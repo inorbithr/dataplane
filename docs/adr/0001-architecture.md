@@ -60,7 +60,14 @@ named Secrets only.
 
 Results carry latency, HTTP status, an error class, certificate expiry and refusal
 reasons. Bodies are never read beyond the status line and headers (gRPC: the one health
-message); URLs, header values and secrets are never reported. Telemetry goes only to the
+message); URLs, header values and secrets are never reported in results.
+
+Declared checks (RFC 0040.1, added 2026-10-03) are the one exception, made by the company
+on purpose: the targets and names written in `checks.toml` (URLs with their path and
+query, hosts, ports, secret *references*, intervals, RFC numbers) are sent in the `hello`
+so the platform can keep them as monitors. Secret values never leave; the platform
+decides what to accept; the agent gains no credential. The `hello` also carries the
+agent's clock (`agent_time`) for the platform's skew check. Telemetry goes only to the
 company's own OpenTelemetry collector, off by default.
 
 ### Small and verifiable

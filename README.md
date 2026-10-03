@@ -22,6 +22,9 @@ Status: pre-release (`0.1.0-alpha`). Before 1.0 only the latest release gets fix
 - **Keeps credentials where they are.** A check that needs a credential names a
   reference (`vault:kv/staging/app#token`, `k8s:ns/name#key`, `env:NAME`, `file:/path`);
   the agent reads it at the moment of the call and forgets it after.
+- **Declares what it watches.** An optional [`checks.toml`](docs/checks.md) lists checks,
+  and refusals that must keep happening (`[[refuse]]`); the platform turns them into
+  monitors managed by this agent ([RFC 0040.1](https://inorbit.hr/lab/rfc/0040.1-declared-checks-and-self-tests/)).
 - **Checks today:** `http` (status, latency, certificate expiry), `tcp`, `tls`,
   `grpc_health` (`grpc.health.v1`). Load and faults come later and are refused until then.
 
@@ -29,12 +32,13 @@ Status: pre-release (`0.1.0-alpha`). Before 1.0 only the latest release gets fix
 
 | Frame | Contents |
 |---|---|
-| `hello` | agent version, policy hash, capabilities, bound domains |
+| `hello` | agent version, policy hash, capabilities, bound domains, the agent's clock; with a [`checks.toml`](docs/checks.md), the declared checks and their hash |
 | `heartbeat` | a sequence number |
 | `result` | job id, `ok`/`failed`/`refused`, start and end time, latency, HTTP status code, error class, certificate expiry, refusal reason |
 
-Never a request or response body, a header value, a URL path or query, or a secret. The
-local admin page (below) counts every frame sent.
+Never a request or response body, a header value or a secret. A URL path or query leaves
+the machine only when you declare it as a target in `checks.toml`. The local admin page
+(below) counts every frame sent.
 
 ## Install
 
@@ -94,6 +98,7 @@ Every artifact is an OCI artifact; copy them into your registry with their signa
 | `iohr-agent run` | connect and work until stopped (exit 3: revoked) |
 | `iohr-agent status` | running, connected, policy hash, what was sent |
 | `iohr-agent policy check [--target URL]` | validate the policy, test a target against it |
+| `iohr-agent checks lint [--resolve]` | validate `checks.toml` against the policy, offline; exit 1 on any error |
 
 The admin page at `http://127.0.0.1:7790/` (JSON at `/status.json`) is read-only and
 answers only on loopback. Telemetry goes to your OpenTelemetry collector when
