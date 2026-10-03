@@ -1,0 +1,87 @@
+[package]
+name = "iohr-agent"
+description = "The InOrbit agent: a data plane that dials out, obeys a local policy and runs checks in your own network."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+readme = "../../README.md"
+
+[[bin]]
+name = "iohr-agent"
+path = "src/main.rs"
+
+[dependencies]
+base64.workspace = true
+bytes.workspace = true
+clap.workspace = true
+ed25519-dalek.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+h2.workspace = true
+http.workspace = true
+ipnet.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry-appender-tracing.workspace = true
+p256.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-tungstenite.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
+
+# .deb: static binary, systemd unit (installed, not started), config owned by the admin.
+[package.metadata.deb]
+name = "iohr-agent"
+maintainer = "InOrbit d.o.o. <security@inorbit.hr>"
+copyright = "2026, InOrbit d.o.o."
+license-file = ["../../LICENSE", "0"]
+extended-description = "Dials out to the InOrbit platform, obeys a local policy that wins over the console, runs checks inside your network and reports timings and verdicts, never content."
+section = "net"
+priority = "optional"
+depends = "adduser"
+maintainer-scripts = "../../packaging/deb/"
+conf-files = ["/etc/iohr-agent/agent.toml", "/etc/iohr-agent/policy.toml"]
+systemd-units = { unit-name = "iohr-agent", unit-scripts = "../../packaging/systemd", enable = false, start = false }
+assets = [
+  ["target/release/iohr-agent", "usr/bin/", "755"],
+  ["../../packaging/agent.toml", "etc/iohr-agent/agent.toml", "640"],
+  ["../../packaging/policy.toml", "etc/iohr-agent/policy.toml", "640"],
+  ["../../README.md", "usr/share/doc/iohr-agent/README.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "iohr-agent"
+license = "Apache-2.0"
+summary = "InOrbit agent: a data plane that dials out and obeys a local policy"
+pre_install_script = "../../packaging/rpm-pre.sh"
+assets = [
+  { source = "target/release/iohr-agent", dest = "/usr/bin/iohr-agent", mode = "755" },
+  { source = "../../packaging/systemd/iohr-agent.service", dest = "/usr/lib/systemd/system/iohr-agent.service", mode = "644" },
+  { source = "../../packaging/agent.toml", dest = "/etc/iohr-agent/agent.toml", mode = "640", config = "noreplace", group = "iohr-agent" },
+  { source = "../../packaging/policy.toml", dest = "/etc/iohr-agent/policy.toml", mode = "640", config = "noreplace", group = "iohr-agent" },
+]
