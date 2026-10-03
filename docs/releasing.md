@@ -8,6 +8,11 @@
    extension bundles as OCI referrers, provenance and SBOM attestations, GitHub release).
    The `release-agent` environment waits for a maintainer's approval.
 
+A maintainer may also push a `v<version>` tag by hand (the version in `Cargo.toml`, the
+chart and `.release-please-manifest.json` bumped first in a pull request); `sign` then
+creates the GitHub release itself, a pre-release when the version has a suffix.
+Release tags are immutable: a failed release is fixed forward with the next version.
+
 ## Before the first release (owner)
 
 - Branch protection or a ruleset on `main`: pull requests only, required check `ci-ok`,
