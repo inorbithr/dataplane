@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.0-alpha.4](https://github.com/inorbithr/dataplane/compare/v0.1.0-alpha.3...v0.1.0-alpha.4) (2026-10-03)
+
+
+### Features
+
+* declared checks, checks.toml in the hello and checks lint (RFC 0040.1) ([#9](https://github.com/inorbithr/dataplane/issues/9)) ([9c0c63a](https://github.com/inorbithr/dataplane/commit/9c0c63a9bba4ba6eec56f72980c44771c6943246))
+
+
+### Documentation
+
+* the PR template asks which platform RFCs a change implements (RFC 0041) ([#7](https://github.com/inorbithr/dataplane/issues/7)) ([27a9391](https://github.com/inorbithr/dataplane/commit/27a9391a5a8bd77718f51a5750b5a88e62e00154))
+
 ## [0.1.0-alpha.3](https://github.com/inorbithr/dataplane/compare/v0.1.0-alpha.2...v0.1.0-alpha.3) (2026-10-03)
 
 
