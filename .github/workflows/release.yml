@@ -239,4 +239,9 @@ jobs:
         run: |
           cp signature.sigstore.json dist/release/iohr-ext-agent.signature.sigstore.json
           cp provenance.sigstore.json dist/release/iohr-ext-agent.provenance.sigstore.json
+          # release-please makes the release when it tags; a tag pushed by hand has none yet.
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            pre=(); [[ "$TAG" == *-* ]] && pre=(--prerelease)
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes "${pre[@]}"
+          fi
           gh release upload "$TAG" dist/release/* --repo "$GITHUB_REPOSITORY" --clobber
