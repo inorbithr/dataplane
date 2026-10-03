@@ -1,0 +1,5 @@
+[default.extend-words]
+hr = "hr"
+
+[files]
+extend-exclude = ["LICENSE", "CODE_OF_CONDUCT.md", "crates/iohr-agent/tests/fixtures/*", "*.svg"]

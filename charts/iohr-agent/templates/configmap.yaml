@@ -1,0 +1,40 @@
+{{- $env := required "environment is required (staging, production, ...)" .Values.environment -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "iohr-agent.fullname" . }}
+  labels:
+    {{- include "iohr-agent.labels" . | nindent 4 }}
+data:
+  agent.toml: |
+    api = {{ .Values.api | quote }}
+    name = {{ .Values.name | default .Release.Name | quote }}
+    environment = {{ $env | quote }}
+    policy = "/etc/iohr-agent/policy/policy.toml"
+    key = "/var/lib/iohr-agent/agent.key"
+    state_dir = "/var/lib/iohr-agent"
+
+    [admin]
+    listen = "127.0.0.1:7790"
+
+    [telemetry]
+    enabled = {{ .Values.telemetry.enabled }}
+    endpoint = {{ .Values.telemetry.endpoint | quote }}
+    {{- if .Values.secrets.vault.addr }}
+
+    [secrets.vault]
+    addr = {{ .Values.secrets.vault.addr | quote }}
+    token = "env:VAULT_TOKEN"
+    {{- end }}
+{{- if not .Values.policy.existingConfigMap }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "iohr-agent.fullname" . }}-policy
+  labels:
+    {{- include "iohr-agent.labels" . | nindent 4 }}
+data:
+  policy.toml: |
+    {{- .Values.policy.policyToml | nindent 4 }}
+{{- end }}

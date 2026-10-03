@@ -1,0 +1,21 @@
+# Secrets and keys: never in the repository
+.env
+.env.*
+*.pem
+*.key
+*.key.new
+enrollment-token
+
+# Claude Code personal files
+.claude/settings.local.json
+CLAUDE.local.md
+
+# Build output
+target/
+dist/
+*.cdx.json
+
+# Editors and OS
+.idea/
+.vscode/*
+.DS_Store

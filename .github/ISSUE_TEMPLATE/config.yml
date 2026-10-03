@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/inorbithr/dataplane/security/advisories/new
+    about: Report privately. Never open a public issue for a vulnerability.
+  - name: API documentation
+    url: https://docs.inorbit.hr
+    about: How the API itself behaves, keys, limits and errors.

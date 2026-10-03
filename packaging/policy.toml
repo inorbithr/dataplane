@@ -1,0 +1,15 @@
+# The local policy of iohr-agent. It wins over anything the platform asks for.
+# Reference: https://github.com/inorbithr/dataplane/blob/main/docs/policy.md
+# This default allows nothing to be reached: list your networks and hosts below.
+environment = "staging"
+
+[domains]
+bound = []
+
+[networks]
+allow = []
+
+[work]
+checks = true
+load = false
+faults = false

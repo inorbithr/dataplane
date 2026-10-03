@@ -1,0 +1,14 @@
+iohr-agent {{ .Chart.AppVersion }} is starting in environment {{ .Values.environment }}.
+
+It dials out to {{ .Values.api }}; nothing listens outside the pod.
+{{- if not .Values.enrollment.existingSecret }}
+
+No enrollment token Secret was given. Create an enrollment in the console (Reliability >
+Agents), then:
+  kubectl -n {{ .Release.Namespace }} create secret generic iohr-agent-enrollment --from-literal=token=ioe_...
+  helm upgrade {{ .Release.Name }} <chart> --reuse-values --set enrollment.existingSecret=iohr-agent-enrollment
+{{- end }}
+
+Status:      kubectl -n {{ .Release.Namespace }} exec {{ include "iohr-agent.fullname" . }}-0 -- iohr-agent status
+Admin page:  kubectl -n {{ .Release.Namespace }} port-forward {{ include "iohr-agent.fullname" . }}-0 7790 and open http://127.0.0.1:7790/
+Stop it:     kubectl -n {{ .Release.Namespace }} scale statefulset/{{ include "iohr-agent.fullname" . }} --replicas=0

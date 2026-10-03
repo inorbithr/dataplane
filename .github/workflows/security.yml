@@ -1,0 +1,79 @@
+name: security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1"
+
+permissions: {}
+
+# Code scanning uploads and dependency review need GitHub Advanced Security on a private
+# repository. Until the repository is public these jobs skip; zizmor still runs on every
+# change through `mise run repo:check` in ci.yml.
+jobs:
+  zizmor:
+    name: zizmor
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
+
+  codeql:
+    name: codeql ${{ matrix.language }}
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { language: actions, build-mode: none, glob: ".github/workflows/*.yml" }
+          - { language: rust, build-mode: none, glob: "crates/*/Cargo.toml" }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # CodeQL fails on a language with no sources; skip until the package exists. GLOB
+      # holds one or more space-separated patterns.
+      - id: present
+        env:
+          GLOB: ${{ matrix.glob }}
+        run: |
+          found=false
+          for g in $GLOB; do compgen -G "$g" > /dev/null && found=true; done
+          if [ "$found" = true ]; then echo "yes=true" >> "$GITHUB_OUTPUT"; else echo "no sources for $GLOB yet, skipping"; fi
+      - if: steps.present.outputs.yes == 'true'
+        uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+      - if: steps.present.outputs.yes == 'true'
+        uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          category: /language:${{ matrix.language }}
+
+  dependency-review:
+    name: dependency review
+    if: ${{ github.event_name == 'pull_request' && !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: moderate
+          comment-summary-in-pr: on-failure

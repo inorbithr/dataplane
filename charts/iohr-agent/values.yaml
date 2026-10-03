@@ -1,0 +1,110 @@
+# Values for iohr-agent. The agent dials out only: no Service, no Ingress, nothing listens
+# beyond the pod's loopback interface.
+
+image:
+  repository: ghcr.io/inorbithr/iohr-agent
+  # Defaults to the chart's appVersion.
+  tag: ""
+  # Pin by digest for admission policies that verify signatures (recommended).
+  digest: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# The platform API.
+api: https://api.inorbit.hr
+# Shown in the console; defaults to the release name.
+name: ""
+# Required: the one environment this agent serves. Must match the policy below.
+environment: ""
+
+enrollment:
+  # A Secret holding the one-time enrollment token (`ioe_…`), used on first start only.
+  # kubectl create secret generic iohr-agent-enrollment --from-literal=token=ioe_…
+  # It may be deleted once the agent shows as enrolled.
+  existingSecret: ""
+  key: token
+
+# The local policy. It wins over anything the platform asks for; edit it here and roll
+# the pod to apply. Reference: https://github.com/inorbithr/dataplane/blob/main/docs/policy.md
+# Leave policyToml empty and set existingConfigMap to manage it elsewhere (key policy.toml).
+policy:
+  existingConfigMap: ""
+  policyToml: |
+    environment = "staging"
+
+    [domains]
+    bound = []
+
+    [networks]
+    # CIDRs, addresses, host names or *.suffixes the agent may connect to.
+    allow = ["*.svc.cluster.local"]
+
+    [work]
+    checks = true
+    load = false
+    faults = false
+
+    [ceilings]
+    max_concurrent_jobs = 4
+    max_job_ms = 30000
+    max_jobs_per_minute = 120
+
+    [secrets]
+    allow = []
+
+telemetry:
+  # Export traces, metrics and logs over OTLP/HTTP to your collector.
+  enabled: false
+  endpoint: http://otel-collector.observability:4318
+
+secrets:
+  kubernetes:
+    # Secrets in this release's namespace the agent may read for `k8s:` references.
+    # A Role with `get` on exactly these names is created; empty means no access at all.
+    secretNames: []
+  vault:
+    # Vault address for `vault:` references; empty disables Vault.
+    addr: ""
+    # The Secret holding the Vault token (read into VAULT_TOKEN).
+    tokenSecret:
+      name: ""
+      key: token
+
+# The enrollment key and record live here; without a volume a restart would need a new
+# enrollment token.
+persistence:
+  size: 16Mi
+  storageClass: ""
+
+resources:
+  requests:
+    cpu: 20m
+    memory: 32Mi
+  limits:
+    memory: 128Mi
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  privileged: false
+  capabilities:
+    drop: ["ALL"]
+
+# Optional egress NetworkPolicy: DNS plus the CIDRs listed here (the platform API and the
+# targets your policy allows). Off by default because API addresses vary.
+networkPolicy:
+  enabled: false
+  egressCIDRs: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}

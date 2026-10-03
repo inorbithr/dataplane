@@ -1,0 +1,106 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "iohr-agent.fullname" . }}
+  labels:
+    {{- include "iohr-agent.labels" . | nindent 4 }}
+spec:
+  # One agent per release: each has its own key and enrollment.
+  replicas: 1
+  serviceName: {{ include "iohr-agent.fullname" . }}
+  selector:
+    matchLabels:
+      {{- include "iohr-agent.selector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "iohr-agent.selector" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "iohr-agent.fullname" . }}
+      automountServiceAccountToken: {{ if include "iohr-agent.k8sAccess" . }}true{{ else }}false{{ end }}
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: agent
+          image: {{ include "iohr-agent.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["run", "--json-logs"]
+          env:
+            - name: IOHR_AGENT_CONFIG
+              value: /etc/iohr-agent/agent.toml
+            {{- if .Values.enrollment.existingSecret }}
+            - name: IOHR_AGENT_ENROLLMENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.enrollment.existingSecret }}
+                  key: {{ .Values.enrollment.key }}
+                  optional: true
+            {{- end }}
+            {{- if and .Values.secrets.vault.addr .Values.secrets.vault.tokenSecret.name }}
+            - name: VAULT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.vault.tokenSecret.name }}
+                  key: {{ .Values.secrets.vault.tokenSecret.key }}
+            {{- end }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          # The admin page listens on the pod's loopback only; probes run the binary.
+          livenessProbe:
+            exec:
+              command: ["/usr/bin/iohr-agent", "status", "--quiet"]
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            timeoutSeconds: 5
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/iohr-agent/agent.toml
+              subPath: agent.toml
+              readOnly: true
+            - name: policy
+              mountPath: /etc/iohr-agent/policy
+              readOnly: true
+            - name: state
+              mountPath: /var/lib/iohr-agent
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "iohr-agent.fullname" . }}
+        - name: policy
+          configMap:
+            name: {{ .Values.policy.existingConfigMap | default (printf "%s-policy" (include "iohr-agent.fullname" .)) }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.persistence.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}

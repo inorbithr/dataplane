@@ -1,0 +1,115 @@
+# Toolchains and tasks. `mise install`, then `mise run ci` runs what CI runs.
+# Release tasks build what the release workflow builds, so a release can be rehearsed
+# (and our internal dogfood channel fed) without GitHub Actions (docs/releasing.md).
+
+[settings]
+experimental = true
+cargo.binstall = true
+
+[tools]
+rust = { version = "1.98.1", components = "rustfmt,clippy", targets = "x86_64-unknown-linux-musl,aarch64-unknown-linux-musl" }
+cargo-binstall = "1.24.0"
+"cargo:cargo-nextest" = "0.9.146"
+cargo-deny = "0.20.2"
+"cargo:cargo-cyclonedx" = "0.5.9"
+"cargo:cargo-deb" = "3.8.0"
+"cargo:cargo-generate-rpm" = "0.16.1"
+helm = "4.2.4"
+cosign = "3.0.2"
+oras = "1.3.0"
+typos = "1.50.3"
+actionlint = "1.7.12"
+zizmor = "1.30.1"
+shellcheck = "0.11.0"
+cyclonedx = "0.33.1"
+
+[env]
+NO_COLOR = "1"
+CARGO_TERM_COLOR = "never"
+# One target directory inside the repository (the disk is shared; `mise run clean`).
+CARGO_TARGET_DIR = "{{config_root}}/target"
+
+# ---------------------------------------------------------------- checks
+
+[tasks.ci]
+description = "Everything CI checks, in the same order"
+depends = ["repo:check", "check", "helm:check"]
+
+[tasks.check]
+shell = "bash -e -o pipefail -c"
+description = "fmt, clippy (pedantic, -D warnings), nextest, doctests, cargo-deny"
+run = """
+cargo fmt --all --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo nextest run --locked --all-features
+cargo test --locked --doc --all-features
+cargo deny check
+"""
+
+[tasks.fmt]
+run = "cargo fmt --all"
+
+[tasks.test]
+description = "Unit and integration tests"
+run = "cargo nextest run --locked --all-features"
+
+[tasks."repo:check"]
+shell = "bash -e -o pipefail -c"
+description = "Spelling, shell scripts, workflow lint and workflow security audit"
+run = [
+  "typos",
+  "shellcheck tools/*.sh packaging/deb/*",
+  "actionlint",
+  "zizmor --min-severity low .github/workflows",
+]
+
+[tasks."helm:check"]
+shell = "bash -e -o pipefail -c"
+description = "Lint and render the Helm chart"
+run = """
+helm lint charts/iohr-agent --strict --set environment=staging
+helm template t charts/iohr-agent --set environment=staging,enrollment.existingSecret=t,secrets.kubernetes.secretNames={a},secrets.vault.addr=https://vault.example:8200,secrets.vault.tokenSecret.name=v,networkPolicy.enabled=true,networkPolicy.egressCIDRs={10.0.0.0/8} > /dev/null
+if helm template t charts/iohr-agent > /dev/null 2>&1; then echo "environment must be required" >&2; exit 1; fi
+"""
+
+[tasks.audit]
+description = "Known vulnerabilities in dependencies"
+run = "cargo deny check advisories"
+
+[tasks.clean]
+description = "Remove build output (shared disk)"
+run = "rm -rf target dist"
+
+# ---------------------------------------------------------------- release, locally
+
+[tasks."dist:bin"]
+shell = "bash -e -o pipefail -c"
+description = "Static release binaries for Linux (musl) into dist/bin/<os>-<arch>/"
+run = "tools/dist-bin.sh"
+
+[tasks."dist:packages"]
+shell = "bash -e -o pipefail -c"
+description = ".deb and .rpm with the systemd unit, from dist/bin"
+depends = ["dist:bin"]
+run = "tools/dist-packages.sh"
+
+[tasks."dist:sbom"]
+shell = "bash -e -o pipefail -c"
+description = "CycloneDX SBOM of the binary into dist/sbom"
+run = """
+mkdir -p dist/sbom
+cargo cyclonedx --manifest-path crates/iohr-agent/Cargo.toml --format json --spec-version 1.5 --override-filename iohr-agent.cdx
+mv crates/iohr-agent/iohr-agent.cdx.json dist/sbom/iohr-agent.cdx.json
+cyclonedx validate --input-file dist/sbom/iohr-agent.cdx.json --input-version v1_5 --fail-on-errors
+"""
+
+[tasks."dist:vex"]
+shell = "bash -e -o pipefail -c"
+description = "The OpenVEX statement for this version into dist/"
+run = "python3 tools/vex.py > dist/iohr-agent.openvex.json"
+
+[tasks."release:local"]
+shell = "bash -e -o pipefail -c"
+description = "Build image + chart + extension artifact and push them, signed with a local key, to $IOHR_DOGFOOD_REGISTRY"
+depends = ["dist:bin", "dist:sbom"]
+run = "tools/release-local.sh"

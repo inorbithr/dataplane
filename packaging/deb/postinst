@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+if [ "$1" = "configure" ]; then
+  if ! getent passwd iohr-agent >/dev/null; then
+    adduser --system --group --no-create-home --home /var/lib/iohr-agent iohr-agent >/dev/null
+  fi
+  chown root:iohr-agent /etc/iohr-agent /etc/iohr-agent/agent.toml /etc/iohr-agent/policy.toml
+  chmod 0750 /etc/iohr-agent
+  chmod 0640 /etc/iohr-agent/agent.toml /etc/iohr-agent/policy.toml
+fi
+#DEBHELPER#
