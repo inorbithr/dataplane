@@ -12,6 +12,9 @@ pub enum Error {
     /// The policy file is missing, unreadable or invalid.
     #[error("policy: {0}")]
     Policy(String),
+    /// The checks file (`checks.toml`) is unreadable or invalid.
+    #[error("checks: {0}")]
+    Checks(String),
     /// A file could not be read or written.
     #[error("{path}: {source}")]
     Io {

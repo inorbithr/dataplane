@@ -8,6 +8,7 @@
 pub mod admin;
 pub mod agent;
 pub mod checks;
+pub mod checks_file;
 pub mod cli;
 pub mod config;
 pub mod enroll;

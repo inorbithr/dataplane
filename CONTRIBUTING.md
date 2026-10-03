@@ -17,7 +17,8 @@ someone else's network, and how a change gets merged.
   to off.
 - **Nothing but timings, codes, classes and counts leaves the machine.** No bodies, no
   header values, no URL paths or queries, no secrets, in results, logs or errors. Tests
-  assert it; keep them.
+  assert it; keep them. The one exception is what a company writes in `checks.toml`: its
+  declared targets go to the platform in the `hello` (`docs/checks.md`).
 - **No new listener.** The agent dials out. The admin page stays read-only on loopback.
 - **Small dependency set.** Every crate ships into a company's network. Justify each new
   one in the PR; `cargo deny check` must pass.

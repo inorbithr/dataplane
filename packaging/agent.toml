@@ -5,6 +5,10 @@ api = "https://api.inorbit.hr"
 name = "CHANGE-ME"
 environment = "staging"
 policy = "/etc/iohr-agent/policy.toml"
+# Optional declared checks (RFC 0040.1): what this agent watches, sent to the platform in
+# the hello and turned into monitors managed by this agent. A missing file declares
+# nothing. Validate with `iohr-agent checks lint`. Reference: docs/checks.md
+checks = "/etc/iohr-agent/checks.toml"
 key = "/var/lib/iohr-agent/agent.key"
 state_dir = "/var/lib/iohr-agent"
 

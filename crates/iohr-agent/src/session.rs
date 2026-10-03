@@ -187,6 +187,12 @@ async fn once(agent: &Arc<Agent>, shutdown: &mut watch::Receiver<bool>) -> Resul
         policy_hash: agent.policy_hash.clone(),
         capabilities: agent.executor.capabilities(),
         domains: agent.policy.domains.bound.clone(),
+        agent_time: now_utc_seconds(),
+        checks_hash: agent.checks.as_ref().map(|c| c.hash.clone()),
+        checks: agent
+            .checks
+            .as_ref()
+            .map(crate::checks_file::DeclaredChecks::wire),
     };
     send(&mut sink, &hello).await?;
 
@@ -310,6 +316,15 @@ async fn once(agent: &Arc<Agent>, shutdown: &mut watch::Receiver<bool>) -> Resul
     }
 }
 
+/// Now, RFC 3339 UTC to the second (`2026-10-03T21:00:00Z`).
+fn now_utc_seconds() -> String {
+    let now = time::OffsetDateTime::now_utc();
+    now.replace_nanosecond(0)
+        .unwrap_or(now)
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
+}
+
 async fn send<S>(sink: &mut S, frame: &AgentFrame) -> Result<()>
 where
     S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
@@ -323,6 +338,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_time_is_utc_seconds() {
+        let t = now_utc_seconds();
+        assert!(t.ends_with('Z') && t.len() == 20, "{t}");
+    }
 
     #[test]
     fn urls() {

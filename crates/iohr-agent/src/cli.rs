@@ -1,4 +1,4 @@
-//! The command line: `init`, `enroll`, `run`, `status`, `policy check`. As an iohr
+//! The command line: `init`, `enroll`, `run`, `status`, `policy check`, `checks lint`. As an iohr
 //! extension the same commands are `iohr agent …`.
 
 use std::io::{BufRead as _, IsTerminal as _, Write as _};
@@ -13,6 +13,7 @@ use url::Url;
 use zeroize::Zeroizing;
 
 use crate::agent::Agent;
+use crate::checks_file::{self, DeclaredChecks, Kind, RefuseBy, Verdict};
 use crate::config::{self, AgentConfig, VaultConfig};
 use crate::enroll::{self, EnrollParams, Enrollment};
 use crate::error::{Error, Result};
@@ -53,6 +54,30 @@ pub enum Command {
     /// Policy tools.
     #[command(subcommand)]
     Policy(PolicyCommand),
+    /// Declared checks (checks.toml) tools.
+    #[command(subcommand)]
+    Checks(ChecksCommand),
+}
+
+/// `checks …`.
+#[derive(Debug, Subcommand)]
+pub enum ChecksCommand {
+    /// Validate checks.toml against the policy, offline; exit 1 on any error.
+    Lint(ChecksLintArgs),
+}
+
+/// `checks lint`.
+#[derive(Debug, Args)]
+pub struct ChecksLintArgs {
+    /// The checks file (default: the one agent.toml names).
+    #[arg(long)]
+    pub file: Option<PathBuf>,
+    /// The policy file (default: the one agent.toml names).
+    #[arg(long)]
+    pub policy: Option<PathBuf>,
+    /// Also resolve each name and check its addresses, as a job would.
+    #[arg(long)]
+    pub resolve: bool,
 }
 
 /// `policy …`.
@@ -218,7 +243,7 @@ pub fn main() -> ExitCode {
         Err(e) => {
             let _ = writeln!(std::io::stderr(), "iohr-agent: {e}");
             ExitCode::from(match e {
-                Error::Config(_) | Error::Policy(_) => 2,
+                Error::Config(_) | Error::Policy(_) | Error::Checks(_) => 2,
                 Error::Revoked(_) => 3,
                 _ => 1,
             })
@@ -239,6 +264,7 @@ async fn dispatch(cmd: Command, config_path: &Path) -> Result<ExitCode> {
         Command::Enroll(a) => enroll_cmd(&a, config_path).await,
         Command::Status(a) => status(&a, config_path).await,
         Command::Policy(PolicyCommand::Check(a)) => policy_check(&a, config_path).await,
+        Command::Checks(ChecksCommand::Lint(a)) => checks_lint(&a, config_path).await,
         Command::Run(_) => Ok(ExitCode::SUCCESS),
     }
 }
@@ -265,6 +291,7 @@ fn run(config_path: &Path, args: &RunArgs) -> Result<ExitCode> {
 
 async fn run_async(cfg: AgentConfig) -> Result<()> {
     let policy = Policy::load(&cfg.policy)?;
+    let checks = DeclaredChecks::load(&cfg.checks)?;
     let enrollment = if let Some(e) = Enrollment::load(&cfg.state_dir)? {
         e
     } else {
@@ -293,11 +320,13 @@ async fn run_async(cfg: AgentConfig) -> Result<()> {
         }
     };
     let key = AgentKey::load(&cfg.key)?;
-    let agent = Arc::new(Agent::new(cfg, policy, enrollment, key)?);
+    let agent = Arc::new(Agent::new(cfg, policy, checks, enrollment, key)?);
     tracing::info!(
         agent_id = %agent.enrollment.agent_id,
         environment = %agent.config.environment,
         policy_hash = %agent.policy_hash,
+        checks = agent.checks.as_ref().map_or(0, |c| c.entries.len()),
+        checks_hash = agent.checks.as_ref().map_or("none", |c| c.hash.as_str()),
         "starting"
     );
     let (tx, rx) = watch::channel(false);
@@ -457,6 +486,12 @@ async fn status(args: &StatusArgs, config_path: &Path) -> Result<ExitCode> {
         "  sent         {} heartbeats, results: {} ok, {} failed, {} refused",
         s.sent.heartbeat, s.sent.results_ok, s.sent.results_failed, s.sent.results_refused
     ));
+    if let Some(hash) = &s.policy.checks_hash {
+        out(&format!(
+            "  checks       {} declared, {hash}",
+            s.policy.checks
+        ));
+    }
     out(&format!("  page         http://{addr}/"));
     Ok(ExitCode::SUCCESS)
 }
@@ -520,6 +555,139 @@ async fn policy_check(args: &PolicyCheckArgs, config_path: &Path) -> Result<Exit
             ));
             Ok(ExitCode::from(1))
         }
+    }
+}
+
+async fn checks_lint(args: &ChecksLintArgs, config_path: &Path) -> Result<ExitCode> {
+    let cfg = if args.file.is_none() || args.policy.is_none() {
+        Some(AgentConfig::load(config_path)?)
+    } else {
+        None
+    };
+    let file = match (&args.file, &cfg) {
+        (Some(f), _) => f.clone(),
+        (None, Some(c)) => c.checks.clone(),
+        (None, None) => return Err(Error::Config("no checks file".into())),
+    };
+    let policy_path = match (&args.policy, &cfg) {
+        (Some(p), _) => p.clone(),
+        (None, Some(c)) => c.policy.clone(),
+        (None, None) => return Err(Error::Config("no policy file".into())),
+    };
+    let policy = Policy::load(&policy_path)?;
+    let text = match std::fs::read_to_string(&file) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && args.file.is_none() => {
+            out(&format!(
+                "{}: no such file; this agent declares no checks",
+                file.display()
+            ));
+            return Ok(ExitCode::SUCCESS);
+        }
+        Err(e) => return Err(Error::io(&file, e)),
+    };
+    let hint = format!("fix it and run `{} checks lint` again", invoked_as());
+    let entries = match checks_file::parse(&text) {
+        Ok(e) => e,
+        Err(e) => {
+            out(&format!("error    {}: {e}", file.display()));
+            out(&hint);
+            return Ok(ExitCode::from(1));
+        }
+    };
+    let (mut errors, mut warnings) = (0usize, 0usize);
+    for (name, entry) in &entries {
+        let verdict = match entry {
+            Err(e) => Verdict::Error(e.clone()),
+            Ok(c) => {
+                let v = checks_file::lint_offline(c, &policy);
+                if args.resolve {
+                    resolve_verdict(c, &policy, v).await
+                } else {
+                    v
+                }
+            }
+        };
+        let label = entry.as_ref().map_or_else(
+            |_| name.clone(),
+            |c| match c.refuse_by {
+                Some(by) => format!("{name} (refuse by {})", by.as_str()),
+                None => name.clone(),
+            },
+        );
+        match verdict {
+            Verdict::Ok => out(&format!("ok       {label}")),
+            Verdict::Warning(w) => {
+                warnings += 1;
+                out(&format!("warning  {label}: {w}"));
+            }
+            Verdict::Error(e) => {
+                errors += 1;
+                out(&format!("error    {label}: {e}"));
+            }
+            Verdict::NeedsResolve { host, .. } => {
+                warnings += 1;
+                out(&format!(
+                    "warning  {label}: {host} is inside a bound domain; the policy refuses it only if an address is outside networks.allow (check with --resolve)"
+                ));
+            }
+        }
+    }
+    if errors == 0 {
+        match DeclaredChecks::from_toml(&text) {
+            Ok(c) => out(&format!(
+                "{}: {} entries, {warnings} warnings, {}",
+                file.display(),
+                c.entries.len(),
+                c.hash
+            )),
+            Err(e) => {
+                out(&format!("error    {}: {e}", file.display()));
+                errors += 1;
+            }
+        }
+    }
+    if errors > 0 {
+        out(&format!(
+            "{}: {errors} errors, {warnings} warnings; {hint}",
+            file.display()
+        ));
+        return Ok(ExitCode::from(1));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Settles a lint verdict with DNS, as the agent would before connecting.
+async fn resolve_verdict(
+    c: &checks_file::DeclaredCheck,
+    policy: &Policy,
+    offline: Verdict,
+) -> Verdict {
+    let Ok(e) = c.spec.endpoint() else {
+        return offline;
+    };
+    let by_policy = c.kind == Kind::Refuse && c.refuse_by == Some(RefuseBy::Policy);
+    let by_platform = c.refuse_by == Some(RefuseBy::Platform);
+    if by_platform || matches!(offline, Verdict::Error(_)) {
+        return offline;
+    }
+    if by_policy && offline == Verdict::Ok {
+        // Already refused by name, address, surface or secret.
+        return offline;
+    }
+    match policy
+        .resolve_target(&e.host, e.port, Duration::from_secs(5))
+        .await
+    {
+        Ok(addr) if by_policy => Verdict::Error(format!(
+            "the policy allows this target (it would connect to {addr}), so this refusal would fail (guard_open)"
+        )),
+        Ok(_) => offline,
+        Err(TargetError::Refused(_)) if by_policy => Verdict::Ok,
+        Err(TargetError::Refused(r)) => Verdict::Error(format!("the policy refuses it: {r}")),
+        Err(TargetError::Dns(r)) => Verdict::Error(format!(
+            "does not resolve ({r}); the job would fail, not be refused"
+        )),
     }
 }
 

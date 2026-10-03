@@ -18,6 +18,14 @@ pub enum AgentFrame {
         capabilities: Vec<String>,
         /// The policy's bound domains.
         domains: Vec<String>,
+        /// This machine's clock, RFC 3339 UTC (the platform measures skew).
+        agent_time: String,
+        /// `sha256:` over the canonical JSON of `checks`; absent without a checks file.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        checks_hash: Option<String>,
+        /// The declared checks, normalized (RFC 0040.1); absent without a checks file.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        checks: Option<Vec<serde_json::Value>>,
     },
     /// Keep-alive.
     Heartbeat {
@@ -141,12 +149,28 @@ mod tests {
             policy_hash: "sha256:00".into(),
             capabilities: vec!["check:http".into()],
             domains: vec!["example.com".into()],
+            agent_time: "2026-10-03T21:00:00Z".into(),
+            checks_hash: None,
+            checks: None,
         };
         assert_eq!(
             serde_json::to_value(&hello).unwrap(),
             json!({"type": "hello", "agent_version": "0.1.0", "policy_hash": "sha256:00",
-                   "capabilities": ["check:http"], "domains": ["example.com"]})
+                   "capabilities": ["check:http"], "domains": ["example.com"],
+                   "agent_time": "2026-10-03T21:00:00Z"})
         );
+        let hello = AgentFrame::Hello {
+            agent_version: "0.1.0".into(),
+            policy_hash: "sha256:00".into(),
+            capabilities: vec![],
+            domains: vec![],
+            agent_time: "t".into(),
+            checks_hash: Some("sha256:11".into()),
+            checks: Some(vec![]),
+        };
+        let v = serde_json::to_value(&hello).unwrap();
+        assert_eq!(v["checks_hash"], "sha256:11");
+        assert_eq!(v["checks"], json!([]));
         let hb = serde_json::to_value(AgentFrame::Heartbeat { seq: 3 }).unwrap();
         assert_eq!(hb, json!({"type": "heartbeat", "seq": 3}));
         let r = AgentFrame::Result(JobResult {

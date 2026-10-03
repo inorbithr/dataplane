@@ -7,6 +7,10 @@ are errors, so a typo never silently allows something. Restart the agent to appl
 change; `iohr-agent policy check` validates a file and prints its hash, which the console
 shows next to the agent.
 
+What the agent declares it watches lives in a separate file, [`checks.toml`](checks.md);
+the policy still decides whether each of those checks may run, and
+`iohr-agent checks lint` tells you before the platform does.
+
 ```toml
 environment = "staging"
 

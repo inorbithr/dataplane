@@ -27,6 +27,10 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- end -}}
 
+{{- define "iohr-agent.checks" -}}
+{{- if or .Values.checks.existingConfigMap .Values.checks.checksToml }}true{{ end -}}
+{{- end -}}
+
 {{- define "iohr-agent.k8sAccess" -}}
 {{- if .Values.secrets.kubernetes.secretNames }}true{{ end -}}
 {{- end -}}

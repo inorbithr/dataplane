@@ -72,6 +72,11 @@ spec:
             - name: policy
               mountPath: /etc/iohr-agent/policy
               readOnly: true
+            {{- if include "iohr-agent.checks" . }}
+            - name: checks
+              mountPath: /etc/iohr-agent/checks
+              readOnly: true
+            {{- end }}
             - name: state
               mountPath: /var/lib/iohr-agent
       volumes:
@@ -81,6 +86,11 @@ spec:
         - name: policy
           configMap:
             name: {{ .Values.policy.existingConfigMap | default (printf "%s-policy" (include "iohr-agent.fullname" .)) }}
+        {{- if include "iohr-agent.checks" . }}
+        - name: checks
+          configMap:
+            name: {{ .Values.checks.existingConfigMap | default (printf "%s-checks" (include "iohr-agent.fullname" .)) }}
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

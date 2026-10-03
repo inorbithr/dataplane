@@ -33,6 +33,9 @@ pub struct AgentConfig {
     /// The policy file.
     #[serde(default = "default_policy")]
     pub policy: PathBuf,
+    /// The declared checks (RFC 0040.1); a missing file declares nothing.
+    #[serde(default = "default_checks")]
+    pub checks: PathBuf,
     /// The private key file (mode 0600).
     #[serde(default = "default_key")]
     pub key: PathBuf,
@@ -192,6 +195,9 @@ fn yes() -> bool {
 fn default_policy() -> PathBuf {
     "policy.toml".into()
 }
+fn default_checks() -> PathBuf {
+    "checks.toml".into()
+}
 fn default_key() -> PathBuf {
     "agent.key".into()
 }
@@ -232,6 +238,7 @@ impl AgentConfig {
             name,
             environment,
             policy: default_policy(),
+            checks: default_checks(),
             key: default_key(),
             state_dir: default_state(),
             key_alg: KeyAlg::default(),
@@ -265,6 +272,7 @@ impl AgentConfig {
             }
         };
         fix(&mut self.policy);
+        fix(&mut self.checks);
         fix(&mut self.key);
         fix(&mut self.state_dir);
         if let Some(ca) = &mut self.tls.ca_file {
@@ -387,6 +395,7 @@ mod tests {
         .unwrap();
         let cfg = AgentConfig::load(&path).unwrap();
         assert_eq!(cfg.policy, dir.path().join("policy.toml"));
+        assert_eq!(cfg.checks, dir.path().join("checks.toml"));
         assert_eq!(cfg.key_alg, KeyAlg::Es256);
         assert!(!cfg.telemetry.enabled);
         assert!(cfg.admin.listen.ip().is_loopback());

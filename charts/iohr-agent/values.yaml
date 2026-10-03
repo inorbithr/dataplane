@@ -52,6 +52,22 @@ policy:
     [secrets]
     allow = []
 
+# Optional declared checks (checks.toml, RFC 0040.1). The platform turns each entry into
+# a monitor managed by this agent; [[refuse]] entries pass when the target is refused.
+# Absent by default: the agent declares nothing. Validate with `iohr-agent checks lint`.
+# Reference: https://github.com/inorbithr/dataplane/blob/main/docs/checks.md
+# Set checksToml, or existingConfigMap to manage it elsewhere (key checks.toml).
+checks:
+  existingConfigMap: ""
+  checksToml: ""
+  # checksToml: |
+  #   [[check]]
+  #   name = "api"
+  #   surface = "http"
+  #   target = "https://api.example.com/healthz"
+  #   every = "60s"
+  #   expect = { status = 200 }
+
 telemetry:
   # Export traces, metrics and logs over OTLP/HTTP to your collector.
   enabled: false
