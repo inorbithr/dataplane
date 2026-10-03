@@ -1,0 +1,242 @@
+# The release of a tag v<version> (docs/releasing.md). Three stages, split so that no step
+# that runs repository code can reach signing material:
+#
+#   build     per platform, on GitHub-hosted runners: compiles the binaries. No id-token,
+#             no registry write.
+#   assemble  image, chart, extension artifact, packages, SBOM, VEX; pushes them by digest
+#             to ghcr.io. packages: write only.
+#   sign      runs no repository build steps: cosign keyless signatures, the extension's
+#             Sigstore bundles as OCI referrers, SLSA v1 provenance and SBOM attestations
+#             by GitHub's attestation actions, then the GitHub release.
+#
+# The signer identity iohr checks is this file at a tag:
+#   https://github.com/inorbithr/dataplane/.github/workflows/release.yml@refs/tags/v*
+# Renaming this file or the environment breaks verification for every user.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  MISE_YES: "1"
+  MISE_TASK_RUN_AUTO_INSTALL: "false"
+  REGISTRY: ghcr.io/inorbithr
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-musl, dir: linux-amd64 }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, dir: linux-arm64 }
+          - { os: macos-15, target: aarch64-apple-darwin, dir: darwin-arm64 }
+          - { os: macos-15, target: x86_64-apple-darwin, dir: darwin-amd64 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
+        with:
+          cache: false
+          install_args: "rust"
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+          DIR: ${{ matrix.dir }}
+        run: |
+          rustup target add "$TARGET"
+          if [[ "$TARGET" == *-linux-musl ]]; then export "CC_${TARGET//-/_}=gcc"; fi
+          cargo build --release --locked -p iohr-agent --target "$TARGET"
+          mkdir -p "dist/bin/$DIR"
+          cp "${CARGO_TARGET_DIR:-target}/$TARGET/release/iohr-agent" "dist/bin/$DIR/iohr-agent"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bin-${{ matrix.dir }}
+          path: dist/bin/
+          if-no-files-found: error
+
+  assemble:
+    name: assemble and push
+    needs: build
+    runs-on: ubuntu-24.04
+    environment: release-agent
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      image_digest: ${{ steps.push.outputs.image_digest }}
+      chart_digest: ${{ steps.push.outputs.chart_digest }}
+      ext_digest: ${{ steps.push.outputs.ext_digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
+        with:
+          cache: false
+          install_args: "rust cargo-binstall cargo:cargo-deb cargo:cargo-generate-rpm cargo:cargo-cyclonedx cyclonedx helm oras"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: bin-*
+          path: dist/bin
+          merge-multiple: true
+      - id: v
+        env:
+          REF: ${{ github.ref_name }}
+        run: echo "version=${REF#v}" >> "$GITHUB_OUTPUT"
+      - run: chmod +x dist/bin/*/iohr-agent
+      - run: tools/dist-packages.sh
+      - run: mise run dist:sbom
+      - run: mkdir -p dist && python3 tools/vex.py > dist/iohr-agent.openvex.json
+      - name: Archives and checksums
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          mkdir -p dist/release
+          for d in dist/bin/*/; do
+            p="$(basename "$d")"
+            tar -C "$d" -czf "dist/release/iohr-agent-$VERSION-$p.tar.gz" iohr-agent
+          done
+          cp dist/packages/* dist/sbom/iohr-agent.cdx.json dist/iohr-agent.openvex.json dist/release/
+          (cd dist/release && sha256sum -- * > SHA256SUMS)
+      - name: Push image, chart and extension
+        id: push
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ github.token }}
+          REVISION: ${{ github.sha }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GH_ACTOR" --password-stdin
+          echo "$GH_TOKEN" | helm registry login ghcr.io -u "$GH_ACTOR" --password-stdin
+          echo "$GH_TOKEN" | oras login ghcr.io -u "$GH_ACTOR" --password-stdin
+          docker buildx create --use
+          docker buildx build --platform linux/amd64,linux/arm64 --build-arg VERSION="$VERSION" \
+            --provenance=false --sbom=false \
+            --tag "$REGISTRY/iohr-agent:$VERSION" --push --metadata-file dist/image.json .
+          echo "image_digest=$(jq -r '."containerimage.digest"' dist/image.json)" >> "$GITHUB_OUTPUT"
+          helm package charts/iohr-agent --version "$VERSION" --app-version "$VERSION" -d dist/chart
+          chart_digest="$(helm push "dist/chart/iohr-agent-$VERSION.tgz" "oci://$REGISTRY/charts" 2>&1 | sed -n 's/^Digest: //p')"
+          echo "chart_digest=$chart_digest" >> "$GITHUB_OUTPUT"
+          ext_digest="$(python3 tools/ext_artifact.py --version "$VERSION" --revision "$REVISION" --out dist/oci/ext-agent)"
+          oras cp --from-oci-layout "dist/oci/ext-agent:$VERSION" "$REGISTRY/iohr-ext/agent:$VERSION"
+          echo "ext_digest=$ext_digest" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release
+          path: |
+            dist/release/
+            dist/oci/ext-agent/
+          if-no-files-found: error
+
+  sign:
+    name: sign, attest, publish release
+    needs: assemble
+    runs-on: ubuntu-24.04
+    environment: release-agent
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.assemble.outputs.version }}
+      IMAGE_DIGEST: ${{ needs.assemble.outputs.image_digest }}
+      CHART_DIGEST: ${{ needs.assemble.outputs.chart_digest }}
+      EXT_DIGEST: ${{ needs.assemble.outputs.ext_digest }}
+      BUNDLE: application/vnd.dev.sigstore.bundle.v0.3+json
+    steps:
+      # Only mise itself and the signing tools; no repository code is built or run here.
+      - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
+        with:
+          cache: false
+          install: false
+      - run: mise use -g cosign@3.0.2 oras@1.3.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release
+          path: dist
+      - name: Log in
+        env:
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "$GH_TOKEN" | mise x -- cosign login ghcr.io -u "$GH_ACTOR" --password-stdin
+          echo "$GH_TOKEN" | mise x -- oras login ghcr.io -u "$GH_ACTOR" --password-stdin
+      - name: Keyless signatures (image and chart, for admission policies)
+        run: |
+          mise x -- cosign sign --yes "$REGISTRY/iohr-agent@$IMAGE_DIGEST"
+          mise x -- cosign sign --yes "$REGISTRY/charts/iohr-agent@$CHART_DIGEST"
+      - name: Extension signature bundle (DSSE over the index digest, OCI referrer)
+        run: |
+          index="dist/oci/ext-agent/blobs/sha256/${EXT_DIGEST#sha256:}"
+          [ "sha256:$(sha256sum "$index" | cut -d' ' -f1)" = "$EXT_DIGEST" ]
+          printf '{}' > empty.json
+          mise x -- cosign attest-blob --yes --new-bundle-format \
+            --type https://sigstore.dev/cosign/sign/v1 --predicate empty.json \
+            --bundle signature.sigstore.json "$index"
+          mise x -- oras attach --artifact-type "$BUNDLE" \
+            "$REGISTRY/iohr-ext/agent@$EXT_DIGEST" "signature.sigstore.json:$BUNDLE"
+      - id: prov-ext
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/iohr-ext/agent
+          subject-digest: ${{ env.EXT_DIGEST }}
+      - name: Extension provenance bundle (OCI referrer)
+        env:
+          BUNDLE_PATH: ${{ steps.prov-ext.outputs.bundle-path }}
+        run: |
+          cp "$BUNDLE_PATH" provenance.sigstore.json
+          mise x -- oras attach --artifact-type "$BUNDLE" \
+            "$REGISTRY/iohr-ext/agent@$EXT_DIGEST" "provenance.sigstore.json:$BUNDLE"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/iohr-agent
+          subject-digest: ${{ env.IMAGE_DIGEST }}
+          push-to-registry: true
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/charts/iohr-agent
+          subject-digest: ${{ env.CHART_DIGEST }}
+          push-to-registry: true
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/release/SHA256SUMS
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ env.REGISTRY }}/iohr-agent
+          subject-digest: ${{ env.IMAGE_DIGEST }}
+          sbom-path: dist/release/iohr-agent.cdx.json
+          push-to-registry: true
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: |
+            dist/release/*.tar.gz
+            dist/release/*.deb
+            dist/release/*.rpm
+          sbom-path: dist/release/iohr-agent.cdx.json
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cp signature.sigstore.json dist/release/iohr-ext-agent.signature.sigstore.json
+          cp provenance.sigstore.json dist/release/iohr-ext-agent.provenance.sigstore.json
+          gh release upload "$TAG" dist/release/* --repo "$GITHUB_REPOSITORY" --clobber

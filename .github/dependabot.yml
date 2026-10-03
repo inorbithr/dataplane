@@ -1,0 +1,23 @@
+# Weekly, grouped, and never a version younger than the cooldown: a compromised release
+# usually surfaces within days.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly, day: monday }
+    cooldown: { default-days: 7 }
+    groups: { actions: { patterns: ["*"] } }
+    commit-message: { prefix: "ci", include: scope }
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule: { interval: weekly, day: monday }
+    cooldown: { default-days: 7 }
+    groups: { cargo: { patterns: ["*"] } }
+    commit-message: { prefix: "build(deps)" }
+
+  - package-ecosystem: docker
+    directory: /
+    schedule: { interval: weekly, day: monday }
+    cooldown: { default-days: 7 }
+    commit-message: { prefix: "build(deps)" }
