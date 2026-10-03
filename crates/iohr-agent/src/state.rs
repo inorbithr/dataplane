@@ -71,6 +71,15 @@ pub struct PolicyInfo {
     pub domains: Vec<String>,
     /// Accepted capabilities.
     pub capabilities: Vec<String>,
+    /// The checks file.
+    #[serde(default)]
+    pub checks_path: String,
+    /// `sha256:…` of the declared checks; none without a checks file.
+    #[serde(default)]
+    pub checks_hash: Option<String>,
+    /// How many checks and refusals are declared.
+    #[serde(default)]
+    pub checks: usize,
 }
 
 /// Counts of frames sent.

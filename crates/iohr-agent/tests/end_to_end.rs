@@ -29,6 +29,7 @@ use tokio::sync::{Mutex, mpsc, watch};
 use url::Url;
 
 use iohr_agent::agent::Agent;
+use iohr_agent::checks_file::DeclaredChecks;
 use iohr_agent::config::AgentConfig;
 use iohr_agent::enroll::{EnrollParams, Enrollment, enroll};
 use iohr_agent::keys::{AgentKey, KeyAlg};
@@ -323,7 +324,16 @@ async fn start(
         None => enroll_agent(h).await,
     };
     let key = AgentKey::load(&h.cfg.key).unwrap();
-    let agent = Arc::new(Agent::new(h.cfg.clone(), h.policy.clone(), enrollment, key).unwrap());
+    let agent = Arc::new(
+        Agent::new(
+            h.cfg.clone(),
+            h.policy.clone(),
+            DeclaredChecks::load(&h.cfg.checks).unwrap(),
+            enrollment,
+            key,
+        )
+        .unwrap(),
+    );
     let (tx, rx) = watch::channel(false);
     let task = tokio::spawn(Arc::clone(&agent).run(rx));
     (agent, tx, task)
@@ -392,6 +402,14 @@ async fn enroll_token_session_job_result() {
         assert_eq!(n, 1);
         assert_eq!(hello["policy_hash"], h.policy.hash());
         assert_eq!(hello["domains"], json!(["example.com"]));
+        assert!(
+            hello.get("checks").is_none() && hello.get("checks_hash").is_none(),
+            "no checks file, no checks: {hello}"
+        );
+        let t = hello["agent_time"].as_str().unwrap();
+        let t =
+            time::OffsetDateTime::parse(t, &time::format_description::well_known::Rfc3339).unwrap();
+        assert!((time::OffsetDateTime::now_utc() - t).abs() < time::Duration::minutes(1));
         let caps: Vec<&str> = hello["capabilities"]
             .as_array()
             .unwrap()
@@ -459,6 +477,91 @@ async fn enroll_token_session_job_result() {
         stop.send(true).unwrap();
         task.await.unwrap().unwrap();
     }
+}
+
+#[tokio::test]
+async fn hello_declares_the_checks_file() {
+    let mut h = harness(KeyAlg::Es256).await;
+    std::fs::write(
+        &h.cfg.checks,
+        r#"
+[[check]]
+name = "api"
+surface = "http"
+target = "https://api.example.com/healthz"
+every = "60s"
+expect = { status = 200, max_ms = 2000 }
+rfc = "0029"
+
+[[refuse]]
+name = "private-is-refused"
+target = "https://db.internal/"
+by = "policy"
+every = "5m"
+
+[[refuse]]
+name = "api-needs-a-token"
+target = "https://api.example.com/v1/me"
+expect = { status = 401 }
+every = "5m"
+"#,
+    )
+    .unwrap();
+    let declared = DeclaredChecks::load(&h.cfg.checks).unwrap().unwrap();
+    let (agent, stop, task) = start(&h).await;
+
+    let (_, hello) = next(&mut h.frames, "hello").await;
+    assert_eq!(hello["checks_hash"], declared.hash.as_str());
+    assert!(
+        hello["checks_hash"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("sha256:")
+            .is_some_and(|hex| hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+    );
+    assert_eq!(
+        hello["checks"],
+        json!([
+            {"key": "api", "kind": "check", "surface": "http",
+             "target": {"url": "https://api.example.com/healthz"},
+             "every_secs": 60, "fail_after": 2,
+             "expect": {"status": 200, "max_ms": 2000}, "rfc": "0029"},
+            {"key": "private-is-refused", "kind": "refuse", "refuse_by": "policy",
+             "surface": "http", "target": {"url": "https://db.internal/"},
+             "every_secs": 300, "fail_after": 1},
+            {"key": "api-needs-a-token", "kind": "refuse", "refuse_by": "answer",
+             "surface": "http", "target": {"url": "https://api.example.com/v1/me"},
+             "every_secs": 300, "fail_after": 1, "expect": {"status": 401}}
+        ])
+    );
+    assert!(hello["agent_time"].as_str().unwrap().ends_with('Z'));
+    let snap = agent.state.snapshot();
+    assert_eq!(snap.policy.checks, 3);
+    assert_eq!(
+        snap.policy.checks_hash.as_deref(),
+        Some(declared.hash.as_str())
+    );
+
+    // A job for a declared check is an ordinary job: the policy still decides.
+    h.cmds
+        .send(job(
+            "j-declared",
+            "check",
+            json!({"surface": "http", "target": {"url": "https://db.internal/"}}),
+        ))
+        .ok();
+    let r = results(&mut h.frames, 1).await;
+    assert_eq!(r["j-declared"]["status"], "refused");
+    assert_eq!(
+        r["j-declared"]["detail"]["error_class"],
+        "refused_by_policy"
+    );
+
+    stop.send(true).unwrap();
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test]

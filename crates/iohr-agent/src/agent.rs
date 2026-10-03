@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use tokio::sync::watch;
 
+use crate::checks_file::DeclaredChecks;
 use crate::config::AgentConfig;
 use crate::enroll::Enrollment;
 use crate::error::{Error, Result};
@@ -24,6 +25,8 @@ pub struct Agent {
     pub policy: Arc<Policy>,
     /// Its hash.
     pub policy_hash: String,
+    /// The declared checks (`checks.toml`), if the file exists.
+    pub checks: Option<DeclaredChecks>,
     /// The enrollment record.
     pub enrollment: Arc<Enrollment>,
     /// Status for the admin page.
@@ -44,6 +47,7 @@ impl Agent {
     pub fn new(
         config: AgentConfig,
         policy: Policy,
+        checks: Option<DeclaredChecks>,
         enrollment: Enrollment,
         key: AgentKey,
     ) -> Result<Self> {
@@ -99,6 +103,9 @@ impl Agent {
                 path: config.policy.display().to_string(),
                 domains: policy.domains.bound.clone(),
                 capabilities: executor.capabilities(),
+                checks_path: config.checks.display().to_string(),
+                checks_hash: checks.as_ref().map(|c| c.hash.clone()),
+                checks: checks.as_ref().map_or(0, |c| c.entries.len()),
             },
             how_to_stop(),
         ));
@@ -106,6 +113,7 @@ impl Agent {
             config,
             policy,
             policy_hash,
+            checks,
             enrollment,
             state,
             tokens,

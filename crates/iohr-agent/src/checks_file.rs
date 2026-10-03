@@ -1,0 +1,1110 @@
+//! `checks.toml`: the checks this agent declares (RFC 0040.1). The platform turns each
+//! entry into a monitor managed by this agent; `[[refuse]]` entries are checks whose
+//! success is a refusal. The file is optional; without it the agent declares nothing.
+//!
+//! The file is the human form (`every = "5m"`, `by = "policy"`); the hello carries the
+//! normalized form (`every_secs`, `kind`, `refuse_by`) and `checks_hash`, the SHA-256 of
+//! its canonical JSON. See `docs/checks.md`.
+
+use std::collections::{BTreeMap, HashSet};
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
+use url::Url;
+
+use crate::checks::{AuthSpec, CheckSpec, Expect, Surface, Target};
+use crate::error::{Error, Result};
+use crate::policy::{NameRule, Policy, normalize_host};
+
+/// Bounds a checks file must respect (the platform enforces the same).
+pub mod limits {
+    /// Most entries, `[[check]]` and `[[refuse]]` together.
+    pub const MAX_CHECKS: usize = 50;
+    /// Longest name.
+    pub const MAX_NAME: usize = 64;
+    /// Shortest interval, in seconds.
+    pub const MIN_EVERY_SECS: u64 = 60;
+    /// Longest interval, in seconds.
+    pub const MAX_EVERY_SECS: u64 = 86_400;
+    /// Most failed runs before a monitor goes down.
+    pub const MAX_FAIL_AFTER: u8 = 5;
+    /// Longest `max_ms`.
+    pub const MAX_MS: u64 = 30_000;
+    /// Longest `valid_for_days`.
+    pub const MAX_VALID_FOR_DAYS: u16 = 365;
+    /// Longest URL.
+    pub const MAX_URL: usize = 2_048;
+    /// Longest gRPC service name.
+    pub const MAX_SERVICE: usize = 256;
+    /// Largest canonical form; keeps the hello well under the platform's 64 KiB frame.
+    pub const MAX_CANONICAL_BYTES: usize = 48 * 1024;
+}
+
+/// `check` or `refuse`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// Passes when the target answers as expected.
+    Check,
+    /// Passes when the target is refused.
+    Refuse,
+}
+
+impl Kind {
+    /// The wire name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Check => "check",
+            Self::Refuse => "refuse",
+        }
+    }
+}
+
+/// Who must refuse a `[[refuse]]` entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefuseBy {
+    /// This agent's policy (the job comes back `refused`, class `refused_by_policy`).
+    Policy,
+    /// The platform, before the job reaches the agent.
+    Platform,
+    /// The target itself, with the answer in `expect` (e.g. status 401).
+    Answer,
+}
+
+impl RefuseBy {
+    /// The wire name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Policy => "policy",
+            Self::Platform => "platform",
+            Self::Answer => "answer",
+        }
+    }
+}
+
+/// One validated entry.
+#[derive(Debug, Clone)]
+pub struct DeclaredCheck {
+    /// `name` in the file, `key` on the wire.
+    pub key: String,
+    /// `check` or `refuse`.
+    pub kind: Kind,
+    /// For `refuse`.
+    pub refuse_by: Option<RefuseBy>,
+    /// What a job for it would carry (surface, target, expect, auth, service).
+    pub spec: CheckSpec,
+    /// Declared only; the platform judges it from the result's `tls_expires_at`.
+    pub valid_for_days: Option<u16>,
+    /// Interval, in seconds.
+    pub every_secs: u64,
+    /// Failed runs before the monitor goes down.
+    pub fail_after: u8,
+    /// The RFC this check proves (`NNNN` or `NNNN.N`).
+    pub rfc: Option<String>,
+}
+
+impl DeclaredCheck {
+    /// The secret reference, if any.
+    #[must_use]
+    pub fn auth(&self) -> Option<&str> {
+        self.spec.auth.as_ref().map(|a| a.secret.as_str())
+    }
+
+    /// The normalized wire form (one element of the hello's `checks`).
+    #[must_use]
+    pub fn to_wire(&self) -> Value {
+        let mut m = BTreeMap::new();
+        m.insert("key", json!(self.key));
+        m.insert("kind", json!(self.kind.as_str()));
+        if let Some(by) = self.refuse_by {
+            m.insert("refuse_by", json!(by.as_str()));
+        }
+        m.insert("surface", json!(self.spec.surface.as_str()));
+        m.insert(
+            "target",
+            match &self.spec.target {
+                Target::Url { url } => json!({"url": url.as_str()}),
+                Target::HostPort { host, port, tls } => match tls {
+                    Some(t) => json!({"host": host, "port": port, "tls": t}),
+                    None => json!({"host": host, "port": port}),
+                },
+            },
+        );
+        m.insert("every_secs", json!(self.every_secs));
+        m.insert("fail_after", json!(self.fail_after));
+        let mut expect = serde_json::Map::new();
+        if let Some(s) = self.spec.expect.status {
+            expect.insert("status".into(), json!(s));
+        }
+        if let Some(ms) = self.spec.expect.max_ms {
+            expect.insert("max_ms".into(), json!(ms));
+        }
+        if let Some(d) = self.valid_for_days {
+            expect.insert("valid_for_days".into(), json!(d));
+        }
+        if !expect.is_empty() {
+            m.insert("expect", Value::Object(expect));
+        }
+        if let Some(s) = &self.spec.service {
+            m.insert("service", json!(s));
+        }
+        if let Some(a) = self.auth() {
+            m.insert("auth", json!(a));
+        }
+        if let Some(r) = &self.rfc {
+            m.insert("rfc", json!(r));
+        }
+        Value::Object(m.into_iter().map(|(k, v)| (k.to_owned(), v)).collect())
+    }
+}
+
+/// A loaded, validated checks file.
+#[derive(Debug, Clone)]
+pub struct DeclaredChecks {
+    /// The file it came from (empty when parsed from text).
+    pub path: PathBuf,
+    /// Entries in file order.
+    pub entries: Vec<DeclaredCheck>,
+    /// `sha256:` + lowercase hex over [`canonical_json`] of the wire array.
+    pub hash: String,
+}
+
+impl DeclaredChecks {
+    /// Reads a checks file. A missing file is no checks (`Ok(None)`).
+    ///
+    /// # Errors
+    /// When the file exists but cannot be read or breaks a rule.
+    pub fn load(path: &Path) -> Result<Option<Self>> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(Error::io(path, e)),
+        };
+        let mut c = Self::from_toml(&text)
+            .map_err(|e| Error::Checks(format!("{}: {}", path.display(), strip(&e))))?;
+        c.path = path.to_path_buf();
+        Ok(Some(c))
+    }
+
+    /// Parses and validates checks TOML; the first rule broken is the error.
+    ///
+    /// # Errors
+    /// [`Error::Checks`] with the entry's name and the rule.
+    pub fn from_toml(text: &str) -> Result<Self> {
+        let parsed = parse(text)?;
+        let mut entries = Vec::with_capacity(parsed.len());
+        for (name, r) in parsed {
+            entries.push(r.map_err(|e| Error::Checks(format!("{name}: {e}")))?);
+        }
+        let wire: Vec<Value> = entries.iter().map(DeclaredCheck::to_wire).collect();
+        let canonical = canonical_json(&Value::Array(wire));
+        if canonical.len() > limits::MAX_CANONICAL_BYTES {
+            return Err(Error::Checks(format!(
+                "the checks take {} bytes; at most {} fit in the hello",
+                canonical.len(),
+                limits::MAX_CANONICAL_BYTES
+            )));
+        }
+        Ok(Self {
+            path: PathBuf::new(),
+            entries,
+            hash: sha256_hex(canonical.as_bytes()),
+        })
+    }
+
+    /// The hello's `checks` array.
+    #[must_use]
+    pub fn wire(&self) -> Vec<Value> {
+        self.entries.iter().map(DeclaredCheck::to_wire).collect()
+    }
+}
+
+fn strip(e: &Error) -> String {
+    match e {
+        Error::Checks(m) => m.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Parses the file: file-level problems (syntax, unknown tables, too many entries,
+/// duplicate names) are the error; each entry is then validated on its own, so `lint`
+/// can report every entry. Entries come back in file order, `[[check]]` and `[[refuse]]`
+/// interleaved as written.
+///
+/// # Errors
+/// [`Error::Checks`] for a file-level problem.
+pub fn parse(text: &str) -> Result<Vec<(String, std::result::Result<DeclaredCheck, String>)>> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FileForm {
+        #[serde(default)]
+        check: Vec<toml::Spanned<toml::Table>>,
+        #[serde(default)]
+        refuse: Vec<toml::Spanned<toml::Table>>,
+    }
+    let f: FileForm = toml::from_str(text).map_err(|e| Error::Checks(e.to_string()))?;
+    let mut raw: Vec<(usize, Kind, toml::Table)> = f
+        .check
+        .into_iter()
+        .map(|s| (s.span().start, Kind::Check, s.into_inner()))
+        .chain(
+            f.refuse
+                .into_iter()
+                .map(|s| (s.span().start, Kind::Refuse, s.into_inner())),
+        )
+        .collect();
+    raw.sort_by_key(|(at, _, _)| *at);
+    if raw.len() > limits::MAX_CHECKS {
+        return Err(Error::Checks(format!(
+            "{} entries; at most {} checks and refusals together",
+            raw.len(),
+            limits::MAX_CHECKS
+        )));
+    }
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(raw.len());
+    for (i, (_, kind, table)) in raw.into_iter().enumerate() {
+        let label = table
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .map_or_else(|| format!("entry {}", i + 1), str::to_owned);
+        if !seen.insert(label.clone()) {
+            return Err(Error::Checks(format!("the name {label:?} is used twice")));
+        }
+        out.push((label, entry(kind, table)));
+    }
+    Ok(out)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileEntry {
+    name: String,
+    #[serde(default)]
+    surface: Option<Surface>,
+    target: FileTarget,
+    every: String,
+    #[serde(default)]
+    expect: Option<FileExpect>,
+    #[serde(default)]
+    fail_after: Option<u8>,
+    #[serde(default)]
+    by: Option<String>,
+    #[serde(default)]
+    service: Option<String>,
+    #[serde(default)]
+    auth: Option<String>,
+    #[serde(default)]
+    rfc: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FileTarget {
+    Text(String),
+    Url(UrlTarget),
+    HostPort(HostPortTarget),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UrlTarget {
+    url: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostPortTarget {
+    host: String,
+    port: u16,
+    #[serde(default)]
+    tls: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FileExpect {
+    #[serde(default)]
+    status: Option<u16>,
+    #[serde(default)]
+    max_ms: Option<u64>,
+    #[serde(default)]
+    valid_for_days: Option<u16>,
+}
+
+impl FileExpect {
+    fn is_empty(&self) -> bool {
+        self.status.is_none() && self.max_ms.is_none() && self.valid_for_days.is_none()
+    }
+}
+
+fn entry(kind: Kind, table: toml::Table) -> std::result::Result<DeclaredCheck, String> {
+    let e: FileEntry = toml::Value::Table(table)
+        .try_into()
+        .map_err(|e: toml::de::Error| e.message().to_owned())?;
+    check_name(&e.name)?;
+    let every_secs = parse_every(&e.every)?;
+    let refuse_by = match (kind, e.by.as_deref(), &e.expect) {
+        (Kind::Check, None, _) => None,
+        (Kind::Check, Some(_), _) => return Err("by is only for [[refuse]]".into()),
+        (Kind::Refuse, Some(_), Some(_)) => {
+            return Err("a [[refuse]] names either by or expect, not both".into());
+        }
+        (Kind::Refuse, Some("policy"), None) => Some(RefuseBy::Policy),
+        (Kind::Refuse, Some("platform"), None) => Some(RefuseBy::Platform),
+        (Kind::Refuse, Some(other), None) => {
+            return Err(format!(
+                "by = {other:?}: must be \"policy\" or \"platform\""
+            ));
+        }
+        (Kind::Refuse, None, Some(x)) if !x.is_empty() => Some(RefuseBy::Answer),
+        (Kind::Refuse, None, _) => {
+            return Err(
+                "a [[refuse]] needs by = \"policy\" or \"platform\", or the refusal it expects in expect"
+                    .into(),
+            );
+        }
+    };
+    let fail_after = e.fail_after.unwrap_or(match kind {
+        Kind::Check => 2,
+        Kind::Refuse => 1,
+    });
+    if !(1..=limits::MAX_FAIL_AFTER).contains(&fail_after) {
+        return Err(format!(
+            "fail_after must be 1 to {}",
+            limits::MAX_FAIL_AFTER
+        ));
+    }
+    let (target, default_surface) = target(e.target, e.surface)?;
+    let surface = e.surface.unwrap_or(default_surface);
+    let x = e.expect.unwrap_or_default();
+    check_expect(&x, surface)?;
+    if let Some(s) = &e.service {
+        if surface != Surface::GrpcHealth {
+            return Err("service is for grpc_health checks".into());
+        }
+        if s.len() > limits::MAX_SERVICE || s.chars().any(char::is_control) {
+            return Err(format!(
+                "service must be at most {} printable characters",
+                limits::MAX_SERVICE
+            ));
+        }
+    }
+    let auth = match e.auth {
+        None => None,
+        Some(r) => {
+            check_reference(&r)?;
+            if !matches!(surface, Surface::Http | Surface::GrpcHealth) {
+                return Err("auth is for http and grpc_health checks".into());
+            }
+            Some(AuthSpec {
+                header: None,
+                scheme: None,
+                secret: r,
+            })
+        }
+    };
+    if let Some(r) = &e.rfc {
+        check_rfc(r)?;
+    }
+    let spec = CheckSpec {
+        surface,
+        target,
+        expect: Expect {
+            status: x.status,
+            max_ms: x.max_ms,
+        },
+        auth,
+        service: e.service,
+        method: None,
+    };
+    spec.endpoint()?;
+    Ok(DeclaredCheck {
+        key: e.name,
+        kind,
+        refuse_by,
+        spec,
+        valid_for_days: x.valid_for_days,
+        every_secs,
+        fail_after,
+        rfc: e.rfc,
+    })
+}
+
+fn check_expect(x: &FileExpect, surface: Surface) -> std::result::Result<(), String> {
+    if let Some(s) = x.status
+        && !(100..=599).contains(&s)
+    {
+        return Err("expect.status must be 100 to 599".into());
+    }
+    if let Some(ms) = x.max_ms
+        && !(1..=limits::MAX_MS).contains(&ms)
+    {
+        return Err(format!("expect.max_ms must be 1 to {}", limits::MAX_MS));
+    }
+    if let Some(d) = x.valid_for_days {
+        if !(1..=limits::MAX_VALID_FOR_DAYS).contains(&d) {
+            return Err(format!(
+                "expect.valid_for_days must be 1 to {}",
+                limits::MAX_VALID_FOR_DAYS
+            ));
+        }
+        if !matches!(surface, Surface::Tls | Surface::Http) {
+            return Err("expect.valid_for_days is for tls and http checks".into());
+        }
+    }
+    if x.status.is_some() && !matches!(surface, Surface::Http) {
+        return Err("expect.status is for http checks".into());
+    }
+    Ok(())
+}
+
+/// The target and the surface it implies when none is named: `http` for a URL, `tcp`
+/// for a host and port.
+fn target(
+    t: FileTarget,
+    surface: Option<Surface>,
+) -> std::result::Result<(Target, Surface), String> {
+    match t {
+        FileTarget::Url(UrlTarget { url }) => Ok((
+            Target::Url {
+                url: parse_url(&url)?,
+            },
+            Surface::Http,
+        )),
+        FileTarget::Text(s) if s.contains("://") => Ok((
+            Target::Url {
+                url: parse_url(&s)?,
+            },
+            Surface::Http,
+        )),
+        FileTarget::Text(s) => {
+            let (host, port) = split_host_port(&s)?;
+            let port = match (port, surface) {
+                (Some(p), _) => p,
+                (None, Some(Surface::Tls)) => 443,
+                (None, _) => {
+                    return Err(format!("target {s:?} needs a port (host:port), or a URL"));
+                }
+            };
+            Ok((
+                Target::HostPort {
+                    host: check_host(host)?,
+                    port,
+                    tls: None,
+                },
+                Surface::Tcp,
+            ))
+        }
+        FileTarget::HostPort(HostPortTarget { host, port, tls }) => Ok((
+            Target::HostPort {
+                host: check_host(&host)?,
+                port,
+                tls,
+            },
+            Surface::Tcp,
+        )),
+    }
+}
+
+fn parse_url(s: &str) -> std::result::Result<Url, String> {
+    if s.len() > limits::MAX_URL {
+        return Err(format!("the URL is longer than {}", limits::MAX_URL));
+    }
+    let url = Url::parse(s).map_err(|e| format!("target {s:?}: {e}"))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("the URL carries a user or password; name a secret reference in auth".into());
+    }
+    if url.fragment().is_some() {
+        return Err("the URL has a #fragment, which is never sent".into());
+    }
+    if let Some(url::Host::Domain(d)) = url.host() {
+        normalize_host(d)?;
+    }
+    Ok(url)
+}
+
+fn split_host_port(s: &str) -> std::result::Result<(&str, Option<u16>), String> {
+    let bad = || format!("target {s:?} is not a URL, host or host:port");
+    if let Some(rest) = s.strip_prefix('[') {
+        let (host, after) = rest.split_once(']').ok_or_else(bad)?;
+        return match after.strip_prefix(':') {
+            Some(p) => Ok((host, Some(p.parse().map_err(|_| bad())?))),
+            None if after.is_empty() => Ok((host, None)),
+            None => Err(bad()),
+        };
+    }
+    if s.parse::<IpAddr>().is_ok() {
+        return Ok((s, None));
+    }
+    match s.rsplit_once(':') {
+        Some((h, p)) => Ok((h, Some(p.parse().map_err(|_| bad())?))),
+        None => Ok((s, None)),
+    }
+}
+
+fn check_host(host: &str) -> std::result::Result<String, String> {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        return Ok(ip.to_string());
+    }
+    normalize_host(host)
+}
+
+fn check_name(name: &str) -> std::result::Result<(), String> {
+    let ok = (1..=limits::MAX_NAME).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "name {name:?} must be 1 to {} of a-z, 0-9 and -",
+            limits::MAX_NAME
+        ))
+    }
+}
+
+fn check_reference(r: &str) -> std::result::Result<(), String> {
+    let ok = ["env:", "file:", "k8s:", "vault:"]
+        .iter()
+        .any(|p| r.len() > p.len() && r.starts_with(p))
+        && !r.chars().any(char::is_whitespace);
+    if ok {
+        Ok(())
+    } else {
+        Err("auth must be a secret reference (env:NAME, file:/path, k8s:ns/name#key, vault:path#key), never a value".into())
+    }
+}
+
+fn check_rfc(r: &str) -> std::result::Result<(), String> {
+    let (num, part) = match r.split_once('.') {
+        Some((n, p)) => (n, Some(p)),
+        None => (r, None),
+    };
+    let digits =
+        |s: &str, max: usize| (1..=max).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit());
+    if num.len() == 4 && digits(num, 4) && part.is_none_or(|p| digits(p, 3)) {
+        Ok(())
+    } else {
+        Err(format!("rfc {r:?} must be NNNN or NNNN.N"))
+    }
+}
+
+/// `"60s"`, `"5m"`, `"1h"`, `"1d"`: seconds, inside the bounds.
+///
+/// # Errors
+/// What is wrong with it.
+pub fn parse_every(s: &str) -> std::result::Result<u64, String> {
+    let bad = || format!("every = {s:?}: use a number with s, m, h or d (\"60s\", \"5m\", \"1h\")");
+    let split = s.find(|c: char| !c.is_ascii_digit()).ok_or_else(bad)?;
+    let (n, unit) = s.split_at(split);
+    let n: u64 = n.parse().map_err(|_| bad())?;
+    let secs = match unit {
+        "s" => Some(n),
+        "m" => n.checked_mul(60),
+        "h" => n.checked_mul(3_600),
+        "d" => n.checked_mul(86_400),
+        _ => return Err(bad()),
+    }
+    .ok_or_else(bad)?;
+    if (limits::MIN_EVERY_SECS..=limits::MAX_EVERY_SECS).contains(&secs) {
+        Ok(secs)
+    } else {
+        Err(format!("every = {s:?}: must be 60s to 24h"))
+    }
+}
+
+/// Canonical JSON: object keys sorted, no whitespace, arrays in order.
+#[must_use]
+pub fn canonical_json(v: &Value) -> String {
+    let mut out = String::new();
+    write_canonical(v, &mut out);
+    out
+}
+
+fn write_canonical(v: &Value, out: &mut String) {
+    match v {
+        Value::Object(m) => {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (i, k) in keys.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&Value::String(k.clone()).to_string());
+                out.push(':');
+                if let Some(x) = m.get(k) {
+                    write_canonical(x, out);
+                }
+            }
+            out.push('}');
+        }
+        Value::Array(a) => {
+            out.push('[');
+            for (i, x) in a.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_canonical(x, out);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&other.to_string()),
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(7 + 64);
+    out.push_str("sha256:");
+    for b in Sha256::digest(bytes) {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+// ---------------------------------------------------------------- lint
+
+/// How a lint judged one entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// Fine.
+    Ok,
+    /// Fine, with something to know.
+    Warning(String),
+    /// Will not work as declared.
+    Error(String),
+    /// Depends on what the name resolves to (`--resolve` decides).
+    NeedsResolve {
+        /// Host to resolve.
+        host: String,
+        /// Port.
+        port: u16,
+    },
+}
+
+/// Judges an entry against the policy without the network: a `check` (or a refusal
+/// expected from the target's answer) must be allowed by the policy; a `by = "policy"`
+/// refusal must be refused by it; a `by = "platform"` refusal should lie outside the
+/// policy's bound domains.
+#[must_use]
+pub fn lint_offline(c: &DeclaredCheck, policy: &Policy) -> Verdict {
+    let refused = policy_refusal(c, policy);
+    let warning = c
+        .spec
+        .endpoint()
+        .ok()
+        .and_then(|e| e.url)
+        .filter(|u| u.query().is_some())
+        .map(|_| {
+            "the URL's query is sent to the platform with the check; keep secrets out of it"
+                .to_owned()
+        });
+    let with_warning = |v: Verdict| match (v, &warning) {
+        (Verdict::Ok, Some(w)) => Verdict::Warning(w.clone()),
+        (v, _) => v,
+    };
+    match (c.kind, c.refuse_by) {
+        (Kind::Refuse, Some(RefuseBy::Policy)) => match refused {
+            Refusal::Refused(_) => Verdict::Ok,
+            Refusal::Allowed => Verdict::Error(
+                "the policy allows this target, so this refusal would fail (guard_open)".into(),
+            ),
+            Refusal::ByName { host, port } => Verdict::NeedsResolve { host, port },
+        },
+        (Kind::Refuse, Some(RefuseBy::Platform)) => {
+            let host = c.spec.endpoint().map(|e| e.host).unwrap_or_default();
+            if policy.domains.bound.is_empty() || !in_bound(policy, &host) {
+                with_warning(Verdict::Ok)
+            } else {
+                Verdict::Warning(format!(
+                    "{host} is inside a bound domain; the platform refuses only targets outside the account's verified domains"
+                ))
+            }
+        }
+        _ => match refused {
+            Refusal::Refused(r) => Verdict::Error(format!("the policy refuses it: {r}")),
+            // Inside a bound domain: allowed when every address is in networks.allow,
+            // which `--resolve` checks.
+            Refusal::Allowed | Refusal::ByName { .. } => with_warning(Verdict::Ok),
+        },
+    }
+}
+
+fn in_bound(policy: &Policy, host: &str) -> bool {
+    policy.domains.bound.iter().any(|d| {
+        host == d
+            || host
+                .strip_suffix(d.as_str())
+                .is_some_and(|rest| rest.ends_with('.'))
+    })
+}
+
+enum Refusal {
+    Refused(String),
+    Allowed,
+    /// Allowed by name inside a bound domain; the addresses decide.
+    ByName {
+        host: String,
+        port: u16,
+    },
+}
+
+/// What the agent's admission path would say before any DNS query.
+fn policy_refusal(c: &DeclaredCheck, policy: &Policy) -> Refusal {
+    if !policy.surface_allowed(c.spec.surface) {
+        return Refusal::Refused(format!(
+            "the {} surface is not enabled ([work] checks, surfaces)",
+            c.spec.surface.as_str()
+        ));
+    }
+    if let Some(r) = c.auth()
+        && !policy.secret_allowed(r)
+    {
+        return Refusal::Refused(format!(
+            "the secret reference {r} is not in [secrets] allow"
+        ));
+    }
+    let e = match c.spec.endpoint() {
+        Ok(e) => e,
+        Err(e) => return Refusal::Refused(e),
+    };
+    let bare = e.host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        return match policy.check_ip(ip) {
+            Ok(()) => Refusal::Allowed,
+            Err(r) => Refusal::Refused(r),
+        };
+    }
+    match normalize_host(&e.host).and_then(|h| policy.check_name(&h)) {
+        Ok(NameRule::NamedInAllow) => Refusal::Allowed,
+        Ok(NameRule::BoundDomain) => Refusal::ByName {
+            host: e.host,
+            port: e.port,
+        },
+        Err(r) => Refusal::Refused(r),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FILE: &str = r#"
+[[check]]
+name = "api"
+surface = "http"
+target = "https://api.example.com/healthz"
+every = "60s"
+expect = { status = 200, max_ms = 2000 }
+fail_after = 2
+rfc = "0029"
+
+[[check]]
+name = "api-tls"
+surface = "tls"
+target = "api.example.com"
+every = "1h"
+expect = { valid_for_days = 14 }
+
+[[refuse]]
+name = "private-is-refused"
+target = "https://db.internal/"
+by = "policy"
+every = "5m"
+
+[[refuse]]
+name = "outside-domains-is-refused"
+target = "https://example.org/"
+by = "platform"
+every = "5m"
+
+[[refuse]]
+name = "api-needs-a-token"
+surface = "http"
+target = "https://api.example.com/v1/me"
+expect = { status = 401 }
+every = "5m"
+"#;
+
+    const POLICY: &str = r#"
+environment = "staging"
+[domains]
+bound = ["example.com"]
+[networks]
+allow = ["10.0.0.0/8", "api.example.com", "cache.internal"]
+[secrets]
+allow = ["env:CHECK_*"]
+"#;
+
+    fn one(toml: &str) -> std::result::Result<DeclaredCheck, String> {
+        let parsed = parse(toml).map_err(|e| e.to_string())?;
+        parsed.into_iter().next().unwrap().1
+    }
+
+    #[test]
+    fn the_rfc_example_normalizes_to_the_contract() {
+        let c = DeclaredChecks::from_toml(FILE).unwrap();
+        let wire = Value::Array(c.wire());
+        assert_eq!(
+            wire,
+            json!([
+                {"key": "api", "kind": "check", "surface": "http",
+                 "target": {"url": "https://api.example.com/healthz"},
+                 "every_secs": 60, "fail_after": 2,
+                 "expect": {"status": 200, "max_ms": 2000}, "rfc": "0029"},
+                {"key": "api-tls", "kind": "check", "surface": "tls",
+                 "target": {"host": "api.example.com", "port": 443},
+                 "every_secs": 3600, "fail_after": 2, "expect": {"valid_for_days": 14}},
+                {"key": "private-is-refused", "kind": "refuse", "refuse_by": "policy",
+                 "surface": "http", "target": {"url": "https://db.internal/"},
+                 "every_secs": 300, "fail_after": 1},
+                {"key": "outside-domains-is-refused", "kind": "refuse", "refuse_by": "platform",
+                 "surface": "http", "target": {"url": "https://example.org/"},
+                 "every_secs": 300, "fail_after": 1},
+                {"key": "api-needs-a-token", "kind": "refuse", "refuse_by": "answer",
+                 "surface": "http", "target": {"url": "https://api.example.com/v1/me"},
+                 "every_secs": 300, "fail_after": 1, "expect": {"status": 401}}
+            ])
+        );
+    }
+
+    #[test]
+    fn canonical_form_and_hash_are_pinned() {
+        let c = DeclaredChecks::from_toml(
+            "[[refuse]]\nname = \"b\"\ntarget = \"10.0.0.1:5432\"\nby = \"policy\"\nevery = \"5m\"\n",
+        )
+        .unwrap();
+        let canonical = canonical_json(&Value::Array(c.wire()));
+        assert_eq!(
+            canonical,
+            r#"[{"every_secs":300,"fail_after":1,"key":"b","kind":"refuse","refuse_by":"policy","surface":"tcp","target":{"host":"10.0.0.1","port":5432}}]"#
+        );
+        assert_eq!(c.hash, sha256_hex(canonical.as_bytes()));
+        assert_eq!(
+            sha256_hex(b"[]"),
+            "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        );
+        assert_eq!(
+            DeclaredChecks::from_toml("").unwrap().hash,
+            sha256_hex(b"[]")
+        );
+        // Formatting and key order in the file do not change the hash; content does.
+        let same = DeclaredChecks::from_toml(
+            "[[refuse]]\nevery = \"300s\"\nby = \"policy\"\ntarget = \"10.0.0.1:5432\"\nname = \"b\"\n",
+        )
+        .unwrap();
+        assert_eq!(same.hash, c.hash);
+        let other = DeclaredChecks::from_toml(
+            "[[refuse]]\nname = \"b\"\ntarget = \"10.0.0.1:5433\"\nby = \"policy\"\nevery = \"5m\"\n",
+        )
+        .unwrap();
+        assert_ne!(other.hash, c.hash);
+    }
+
+    #[test]
+    fn entries_keep_file_order_across_tables() {
+        let c = DeclaredChecks::from_toml(
+            "[[refuse]]\nname = \"r\"\ntarget = \"10.0.0.1:1\"\nby = \"policy\"\nevery = \"5m\"\n\
+             [[check]]\nname = \"c\"\ntarget = \"10.0.0.1:2\"\nevery = \"5m\"\n\
+             [[refuse]]\nname = \"s\"\ntarget = \"10.0.0.1:3\"\nby = \"platform\"\nevery = \"5m\"\n",
+        )
+        .unwrap();
+        let keys: Vec<&str> = c.entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, ["r", "c", "s"]);
+    }
+
+    #[test]
+    fn durations() {
+        assert_eq!(parse_every("60s"), Ok(60));
+        assert_eq!(parse_every("5m"), Ok(300));
+        assert_eq!(parse_every("1h"), Ok(3_600));
+        assert_eq!(parse_every("24h"), Ok(86_400));
+        assert_eq!(parse_every("1d"), Ok(86_400));
+        for bad in [
+            "59s",
+            "25h",
+            "2d",
+            "60",
+            "1.5h",
+            "m",
+            "",
+            "5 m",
+            "-1h",
+            "99999999999999999999h",
+        ] {
+            assert!(parse_every(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn defaults() {
+        let c =
+            one("[[check]]\nname = \"a\"\ntarget = \"https://a.example.com/\"\nevery = \"1m\"\n")
+                .unwrap();
+        assert_eq!((c.fail_after, c.spec.surface), (2, Surface::Http));
+        let r = one("[[refuse]]\nname = \"a\"\ntarget = \"https://a.example.com/\"\nby = \"policy\"\nevery = \"1m\"\n").unwrap();
+        assert_eq!((r.fail_after, r.spec.surface), (1, Surface::Http));
+        let r = one("[[refuse]]\nname = \"a\"\ntarget = \"db.internal:5432\"\nby = \"policy\"\nevery = \"1m\"\n").unwrap();
+        assert_eq!(r.spec.surface, Surface::Tcp);
+        let r = one("[[refuse]]\nname = \"a\"\ntarget = { host = \"db.internal\", port = 5432 }\nby = \"platform\"\nevery = \"1m\"\n").unwrap();
+        assert_eq!(
+            (r.spec.surface, r.refuse_by),
+            (Surface::Tcp, Some(RefuseBy::Platform))
+        );
+    }
+
+    fn numbered(n: u16) -> String {
+        use std::fmt::Write as _;
+        (0..n).fold(String::new(), |mut s, i| {
+            let _ = write!(
+                s,
+                "[[check]]\nname = \"c{i}\"\ntarget = \"10.0.0.1:{}\"\nevery = \"1m\"\n",
+                i + 1
+            );
+            s
+        })
+    }
+
+    #[test]
+    fn rules_are_enforced() {
+        let base = |extra: &str| {
+            format!(
+                "[[check]]\nname = \"a\"\ntarget = \"https://a.example.com/\"\nevery = \"1m\"\n{extra}"
+            )
+        };
+        for (bad, why) in [
+            (base("colour = \"red\"\n"), "unknown key"),
+            (base("expect = { status = 99 }\n"), "status"),
+            (base("expect = { max_ms = 30001 }\n"), "max_ms"),
+            (base("expect = { valid_for_days = 0 }\n"), "valid_for_days"),
+            (base("expect = { body = \"x\" }\n"), "unknown expect key"),
+            (base("fail_after = 0\n"), "fail_after 0"),
+            (base("fail_after = 6\n"), "fail_after 6"),
+            (base("by = \"policy\"\n"), "by on a check"),
+            (base("auth = \"hunter2\"\n"), "auth value"),
+            (base("rfc = \"29\"\n"), "rfc"),
+            (base("service = \"x\"\n"), "service on http"),
+            (
+                "[[check]]\nname = \"Bad_Name\"\ntarget = \"https://a.example.com/\"\nevery = \"1m\"\n".into(),
+                "name",
+            ),
+            (
+                "[[check]]\nname = \"a\"\ntarget = \"https://u:p@a.example.com/\"\nevery = \"1m\"\n".into(),
+                "userinfo",
+            ),
+            (
+                "[[check]]\nname = \"a\"\ntarget = \"db.internal\"\nevery = \"1m\"\n".into(),
+                "tcp without port",
+            ),
+            (
+                "[[check]]\nname = \"a\"\nsurface = \"tcp\"\ntarget = \"10.0.0.1:1\"\nevery = \"1m\"\nexpect = { valid_for_days = 3 }\n".into(),
+                "valid_for_days on tcp",
+            ),
+            (
+                "[[refuse]]\nname = \"a\"\ntarget = \"https://a.example.com/\"\nevery = \"1m\"\n".into(),
+                "refuse without by",
+            ),
+            (
+                "[[refuse]]\nname = \"a\"\ntarget = \"https://a.example.com/\"\nby = \"nobody\"\nevery = \"1m\"\n".into(),
+                "unknown by",
+            ),
+            (
+                "[[refuse]]\nname = \"a\"\ntarget = \"https://a.example.com/\"\nby = \"policy\"\nexpect = { status = 401 }\nevery = \"1m\"\n".into(),
+                "by and expect",
+            ),
+        ] {
+            assert!(one(&bad).is_err(), "{why}: {bad}");
+        }
+        // File-level rules.
+        assert!(DeclaredChecks::from_toml("[[checks]]\nname = \"a\"\n").is_err());
+        let twice = format!("{}{}", base(""), base(""));
+        assert!(parse(&twice).is_err(), "duplicate names");
+        let many = numbered(51);
+        assert!(parse(&many).is_err(), "more than 50");
+        let fifty = numbered(50);
+        assert_eq!(DeclaredChecks::from_toml(&fifty).unwrap().entries.len(), 50);
+    }
+
+    #[test]
+    fn a_missing_file_is_no_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            DeclaredChecks::load(&dir.path().join("checks.toml"))
+                .unwrap()
+                .is_none()
+        );
+        std::fs::write(dir.path().join("checks.toml"), FILE).unwrap();
+        let c = DeclaredChecks::load(&dir.path().join("checks.toml"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.entries.len(), 5);
+        std::fs::write(dir.path().join("checks.toml"), "[[check]]\nname = 1\n").unwrap();
+        let e = DeclaredChecks::load(&dir.path().join("checks.toml")).unwrap_err();
+        assert!(matches!(e, Error::Checks(_)), "{e}");
+    }
+
+    fn lint_all(file: &str) -> Vec<(String, Verdict)> {
+        let p = Policy::from_toml(POLICY).unwrap();
+        parse(file)
+            .unwrap()
+            .into_iter()
+            .map(|(n, r)| (n, lint_offline(&r.unwrap(), &p)))
+            .collect()
+    }
+
+    #[test]
+    fn lint_against_the_policy() {
+        let v = lint_all(FILE);
+        assert_eq!(v[0], ("api".into(), Verdict::Ok));
+        assert_eq!(v[1].1, Verdict::Ok);
+        assert_eq!(v[2].1, Verdict::Ok, "db.internal is refused by the policy");
+        assert_eq!(
+            v[3].1,
+            Verdict::Ok,
+            "example.org is outside the bound domains"
+        );
+        assert_eq!(v[4].1, Verdict::Ok);
+    }
+
+    #[test]
+    fn lint_catches_a_check_outside_the_policy() {
+        let v = lint_all(
+            "[[check]]\nname = \"a\"\ntarget = \"https://db.internal/\"\nevery = \"1m\"\n[[check]]\nname = \"b\"\ntarget = \"192.168.0.1:22\"\nevery = \"1m\"\n[[check]]\nname = \"c\"\ntarget = \"https://api.example.com/\"\nauth = \"env:OTHER\"\nevery = \"1m\"\n",
+        );
+        for (n, verdict) in v {
+            assert!(matches!(verdict, Verdict::Error(_)), "{n}: {verdict:?}");
+        }
+    }
+
+    #[test]
+    fn lint_catches_a_policy_refusal_the_policy_would_allow() {
+        let v = lint_all(
+            "[[refuse]]\nname = \"a\"\ntarget = \"https://cache.internal/\"\nby = \"policy\"\nevery = \"5m\"\n[[refuse]]\nname = \"b\"\ntarget = \"10.1.2.3:5432\"\nby = \"policy\"\nevery = \"5m\"\n",
+        );
+        for (n, verdict) in v {
+            assert!(matches!(verdict, Verdict::Error(_)), "{n}: {verdict:?}");
+        }
+        // Inside a bound domain the addresses decide; --resolve settles it.
+        let v = lint_all(
+            "[[refuse]]\nname = \"a\"\ntarget = \"https://www.example.com/\"\nby = \"policy\"\nevery = \"5m\"\n",
+        );
+        assert!(matches!(v[0].1, Verdict::NeedsResolve { .. }), "{:?}", v[0]);
+    }
+
+    #[test]
+    fn lint_warns_on_platform_refusals_inside_bound_domains_and_queries() {
+        let v = lint_all(
+            "[[refuse]]\nname = \"a\"\ntarget = \"https://www.example.com/\"\nby = \"platform\"\nevery = \"5m\"\n[[check]]\nname = \"b\"\ntarget = \"https://api.example.com/x?y=1\"\nevery = \"5m\"\n",
+        );
+        assert!(matches!(v[0].1, Verdict::Warning(_)), "{:?}", v[0]);
+        assert!(matches!(v[1].1, Verdict::Warning(_)), "{:?}", v[1]);
+    }
+}

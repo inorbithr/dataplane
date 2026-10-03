@@ -207,6 +207,14 @@ table{{border-collapse:collapse;width:100%}}td,th{{text-align:left;padding:.25re
     );
     row(&mut h, "Bound domains", &s.policy.domains.join(", "));
     row(&mut h, "Accepts", &s.policy.capabilities.join(", "));
+    row(
+        &mut h,
+        "Declared checks",
+        &match &s.policy.checks_hash {
+            Some(hash) => format!("{} ({hash}, {})", s.policy.checks, s.policy.checks_path),
+            None => format!("none (no {})", s.policy.checks_path),
+        },
+    );
     if let Some(e) = &s.last_error {
         row(&mut h, "Last error", e);
     }
