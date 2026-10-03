@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 use tokio::sync::watch;
 use url::Url;
 use zeroize::Zeroizing;
@@ -178,10 +178,26 @@ pub struct PolicyCheckArgs {
     pub target: Option<String>,
 }
 
+/// How the person started this program: `iohr agent` when iohr runs it as an
+/// extension (iohr always passes the token socket), `iohr-agent` otherwise. Help,
+/// usage and every "run this next" hint name the command they actually typed.
+#[must_use]
+pub fn invoked_as() -> &'static str {
+    if std::env::var_os(extsock::SOCKET_ENV).is_some() {
+        "iohr agent"
+    } else {
+        "iohr-agent"
+    }
+}
+
 /// Parses arguments and runs; the process exit code.
 #[must_use]
 pub fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let matches = Cli::command().bin_name(invoked_as()).get_matches();
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(e) => e.exit(),
+    };
     tls::install_crypto_provider();
     let config_path = cli
         .config
@@ -255,7 +271,8 @@ async fn run_async(cfg: AgentConfig) -> Result<()> {
         {
             let token = std::env::var(TOKEN_ENV).ok().map(Zeroizing::new).ok_or_else(|| {
                 Error::Config(format!(
-                    "this agent is not enrolled yet: run `iohr-agent enroll --token-file <file>` or set {TOKEN_ENV}"
+                    "this agent is not enrolled yet: run `{} enroll --token-file <file>` or set {TOKEN_ENV}",
+                    invoked_as()
                 ))
             })?;
             tracing::info!("not enrolled yet; enrolling with the token from {TOKEN_ENV}");
@@ -356,7 +373,7 @@ async fn enroll_cmd(args: &EnrollArgs, config_path: &Path) -> Result<ExitCode> {
         "Key: {} (mode 0600, never leaves this machine)",
         cfg.key.display()
     ));
-    out("Start it with `iohr-agent run` (or `iohr agent run`).");
+    out(&format!("Start it with `{} run`.", invoked_as()));
     Ok(ExitCode::SUCCESS)
 }
 
@@ -780,8 +797,9 @@ async fn init(a: &InitArgs, config_path: &Path) -> Result<ExitCode> {
             let f = state_dir.join("enrollment-token");
             keys::write_private(&f, token.as_bytes(), true)?;
             out(&format!(
-                "Token saved to {} (0600, single use, one hour). Enroll with: iohr-agent --config {} enroll --token-file {}",
+                "Token saved to {} (0600, single use, one hour). Enroll with: {} --config {} enroll --token-file {}",
                 f.display(),
+                invoked_as(),
                 cfg_path.display(),
                 f.display()
             ));
@@ -802,8 +820,9 @@ async fn init(a: &InitArgs, config_path: &Path) -> Result<ExitCode> {
             })
             .await?;
             out(&format!(
-                "Enrolled as {}. Start it with: iohr agent run --config {}",
+                "Enrolled as {}. Start it with: {} run --config {}",
                 e.agent_id,
+                invoked_as(),
                 cfg_path.display()
             ));
         }
@@ -812,7 +831,8 @@ async fn init(a: &InitArgs, config_path: &Path) -> Result<ExitCode> {
                 "Next: create an enrollment in the console (Reliability > Agents) for this environment,",
             );
             out(&format!(
-                "save the token to a file, and run: iohr-agent --config {} enroll --token-file <file>",
+                "save the token to a file, and run: {} --config {} enroll --token-file <file>",
+                invoked_as(),
                 cfg_path.display()
             ));
         }
