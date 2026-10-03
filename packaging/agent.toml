@@ -1,0 +1,15 @@
+# iohr-agent configuration for a system install. Run `iohr-agent init --dir /etc/iohr-agent
+# --state-dir /var/lib/iohr-agent --force` to generate a complete one, or edit this file.
+# What the agent may do is in policy.toml, not here.
+api = "https://api.inorbit.hr"
+name = "CHANGE-ME"
+environment = "staging"
+policy = "/etc/iohr-agent/policy.toml"
+key = "/var/lib/iohr-agent/agent.key"
+state_dir = "/var/lib/iohr-agent"
+
+[admin]
+listen = "127.0.0.1:7790"
+
+[telemetry]
+enabled = false

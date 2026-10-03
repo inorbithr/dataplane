@@ -1,0 +1,48 @@
+[Unit]
+Description=InOrbit agent (iohr-agent): dials out, obeys /etc/iohr-agent/policy.toml
+Documentation=https://github.com/inorbithr/dataplane
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=iohr-agent
+Group=iohr-agent
+Environment=IOHR_AGENT_CONFIG=/etc/iohr-agent/agent.toml
+# An enrollment token for the first start may be put here (mode 0600, root-owned):
+EnvironmentFile=-/etc/iohr-agent/enrollment.env
+ExecStart=/usr/bin/iohr-agent run --json-logs
+Restart=on-failure
+RestartSec=5s
+# Exit code 3 means the platform revoked this agent: do not restart it.
+RestartPreventExitStatus=2 3
+StateDirectory=iohr-agent
+StateDirectoryMode=0700
+
+# No privileges: it only opens outbound connections and a loopback admin page.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
