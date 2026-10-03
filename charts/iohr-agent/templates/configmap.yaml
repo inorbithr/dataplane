@@ -11,6 +11,9 @@ data:
     name = {{ .Values.name | default .Release.Name | quote }}
     environment = {{ $env | quote }}
     policy = "/etc/iohr-agent/policy/policy.toml"
+    {{- if include "iohr-agent.checks" . }}
+    checks = "/etc/iohr-agent/checks/checks.toml"
+    {{- end }}
     key = "/var/lib/iohr-agent/agent.key"
     state_dir = "/var/lib/iohr-agent"
 
@@ -37,4 +40,16 @@ metadata:
 data:
   policy.toml: |
     {{- .Values.policy.policyToml | nindent 4 }}
+{{- end }}
+{{- if and .Values.checks.checksToml (not .Values.checks.existingConfigMap) }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "iohr-agent.fullname" . }}-checks
+  labels:
+    {{- include "iohr-agent.labels" . | nindent 4 }}
+data:
+  checks.toml: |
+    {{- .Values.checks.checksToml | nindent 4 }}
 {{- end }}
