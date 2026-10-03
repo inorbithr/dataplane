@@ -2,8 +2,8 @@ apiVersion: v2
 name: iohr-agent
 description: The InOrbit agent. Dials out to the platform, obeys a local policy, runs checks in your cluster's network.
 type: application
-version: 0.1.0-alpha.1
-appVersion: "0.1.0-alpha.1"
+version: 0.1.0-alpha.2
+appVersion: "0.1.0-alpha.2"
 home: https://github.com/inorbithr/dataplane
 sources:
   - https://github.com/inorbithr/dataplane

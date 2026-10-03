@@ -15,7 +15,7 @@ for dir in dist/bin/linux-*; do
   # Both tools package the binary from the target directory: put the static one there.
   mkdir -p "$target_dir/$t/release"
   cp "$dir/iohr-agent" "$target_dir/$t/release/iohr-agent"
-  cargo deb -p iohr-agent --no-build --target "$t" --output dist/packages/
+  cargo deb -p iohr-agent --no-build --no-strip --target "$t" --output dist/packages/
   cargo generate-rpm -p crates/iohr-agent --target "$t" --arch "$rpm_arch" -o dist/packages/
 done
 ls -1 dist/packages
