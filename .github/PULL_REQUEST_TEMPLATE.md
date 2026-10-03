@@ -2,6 +2,10 @@
 
 <!-- One or two sentences. Link the issue. -->
 
+<!-- One line per platform RFC this implements (RFC 0041); only these lines link the PR to an RFC:
+Implements: RFC 0040.1
+-->
+
 ## Checklist
 
 - [ ] `mise run ci` passes locally
