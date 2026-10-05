@@ -1,23 +1,34 @@
-# Weekly, grouped, and never a version younger than the cooldown: a compromised release
-# usually surfaces within days.
+# Every dependency stays on its latest version, majors included (CONTRIBUTING.md,
+# Dependencies). Updates arrive grouped: one pull request per ecosystem for patch and
+# minor, which merges itself once `ci-ok` passes (dependabot-automerge.yml), and one for
+# majors, where a maintainer adapts the code in the same pull request. Never a version
+# younger than the cooldown: a compromised release usually surfaces within days.
+# Security updates ignore the schedule and the cooldown.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
-    schedule: { interval: weekly, day: monday }
+    schedule: { interval: daily }
     cooldown: { default-days: 7 }
-    groups: { actions: { patterns: ["*"] } }
+    groups:
+      actions: { patterns: ["*"], update-types: [minor, patch] }
+      actions-major: { patterns: ["*"], update-types: [major] }
     commit-message: { prefix: "ci", include: scope }
 
   - package-ecosystem: cargo
     directory: /
     schedule: { interval: weekly, day: monday }
     cooldown: { default-days: 7 }
-    groups: { cargo: { patterns: ["*"] } }
+    groups:
+      cargo: { patterns: ["*"], update-types: [minor, patch] }
+      cargo-major: { patterns: ["*"], update-types: [major] }
     commit-message: { prefix: "build(deps)" }
 
   - package-ecosystem: docker
     directory: /
     schedule: { interval: weekly, day: monday }
     cooldown: { default-days: 7 }
+    groups:
+      docker: { patterns: ["*"], update-types: [minor, patch] }
+      docker-major: { patterns: ["*"], update-types: [major] }
     commit-message: { prefix: "build(deps)" }

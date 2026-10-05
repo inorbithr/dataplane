@@ -1,0 +1,46 @@
+name: dependabot auto-merge
+
+# Dependabot's patch and minor updates merge themselves once the required checks pass
+# (CONTRIBUTING.md, Dependencies). This job only turns on auto-merge; the ruleset still
+# requires `ci-ok`, so nothing merges red. Majors stay for a maintainer, and so does a
+# 0.x minor (0.29 to 0.30), which SemVer treats as breaking.
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions: {}
+
+jobs:
+  auto-merge:
+    name: auto-merge
+    # Opened by Dependabot. fetch-metadata returns no metadata unless every commit is
+    # Dependabot's, so a commit from anyone else on the branch leaves it for review.
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - id: meta
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+      - name: Auto-merge patch and minor updates
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          UPDATES: ${{ steps.meta.outputs.updated-dependencies-json }}
+        run: |
+          if [ "$(jq 'length' <<<"${UPDATES:-[]}")" = 0 ]; then
+            echo "no update metadata: left for review"
+            exit 0
+          fi
+          # Every dependency must be a patch (not 0.0.x), or a minor at 1.0 or later.
+          blocking=$(jq -r '[.[] | (.prevVersion // "0.0.0") as $prev | select(
+              (.updateType != "version-update:semver-patch" and .updateType != "version-update:semver-minor")
+              or (.updateType == "version-update:semver-minor" and ($prev | test("^v?0\\.")))
+              or (.updateType == "version-update:semver-patch" and ($prev | test("^v?0\\.0\\.")))
+            ) | .dependencyName] | unique | join(", ")' <<<"$UPDATES")
+          if [ -n "$blocking" ]; then
+            echo "left for review (major or breaking 0.x update): $blocking"
+            exit 0
+          fi
+          gh pr merge --auto --squash "$PR_URL"
