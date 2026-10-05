@@ -131,12 +131,12 @@ fn verify(jwt: &str, jwk: &Value) -> Option<Value> {
             use p256::ecdsa::signature::Verifier as _;
             let x = B64.decode(jwk["x"].as_str()?).ok()?;
             let y = B64.decode(jwk["y"].as_str()?).ok()?;
-            let point = p256::EncodedPoint::from_affine_coordinates(
-                x.as_slice().into(),
-                y.as_slice().into(),
+            let point = p256::Sec1Point::from_affine_coordinates(
+                x.as_slice().try_into().ok()?,
+                y.as_slice().try_into().ok()?,
                 false,
             );
-            let vk = p256::ecdsa::VerifyingKey::from_encoded_point(&point).ok()?;
+            let vk = p256::ecdsa::VerifyingKey::from_sec1_point(&point).ok()?;
             vk.verify(
                 input.as_bytes(),
                 &p256::ecdsa::Signature::from_slice(&sig).ok()?,
