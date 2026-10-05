@@ -27,6 +27,22 @@ someone else's network, and how a change gets merged.
 - **Integration tests use the fake control plane** in `crates/iohr-agent/tests/`, which
   speaks the shared contract: real servers on port 0, no mocks of the agent's own parts.
 
+## Dependencies
+
+Every crate, toolchain, tool, base image and action stays on its latest release, majors
+included; a major update adapts the code in the same pull request rather than waiting.
+The minimum supported Rust (`rust-version`, 1.94) is raised only on its own, as a
+decision.
+
+- Dependabot (`.github/dependabot.yml`) checks Cargo and the Docker base images weekly and
+  the actions daily, with a 7-day cooldown, grouped into one pull request for patch and
+  minor and one for majors per ecosystem.
+- Patch and minor updates (minor only at 1.0 or later; a 0.x minor is breaking) merge
+  themselves once `ci-ok` passes (`.github/workflows/dependabot-automerge.yml`, which runs
+  only for pull requests Dependabot opened). Majors wait for a maintainer.
+- `mise.toml` is outside Dependabot: `mise outdated --bump` lists what is behind, and the
+  Rust image in `Dockerfile.source` follows the Rust in `mise.toml`.
+
 ## Commits and pull requests
 
 - Titles follow [Conventional Commits](https://www.conventionalcommits.org):
