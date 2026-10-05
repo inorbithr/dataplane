@@ -101,7 +101,7 @@ impl AgentKey {
     fn thumbprint_members(&self) -> Value {
         match self {
             Self::Es256(k) => {
-                let point = k.verifying_key().to_encoded_point(false);
+                let point = k.verifying_key().to_sec1_point(false);
                 let x = point.x().map(|x| B64.encode(x)).unwrap_or_default();
                 let y = point.y().map(|y| B64.encode(y)).unwrap_or_default();
                 json!({"crv": "P-256", "kty": "EC", "x": x, "y": y})
@@ -275,12 +275,12 @@ mod tests {
                 use p256::ecdsa::signature::Verifier as _;
                 let x = B64.decode(jwk["x"].as_str().unwrap()).unwrap();
                 let y = B64.decode(jwk["y"].as_str().unwrap()).unwrap();
-                let point = p256::EncodedPoint::from_affine_coordinates(
-                    x.as_slice().into(),
-                    y.as_slice().into(),
+                let point = p256::Sec1Point::from_affine_coordinates(
+                    x.as_slice().try_into().unwrap(),
+                    y.as_slice().try_into().unwrap(),
                     false,
                 );
-                let vk = p256::ecdsa::VerifyingKey::from_encoded_point(&point).unwrap();
+                let vk = p256::ecdsa::VerifyingKey::from_sec1_point(&point).unwrap();
                 let sig = p256::ecdsa::Signature::from_slice(&sig).unwrap();
                 vk.verify(input.as_bytes(), &sig).is_ok()
             }
