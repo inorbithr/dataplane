@@ -5,6 +5,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 target_dir="${CARGO_TARGET_DIR:-target}"
 mkdir -p dist/packages
+# RPM versions may not contain '-': a pre-release is written with '~' (0.1.0~alpha.4), which
+# RPM sorts before the release, as Debian does.
+version=$(cargo pkgid -p iohr-agent | sed 's/.*[#@]//')
+rpm_version="${version//-/\~}"
 for dir in dist/bin/linux-*; do
   arch="${dir##*-}"
   case "$arch" in
@@ -16,6 +20,7 @@ for dir in dist/bin/linux-*; do
   mkdir -p "$target_dir/$t/release"
   cp "$dir/iohr-agent" "$target_dir/$t/release/iohr-agent"
   cargo deb -p iohr-agent --no-build --no-strip --target "$t" --output dist/packages/
-  cargo generate-rpm -p crates/iohr-agent --target "$t" --arch "$rpm_arch" -o dist/packages/
+  cargo generate-rpm -p crates/iohr-agent --target "$t" --arch "$rpm_arch" -o dist/packages/ \
+    -s "version = \"$rpm_version\""
 done
 ls -1 dist/packages
