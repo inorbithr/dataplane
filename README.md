@@ -1,12 +1,4 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/logo-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset=".github/assets/logo-light.svg">
-    <img alt="InOrbit data plane logo: concentric rings around an amber dot" src=".github/assets/logo-light.svg" width="88" height="88">
-  </picture>
-</p>
-
-<h1 align="center">dataplane</h1>
+<p align="center"><img alt="dataplane: iohr agent run in a terminal with http, tls and grpc checks passing and one target refused by policy, over request timings and zero bodies sent" src=".github/assets/social-preview.png" width="100%"></p>
 
 <p align="center">InOrbit data plane for reliability testing, observability, and experiment execution.</p>
 
