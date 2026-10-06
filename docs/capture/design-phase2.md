@@ -153,7 +153,9 @@ wrong response.
 - **HTTP/1.** A request starts with a segment from the client that begins with a method,
   and a response with a segment from the server that begins with `HTTP/1.x NNN`.
   Responses pair with the oldest waiting request (pipelining keeps order). At most 16
-  requests wait per flow. A `1xx` response is not the answer: `100 Continue` is skipped,
+  requests wait per flow. Pipelined requests that share one TCP segment count as one (only a
+  segment's start is read), so a pipelining client is under-counted; responses that share
+  a segment the same way. A `1xx` response is not the answer: `100 Continue` is skipped,
   and `101` ends timing for the flow.
 - **HTTP/2 (h2c, gRPC).** Frames are followed across segments using the frame lengths and
   the sequence numbers, from the client preface and the server's first SETTINGS. A
