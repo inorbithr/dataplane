@@ -65,6 +65,9 @@ if f:
     s, l = f["small_ring"], f["rate_limited"]
     print(f"  flood    4 KiB ring: ring full {s['drops']['ring_buffer_full']}, flows evicted {s['flows']['evicted']}, rss {s['memory']['rss_kib']} KiB;"
           f" 100/s: rate limited {l['drops']['rate_limited']}, rss {l['memory']['rss_kib']} KiB" + (f"  FAILED: {', '.join(bad)}" if bad else ""))
+if f and f.get("timing"):
+    t = f["timing"]
+    print(f"  timing flood  40000 unanswered requests: budget {t['budget']}, parser rss {t['memory']['rss_kib']} KiB, parent rss {t['parent_rss_kib']} KiB")
 if f:
     u = f["unlimited"]
     print(f"           16 MiB ring, no limit: ring full {u['drops']['ring_buffer_full']}, read {u['copy']['records_read']} of {u['copy']['records_copied']} copied,"

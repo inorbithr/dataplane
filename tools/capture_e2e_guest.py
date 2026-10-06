@@ -759,12 +759,16 @@ def phase2(binary, version):
     agent_tables, agent_tables_raw = query(binary, tables=True, user=("65534", "65534", ["--clear-groups"]))
     # Layer 3: pcap on request.
     ctl = f"{SCRATCH}/sock/control.sock"
-    out_copy = f"{SCRATCH}/for-nobody.pcapng"
+    # The copy is created as the sudo user (nobody here), so in a directory nobody owns.
+    nobody_dir = f"{SCRATCH}/nobody"
+    os.makedirs(nobody_dir, exist_ok=True)
+    os.chown(nobody_dir, 65534, 65534)
+    out_copy = f"{nobody_dir}/for-nobody.pcapng"
     if os.path.exists(out_copy):
         os.unlink(out_copy)
     env = dict(os.environ, SUDO_UID="65534", SUDO_GID="65534")
-    last = subprocess.run([binary, "pcap", "--control-socket", ctl, "--seconds", "60", "--filter", f"tcp and port {T_HTTP_PORT}",
-                           "--out", out_copy, "--json"], capture_output=True, text=True, timeout=60, env=env)
+    last = subprocess.run([binary, "pcap", "--control-socket", ctl, "--pcap-dir", pcap_dir, "--seconds", "60",
+                           "--filter", f"tcp and port {T_HTTP_PORT}", "--out", out_copy, "--json"], capture_output=True, text=True, timeout=60, env=env)
     try:
         last_answer = json.loads(last.stdout)
     except json.JSONDecodeError:
@@ -805,7 +809,13 @@ def phase2(binary, version):
         time.sleep(0.5)
     deleted = not os.path.exists(companion_file)
     status_after = control_as("0", ctl, {"version": 1, "request": "status"})
+    subprocess.run([binary, "pcap", "--control-socket", ctl, "--pcap-dir", pcap_dir, "--seconds", "5"],
+                   capture_output=True, text=True, timeout=30)
     report = stop_capture(proc, log, "phase2")
+    # When the companion stops, its cleanup removes the pcap files that are left.
+    leftover = [f for f in os.listdir(pcap_dir) if f.startswith("iohr-")] if os.path.isdir(pcap_dir) else []
+    sh(f"{binary} cleanup --interface veth-cap --pcap-dir {pcap_dir}", check=False)
+    after_cleanup = [f for f in os.listdir(pcap_dir) if f.startswith("iohr-")] if os.path.isdir(pcap_dir) else []
     for p in servers:
         p.kill()
         p.wait()
@@ -863,6 +873,7 @@ def phase2(binary, version):
         "pcap_cli_refuses_non_root": pcap_cli_nonroot.returncode == 2,
         "pcap_deleted_after_retention": deleted,
         "person_copy_kept": os.path.exists(out_copy),
+        "cleanup_removes_pcap_files_on_stop": len(leftover) > 0 and after_cleanup == [],
         "packets_copied_without_drops": status_after.get("received", 0) > 0
         and (snap or {}).get("packets", {}).get("ring_buffer_full", 1) == 0,
     }
@@ -878,9 +889,66 @@ def phase2(binary, version):
         "as_owner": as_owner,
         "as_other": as_other,
         "status_after": status_after,
+        "next_read_stderr": next_read.stderr[-500:],
+        "next_stderr": nxt_err[-500:],
         "attach": report["attach"],
         "client_stderr": client.stderr[-1000:],
     }
+
+
+SINK_PORT = 8099
+N_SINK_CONNS = 2500
+SINK = f"""
+import resource, socket, threading
+resource.setrlimit(resource.RLIMIT_NOFILE, (20000, 20000))
+l = socket.socket()
+l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+l.bind(("{CAP_ADDR}", {SINK_PORT}))
+l.listen(4096)
+held = []
+while True:
+    c, _ = l.accept()
+    held.append(c)  # read nothing, answer nothing
+"""
+SINK_CLIENT = f"""
+import resource, socket, time
+resource.setrlimit(resource.RLIMIT_NOFILE, (20000, 20000))
+req = b"GET /flood/1 HTTP/1.1\\r\\nHost: f\\r\\n\\r\\n"
+conns = []
+for i in range({N_SINK_CONNS}):
+    s = socket.create_connection(("{CAP_ADDR}", {SINK_PORT}))
+    for k in range(16):
+        s.sendall(req)
+    conns.append(s)
+    if i % 100 == 99:
+        time.sleep(0.05)
+time.sleep(3)
+"""
+
+
+def timing_flood(binary):
+    """Requests that are never answered on 2500 connections (40000 waiting): the timing
+    budget caps what the parser holds, the rest is counted, memory stays bounded."""
+    setup()
+    sink = subprocess.Popen(["python3", "-c", SINK])
+    for _ in range(50):
+        if port_open(SINK_PORT):
+            break
+        time.sleep(0.1)
+    proc, log = start_capture(binary, "auto", ["--samples-per-sec", "0", "--ring-buffer-kib", "16384"])
+    peer(["python3", "-c", SINK_CLIENT], timeout=180)
+    time.sleep(1.5)
+    parent_rss = rss_kib(proc.pid)
+    snap, raw = query(binary, tables=False)
+    stop_capture(proc, log, "timing flood")
+    sink.kill()
+    sink.wait()
+    sh("ip netns del peer", check=False)
+    sh("ip link del veth-cap", check=False)
+    if snap is None:
+        raise SystemExit(f"no answer during the timing flood: {raw.stderr}")
+    return {"budget": snap["timing"]["budget"], "memory": snap["memory"], "parent_rss_kib": parent_rss,
+            "drops": snap["drops"], "flows": snap["flows"]}
 
 
 def flood(binary, mode, extra):
@@ -1121,12 +1189,17 @@ def main():
     # Whole packets under the flood: the buffer stays at its 4 MiB, older packets go out.
     packets = flood(binary, "auto", ["--packets", "--packets-per-sec", "0", "--packets-buffer-mib", "4",
                                      "--pcap-dir", f"{SCRATCH}/pcap-flood"])
+    tflood = timing_flood(binary)
     results["flood"] = {
         "small_ring": small,
         "rate_limited": limited,
         "unlimited": unlimited,
         "packets": packets,
+        "timing": tflood,
         "checks": {
+            "timing_budget_holds": tflood["budget"]["pending_peak"] <= tflood["budget"]["pending_max"]
+            and tflood["budget"]["refused"] > 0
+            and tflood["memory"]["rss_kib"] < 64 * 1024,
             "packets_buffer_bounded": packets["packets"]["buffered_bytes"] <= 4 * 1024 * 1024
             and packets["packets"]["buffer_evicted"] > 0 and packets["totals_exact"],
             "layer2_alive_after_unlimited_flood": unlimited["dns_after_flood"] == 5,
