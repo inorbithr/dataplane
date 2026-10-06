@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+if [ "$1" = "configure" ]; then
+  if ! getent passwd iohr-capture >/dev/null; then
+    adduser --system --group --no-create-home --home /nonexistent iohr-capture >/dev/null
+  fi
+  chown root:iohr-capture /etc/iohr-capture /etc/iohr-capture/capture.env
+  chmod 0750 /etc/iohr-capture
+  chmod 0640 /etc/iohr-capture/capture.env
+fi
+#DEBHELPER#

@@ -1,0 +1,25 @@
+# cargo-deny for the eBPF crate, which is not a workspace member (its own Cargo.lock).
+# Same rules as the workspace's deny.toml, plus GPL-2.0 for this crate alone: the kernel
+# requires a GPL-compatible licence of programs that call GPL-only helpers
+# (docs/adr/0002-capture-companion.md). Nothing else may be GPL.
+
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+confidence-threshold = 0.9
+allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
+exceptions = [{ crate = "iohr-capture-ebpf", allow = ["GPL-2.0"] }]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

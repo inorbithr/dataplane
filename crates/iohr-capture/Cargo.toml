@@ -1,0 +1,70 @@
+[package]
+name = "iohr-capture"
+description = "The InOrbit capture companion: loads eBPF traffic counters, drops its privileges, reports counts only."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+readme = "../../docs/capture/install.md"
+
+[[bin]]
+name = "iohr-capture"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "time", "signal", "macros"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya.workspace = true
+iohr-capture-common = { path = "../iohr-capture-common", features = ["user"] }
+rustix.workspace = true
+
+[build-dependencies]
+# Compiles crates/iohr-capture-ebpf (not a workspace member: its own Cargo.lock, nightly
+# and licence) for the BPF target; build.rs reruns when that directory changes.
+aya-build.workspace = true
+
+[lints]
+workspace = true
+
+# .deb: static binary and systemd unit (installed, never enabled or started), settings
+# owned by the admin. tshark is only suggested: dissection runs the host's own copy, as
+# the person who asks (docs/adr/0002).
+[package.metadata.deb]
+name = "iohr-capture"
+maintainer = "InOrbit d.o.o. <security@inorbit.hr>"
+copyright = "2026, InOrbit d.o.o."
+license-file = ["../../LICENSE", "0"]
+extended-description = "The privileged companion of iohr-agent: attaches eBPF TC classifiers to one interface, drops its capabilities, counts packets and bytes per direction. Never drops a packet; stores and sends nothing in this version."
+section = "net"
+priority = "optional"
+depends = "adduser"
+suggests = "tshark"
+maintainer-scripts = "../../packaging/deb-capture/"
+conf-files = ["/etc/iohr-capture/capture.env"]
+systemd-units = { unit-name = "iohr-capture", unit-scripts = "../../packaging/systemd", enable = false, start = false }
+assets = [
+  ["target/release/iohr-capture", "usr/bin/", "755"],
+  ["../../packaging/capture.env", "etc/iohr-capture/capture.env", "640"],
+  ["../../docs/capture/install.md", "usr/share/doc/iohr-capture/README.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "iohr-capture"
+license = "Apache-2.0 AND (MIT OR GPL-2.0-only)"
+summary = "InOrbit capture companion: eBPF traffic counters, counts only"
+pre_install_script = "../../packaging/rpm-capture-pre.sh"
+assets = [
+  { source = "target/release/iohr-capture", dest = "/usr/bin/iohr-capture", mode = "755" },
+  { source = "../../packaging/systemd/iohr-capture.service", dest = "/usr/lib/systemd/system/iohr-capture.service", mode = "644" },
+  { source = "../../packaging/capture.env", dest = "/etc/iohr-capture/capture.env", mode = "640", config = "noreplace", group = "iohr-capture" },
+]

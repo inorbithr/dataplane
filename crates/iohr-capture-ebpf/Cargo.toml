@@ -1,0 +1,31 @@
+# The eBPF programs of iohr-capture. Not a workspace member: it is built for the BPF
+# target with the pinned nightly in rust-toolchain.toml (and bpf-linker) by
+# crates/iohr-capture/build.rs through aya-build. It is the only crate with `unsafe`
+# (the eBPF context API needs it; the kernel verifier checks every program) and the only
+# one under a GPL-compatible licence, which the kernel requires of programs that call
+# GPL-only helpers (docs/adr/0002-capture-companion.md).
+[package]
+name = "iohr-capture-ebpf"
+description = "eBPF programs of iohr-capture (TC classifiers that count, never drop)."
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR GPL-2.0"
+repository = "https://github.com/inorbithr/dataplane"
+publish = false
+
+[dependencies]
+aya-ebpf = { version = "0.2.1", default-features = false }
+iohr-capture-common = { path = "../iohr-capture-common" }
+
+[[bin]]
+name = "iohr-capture"
+path = "src/main.rs"
+
+[lints.rust]
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "warn"

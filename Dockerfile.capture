@@ -1,0 +1,27 @@
+# syntax=docker/dockerfile:1
+# The iohr-capture image: the static binary on distroless, nothing else. Built like the
+# agent's image from dist/bin/linux-<arch>/ (tools/dist-bin.sh or the release workflow).
+#
+# It starts as uid 0 because Docker gives capabilities to root only (no ambient
+# capabilities for other users); run it with every capability dropped except the three it
+# needs, which it gives up itself right after attaching (docs/capture/install.md):
+#
+#   docker run --rm --network host --cap-drop ALL \
+#     --cap-add BPF --cap-add PERFMON --cap-add NET_ADMIN --security-opt no-new-privileges \
+#     -v /sys/kernel/btf:/sys/kernel/btf:ro ghcr.io/inorbithr/iohr-capture:<version> \
+#     run --interface eth0 --for 30
+#
+# Never --privileged.
+FROM gcr.io/distroless/static-debian13:latest@sha256:58133991db06659feaabe0f4e97a35cebf15ef4ea08f8a4c6d2ee5f75e4aa6a0
+ARG TARGETARCH
+ARG VERSION=dev
+LABEL org.opencontainers.image.title="iohr-capture" \
+      org.opencontainers.image.description="InOrbit capture companion: eBPF traffic counters, counts only, never drops" \
+      org.opencontainers.image.source="https://github.com/inorbithr/dataplane" \
+      org.opencontainers.image.licenses="Apache-2.0 AND (MIT OR GPL-2.0)" \
+      org.opencontainers.image.vendor="InOrbit d.o.o." \
+      org.opencontainers.image.version="${VERSION}"
+COPY --chmod=0555 dist/bin/linux-${TARGETARCH}/iohr-capture /usr/bin/iohr-capture
+USER 0:0
+ENTRYPOINT ["/usr/bin/iohr-capture"]
+CMD ["doctor"]

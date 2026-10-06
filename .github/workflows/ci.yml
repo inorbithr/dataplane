@@ -46,7 +46,7 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
         with:
-          install_args: "rust cargo-binstall cargo:cargo-nextest cargo-deny"
+          install_args: "rust cargo-binstall cargo:cargo-nextest cargo-deny cargo:bpf-linker"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: mise run check
 
@@ -77,12 +77,13 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
         with:
-          install_args: "rust cargo-binstall cargo:cargo-deb cargo:cargo-generate-rpm cargo:cargo-cyclonedx cyclonedx"
+          install_args: "rust cargo-binstall cargo:cargo-deb cargo:cargo-generate-rpm cargo:cargo-cyclonedx cyclonedx cargo:bpf-linker"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: mise run dist:packages
       - run: mise run dist:sbom
       - run: python3 tools/ext_artifact.py --version 0.0.0-ci
       - run: docker build -t iohr-agent:ci . && docker run --rm iohr-agent:ci --version
+      - run: docker build -f Dockerfile.capture -t iohr-capture:ci . && docker run --rm iohr-capture:ci --version
 
   ci-ok:
     name: ci-ok
