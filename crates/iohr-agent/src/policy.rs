@@ -3,7 +3,7 @@
 //! `docs/policy.md` for the reference.
 
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ipnet::IpNet;
@@ -44,6 +44,10 @@ pub struct Policy {
     /// Which secret references a job may name.
     #[serde(default)]
     pub secrets: SecretsPolicy,
+    /// Where and what to read from the capture companion (`[work] capture` turns it on).
+    /// Left out of the hashed form while absent, so policies without it keep their hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<CapturePolicy>,
     #[serde(skip)]
     compiled: Compiled,
 }
@@ -95,6 +99,7 @@ fn default_deny() -> Vec<String> {
 /// `[work]`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)] // one switch per kind of work, as in the TOML
 pub struct Work {
     /// Surface checks.
     #[serde(default = "yes")]
@@ -108,6 +113,83 @@ pub struct Work {
     /// Which check surfaces are accepted.
     #[serde(default = "all_surfaces")]
     pub surfaces: Vec<Surface>,
+    /// Read the capture companion's aggregates and announce what it can show
+    /// (`capture:*` in the hello). Off by default; left out of the hashed form while off.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub capture: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if passes a reference
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// The default aggregates socket of the capture companion (`docs/capture/design-phase1.md`).
+pub const CAPTURE_SOCKET: &str = "/run/iohr-capture/aggregates.sock";
+
+/// A capture layer the agent may announce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureLayer {
+    /// Layer 1: packet and byte counts per protocol, port and TCP flag.
+    Headers,
+    /// Layer 2: protocols recognised from a flow's first bytes.
+    Protocols,
+    /// Layer 4: the process, container or pod owning a socket.
+    Owners,
+    /// Layer 5: TCP health (RTT, retransmits, resets, listen overflows).
+    Tcp,
+}
+
+impl CaptureLayer {
+    /// Every layer of this version.
+    pub const ALL: [Self; 4] = [Self::Headers, Self::Protocols, Self::Owners, Self::Tcp];
+
+    /// The wire name (`headers`, ...).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Headers => "headers",
+            Self::Protocols => "protocols",
+            Self::Owners => "owners",
+            Self::Tcp => "tcp",
+        }
+    }
+}
+
+/// `[capture]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapturePolicy {
+    /// The companion's aggregates socket.
+    #[serde(default = "capture_socket")]
+    pub socket: PathBuf,
+    /// Which layers the agent may announce (when the companion runs them).
+    #[serde(default = "capture_layers")]
+    pub layers: Vec<CaptureLayer>,
+    /// An answer older than this counts as no answer.
+    #[serde(default = "capture_age")]
+    pub max_snapshot_age_secs: u64,
+}
+
+impl Default for CapturePolicy {
+    fn default() -> Self {
+        Self {
+            socket: capture_socket(),
+            layers: capture_layers(),
+            max_snapshot_age_secs: capture_age(),
+        }
+    }
+}
+
+fn capture_socket() -> PathBuf {
+    PathBuf::from(CAPTURE_SOCKET)
+}
+fn capture_layers() -> Vec<CaptureLayer> {
+    CaptureLayer::ALL.to_vec()
+}
+fn capture_age() -> u64 {
+    30
 }
 
 impl Default for Work {
@@ -117,6 +199,7 @@ impl Default for Work {
             load: false,
             faults: false,
             surfaces: all_surfaces(),
+            capture: false,
         }
     }
 }
@@ -299,6 +382,24 @@ impl Policy {
                 ));
             }
         }
+        if let Some(cap) = &mut self.capture {
+            if !cap.socket.is_absolute() {
+                return Err(format!(
+                    "capture.socket must be an absolute path, not {}",
+                    cap.socket.display()
+                ));
+            }
+            if !(1..=3600).contains(&cap.max_snapshot_age_secs) {
+                return Err("capture.max_snapshot_age_secs must be 1 to 3600".into());
+            }
+            let mut seen = Vec::with_capacity(cap.layers.len());
+            for l in &cap.layers {
+                if !seen.contains(l) {
+                    seen.push(*l);
+                }
+            }
+            cap.layers = seen;
+        }
         self.compiled = c;
         Ok(())
     }
@@ -327,6 +428,15 @@ impl Policy {
                 Some(prefix) => reference.starts_with(prefix),
                 None => reference == p,
             })
+    }
+
+    /// The capture settings in force: `Some` only when `[work] capture = true` (the
+    /// defaults when there is no `[capture]` section).
+    #[must_use]
+    pub fn capture(&self) -> Option<CapturePolicy> {
+        self.work
+            .capture
+            .then(|| self.capture.clone().unwrap_or_default())
     }
 
     /// Whether a surface is accepted.
@@ -633,6 +743,56 @@ allow = ["vault:kv/staging/*", "env:CHECK_TOKEN"]
         assert!(p.secret_allowed("env:CHECK_TOKEN"));
         assert!(!p.secret_allowed("env:CHECK_TOKEN_2"));
         assert!(!p.secret_allowed("env:VAULT_TOKEN"));
+    }
+
+    #[test]
+    fn capture_is_off_by_default_and_keeps_old_hashes() {
+        let p = Policy::from_toml(POLICY).unwrap();
+        assert!(!p.work.capture);
+        assert_eq!(p.capture(), None);
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(
+            !json.contains("capture"),
+            "absent from the hashed form: {json}"
+        );
+        // The hash of a policy without capture is the hash before capture existed.
+        assert_eq!(
+            p.hash(),
+            Policy::from_toml(&POLICY.replace("[secrets]", "[work]\ncapture = false\n[secrets]"))
+                .unwrap()
+                .hash()
+        );
+    }
+
+    #[test]
+    fn capture_section() {
+        let on = Policy::from_toml(&format!("{POLICY}[work]\ncapture = true\n")).unwrap();
+        let c = on.capture().unwrap();
+        assert_eq!(c.socket, Path::new(CAPTURE_SOCKET));
+        assert_eq!(c.layers, CaptureLayer::ALL);
+        assert_eq!(c.max_snapshot_age_secs, 30);
+        assert_ne!(on.hash(), Policy::from_toml(POLICY).unwrap().hash());
+        let p = Policy::from_toml(&format!(
+            "{POLICY}[work]\ncapture = true\n[capture]\nsocket = \"/tmp/a.sock\"\nlayers = [\"tcp\", \"headers\", \"tcp\"]\nmax_snapshot_age_secs = 5\n"
+        ))
+        .unwrap();
+        let c = p.capture().unwrap();
+        assert_eq!(c.layers, [CaptureLayer::Tcp, CaptureLayer::Headers]);
+        assert_eq!(c.max_snapshot_age_secs, 5);
+        // A section without the switch is accepted and does nothing.
+        let off = Policy::from_toml(&format!("{POLICY}[capture]\nlayers = [\"tcp\"]\n")).unwrap();
+        assert_eq!(off.capture(), None);
+        for bad in [
+            "[capture]\nsocket = \"relative.sock\"",
+            "[capture]\nlayers = [\"packets\"]",
+            "[capture]\nmax_snapshot_age_secs = 0",
+            "[capture]\nextra = 1",
+        ] {
+            assert!(
+                Policy::from_toml(&format!("{POLICY}{bad}\n")).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

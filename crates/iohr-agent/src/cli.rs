@@ -1,4 +1,5 @@
-//! The command line: `init`, `enroll`, `run`, `status`, `policy check`, `checks lint`. As an iohr
+//! The command line: `init`, `enroll`, `run`, `status`, `policy check`, `checks lint`,
+//! `capture status`. As an iohr
 //! extension the same commands are `iohr agent …`.
 
 use std::io::{BufRead as _, IsTerminal as _, Write as _};
@@ -57,6 +58,30 @@ pub enum Command {
     /// Declared checks (checks.toml) tools.
     #[command(subcommand)]
     Checks(ChecksCommand),
+    /// The capture companion (iohr-capture) on this host.
+    #[command(subcommand)]
+    Capture(CaptureCommand),
+}
+
+/// `capture …`.
+#[derive(Debug, Subcommand)]
+pub enum CaptureCommand {
+    /// Ask iohr-capture what it counted on this host (its aggregates socket); nothing is sent anywhere.
+    Status(CaptureStatusArgs),
+}
+
+/// `capture status`.
+#[derive(Debug, Args)]
+pub struct CaptureStatusArgs {
+    /// The aggregates socket (default: `[capture] socket` in the policy, or /run/iohr-capture/aggregates.sock).
+    #[arg(long)]
+    pub socket: Option<PathBuf>,
+    /// Print the answer as JSON.
+    #[arg(long)]
+    pub json: bool,
+    /// Also show the top-K tables (hosts, paths, SNI, DNS names, addresses, owners). For you, on this host.
+    #[arg(long)]
+    pub tables: bool,
 }
 
 /// `checks …`.
@@ -265,6 +290,7 @@ async fn dispatch(cmd: Command, config_path: &Path) -> Result<ExitCode> {
         Command::Status(a) => status(&a, config_path).await,
         Command::Policy(PolicyCommand::Check(a)) => policy_check(&a, config_path).await,
         Command::Checks(ChecksCommand::Lint(a)) => checks_lint(&a, config_path).await,
+        Command::Capture(CaptureCommand::Status(a)) => capture_status(&a, config_path).await,
         Command::Run(_) => Ok(ExitCode::SUCCESS),
     }
 }
@@ -351,6 +377,82 @@ async fn wait_for_signal() {
         }
     }
     let _ = tokio::signal::ctrl_c().await;
+}
+
+async fn capture_status(args: &CaptureStatusArgs, config_path: &Path) -> Result<ExitCode> {
+    let from_policy = || {
+        let cfg = AgentConfig::load(config_path).ok()?;
+        let policy = Policy::load(&cfg.policy).ok()?;
+        Some(policy.capture.unwrap_or_default().socket)
+    };
+    let socket = args
+        .socket
+        .clone()
+        .or_else(from_policy)
+        .unwrap_or_else(|| PathBuf::from(crate::policy::CAPTURE_SOCKET));
+    let what = if args.tables { "tables" } else { "counts" };
+    let raw = crate::capture::request(&socket, what, Duration::from_secs(5))
+        .await
+        .map_err(|e| Error::Config(format!("{e}; is iohr-capture running, and are you in the iohr-agent group? (docs/capture/install.md)")))?;
+    let value: serde_json::Value = serde_json::from_slice(&raw)
+        .map_err(|e| Error::Config(format!("the companion's answer is not JSON: {e}")))?;
+    if let Some(code) = value.get("error").and_then(|v| v.as_str()) {
+        return Err(Error::Config(format!(
+            "iohr-capture answered {code}: {}",
+            value.get("message").and_then(|v| v.as_str()).unwrap_or("")
+        )));
+    }
+    if args.json {
+        out(&serde_json::to_string_pretty(&value).unwrap_or_default());
+        return Ok(ExitCode::SUCCESS);
+    }
+    let c = crate::capture::Counts::parse(&raw).map_err(Error::Config)?;
+    out(&format!(
+        "iohr-capture {} ({}), numbers from {} s ago",
+        value
+            .get("companion_version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?"),
+        c.layers.join(", "),
+        c.age_secs(crate::capture::now_ms())
+    ));
+    out(&format!(
+        "headers    in {} skb / {} B, out {} skb / {} B",
+        c.headers.ingress.packets,
+        c.headers.ingress.bytes,
+        c.headers.egress.packets,
+        c.headers.egress.bytes
+    ));
+    out(&format!(
+        "drops      {} rate limited, {} ring buffer full, {} flows evicted",
+        c.drops.rate_limited, c.drops.ring_buffer_full, c.drops.flows_evicted
+    ));
+    out(&format!(
+        "protocols  http/1 {}, tls {}, dns {}, http/2 {} (grpc {})",
+        c.protocols.http1_requests,
+        c.protocols.tls_client_hellos,
+        c.protocols.dns_queries,
+        c.protocols.http2_connections,
+        c.protocols.grpc_calls
+    ));
+    out(&format!(
+        "owners     {} sockets, {} owners, flows {} owned / {} unowned",
+        c.owners.sockets, c.owners.owners, c.owners.flows_owned, c.owners.flows_unowned
+    ));
+    out(&format!(
+        "tcp        {} established, {} listening, {} retransmits, resets {} in / {} out, {} listen overflows",
+        c.tcp.established,
+        c.tcp.listening,
+        c.tcp.retransmits_sampled,
+        c.tcp.resets_in,
+        c.tcp.resets_out,
+        c.tcp.host.listen_overflows
+    ));
+    if let Some(t) = value.get("tables") {
+        out("");
+        out(&serde_json::to_string_pretty(t).unwrap_or_default());
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn enroll_cmd(args: &EnrollArgs, config_path: &Path) -> Result<ExitCode> {
