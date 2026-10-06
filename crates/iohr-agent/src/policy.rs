@@ -139,11 +139,23 @@ pub enum CaptureLayer {
     Owners,
     /// Layer 5: TCP health (RTT, retransmits, resets, listen overflows).
     Tcp,
+    /// Layer 3: the companion keeps whole packets for pcap files root asks for on the host.
+    /// The agent only says the host can; it never gets a packet.
+    Packets,
+    /// Layer 7: request timing per route template and owner (counts only to the agent).
+    Timing,
 }
 
 impl CaptureLayer {
     /// Every layer of this version.
-    pub const ALL: [Self; 4] = [Self::Headers, Self::Protocols, Self::Owners, Self::Tcp];
+    pub const ALL: [Self; 6] = [
+        Self::Headers,
+        Self::Protocols,
+        Self::Owners,
+        Self::Tcp,
+        Self::Packets,
+        Self::Timing,
+    ];
 
     /// The wire name (`headers`, ...).
     #[must_use]
@@ -153,6 +165,8 @@ impl CaptureLayer {
             Self::Protocols => "protocols",
             Self::Owners => "owners",
             Self::Tcp => "tcp",
+            Self::Packets => "packets",
+            Self::Timing => "timing",
         }
     }
 }
@@ -784,7 +798,7 @@ allow = ["vault:kv/staging/*", "env:CHECK_TOKEN"]
         assert_eq!(off.capture(), None);
         for bad in [
             "[capture]\nsocket = \"relative.sock\"",
-            "[capture]\nlayers = [\"packets\"]",
+            "[capture]\nlayers = [\"payloads\"]",
             "[capture]\nmax_snapshot_age_secs = 0",
             "[capture]\nextra = 1",
         ] {

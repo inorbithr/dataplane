@@ -17,6 +17,12 @@
 //! counts (so the test is not vacuous). A companion whose error code is itself a name gets
 //! it replaced by `other` (`a_companion_error_never_carries_a_name`).
 //!
+//! Phase 2: the poisoned answer also carries layer 7 (route templates, owners) and layer 3
+//! (pcap paths) in its `timing` and `packets` sections; the hello must announce
+//! `capture:timing` and `capture:packets` (the control socket exists) and still carry none
+//! of it. A version 2 `lookup` answer stuffed with names parses to numbers only
+//! (`a_lookup_answer_carries_only_numbers`).
+//!
 //! Scope: what leaves the agent's process towards the platform and the OTLP collector, and
 //! what the admin page serves. The agent's local stderr (the journal under systemd) is on
 //! the host and is not covered here; it carries the same fixed reason strings as
@@ -46,7 +52,7 @@ use iohr_agent::keys::KeyAlg;
 const COUNT_CANARIES: [&str; 2] = ["7391846205", "4602917383"];
 
 /// Values a capture snapshot can hold. None may leave the companion's socket.
-const CANARIES: [&str; 8] = [
+const CANARIES: [&str; 11] = [
     "canary-sni.example",
     "canary-host.example",
     "canary-dns.example",
@@ -55,6 +61,9 @@ const CANARIES: [&str; 8] = [
     "canary-pod-0a1b2c3d",
     "canary-process",
     "canary-version",
+    "/canary/route/{id}",
+    "cgroup:/canary-owner.slice",
+    "/var/lib/iohr-capture/pcap/canary.pcapng",
 ];
 
 fn poisoned_answer() -> Value {
@@ -64,7 +73,7 @@ fn poisoned_answer() -> Value {
         "companion_version": "canary-version",
         "interface": "canary-host.example",
         "updated_unix_ms": iohr_agent::capture::now_ms(),
-        "layers": ["headers", "protocols", "owners", "tcp", "canary-dns.example"],
+        "layers": ["headers", "protocols", "owners", "tcp", "timing", "packets", "canary-dns.example"],
         "headers": {"ingress": {"packets": 7_391_846_205_u64, "bytes": 99}, "egress": {"packets": 7, "bytes": 8},
                     "note": "canary-sni.example"},
         "drops": {"rate_limited": 0, "ring_buffer_full": 0, "flows_evicted": 0, "who": "10.99.88.77"},
@@ -73,12 +82,18 @@ fn poisoned_answer() -> Value {
         "owners": {"sockets": 5, "owners": 1, "flows_owned": 3, "flows_unowned": 0, "pod": "canary-pod-0a1b2c3d"},
         "tcp": {"established": 1, "listening": 2, "retransmits_sampled": 0, "resets_in": 0, "resets_out": 0,
                 "host": {"listen_overflows": 0}, "process": "canary-process"},
+        "timing": {"requests": 7_391_846_205_u64, "responses": 3, "unanswered": 0, "unsynced": 0, "keys": 1,
+                   "status_classes": {"2xx": 3, "canary-host.example": 1},
+                   "top_route": "GET /canary/route/{id}", "owner": "cgroup:/canary-owner.slice"},
+        "packets": {"enabled": true, "copied": 9, "rate_limited": 0, "ring_buffer_full": 0, "pcaps_written": 1,
+                    "last_file": "/var/lib/iohr-capture/pcap/canary.pcapng"},
         "tables": {
             "tls": {"sni": rows("canary-sni.example")},
             "http1": {"hosts": rows("canary-host.example"), "paths": rows("GET /canary/path")},
             "dns": {"names": rows("canary-dns.example")},
             "remote_addresses": rows("10.99.88.77"),
             "owners": [{"owner": "kubernetes:pod canary-pod-0a1b2c3d", "process": "canary-process"}],
+            "timing": [{"owner": "cgroup:/canary-owner.slice", "route": "GET /canary/route/{id}", "requests": 7}],
         }
     })
 }
@@ -176,6 +191,9 @@ fn dat10_captured_traffic_stays_on_the_host() {
     let (frames, html, status, asked) = rt.block_on(async {
         let sockdir = tempfile::tempdir().unwrap();
         let sock = sockdir.path().join("aggregates.sock");
+        // The control socket's presence is part of `capture:packets` (the agent never
+        // connects to it: root only).
+        std::fs::write(sockdir.path().join("control.sock"), b"").unwrap();
         let asked: Arc<StdMutex<Vec<String>>> = Arc::default();
         tokio::spawn(companion(sock.clone(), Arc::clone(&asked)));
         let mut h = harness_with(
@@ -229,6 +247,8 @@ fn dat10_captured_traffic_stays_on_the_host() {
         "capture:protocols",
         "capture:owners",
         "capture:tcp",
+        "capture:timing",
+        "capture:packets",
     ] {
         assert!(caps.contains(&c), "{c} missing from the hello: {caps:?}");
     }
@@ -380,4 +400,66 @@ async fn a_companion_error_never_carries_a_name() {
     }
     stop.send(true).unwrap();
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_lookup_answer_carries_only_numbers() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let sockdir = tempfile::tempdir().unwrap();
+    let sock = sockdir.path().join("aggregates.sock");
+    let l = tokio::net::UnixListener::bind(&sock).unwrap();
+    let asked: Arc<StdMutex<Vec<Value>>> = Arc::default();
+    let seen = Arc::clone(&asked);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = l.accept().await else {
+                continue;
+            };
+            let mut buf = vec![0u8; 1024];
+            let n = s.read(&mut buf).await.unwrap_or(0);
+            let req: Value =
+                serde_json::from_slice(buf[..n].split(|b| *b == b'\n').next().unwrap_or_default())
+                    .unwrap_or_default();
+            seen.lock().unwrap().push(req);
+            let answer = json!({
+                "version": 2, "found": true, "requests": 7_391_846_205_u64, "responses": 5, "unanswered": 0,
+                "owner": "cgroup:/canary-owner.slice", "route": "GET /canary/route/{id}",
+                "status_classes": {"2xx": 5, "canary-host.example": 1},
+                "grpc_status": {"0": 2, "canary-sni.example": 9},
+                "latency_ms": {"le": ["canary-dns.example"], "counts": [0, 0, 0, 0, 0, 0, 5], "sum": 175.0,
+                               "note": "/canary/path"},
+                "owner_tcp": {"found": true, "retransmits": 1, "resets": 0, "rtt_ms": {"lt_1": 1},
+                              "pod": "canary-pod-0a1b2c3d", "peer": "10.99.88.77"},
+                "file": "/var/lib/iohr-capture/pcap/canary.pcapng",
+            });
+            let _ = s.write_all(answer.to_string().as_bytes()).await;
+            let _ = s.shutdown().await;
+        }
+    });
+    let got = iohr_agent::capture::lookup(
+        &sock,
+        "cgroup:/web.slice",
+        "GET /orders/{id}",
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    // Not vacuous: the numbers arrived.
+    assert_eq!(
+        (got.requests, got.responses, got.grpc_status[0]),
+        (7_391_846_205, 5, 2)
+    );
+    assert_eq!(got.latency.counts[6], 5);
+    let text = serde_json::to_string(&got).unwrap();
+    assert!(
+        leaks(&text).is_empty(),
+        "lookup leaks {:?}: {text}",
+        leaks(&text)
+    );
+    // The agent asked in version 2, for exactly the key it holds, and nothing else.
+    let req = asked.lock().unwrap()[0].clone();
+    assert_eq!(req["version"], 2);
+    assert_eq!(req["request"], "lookup");
+    assert_eq!(req["owner"], "cgroup:/web.slice");
+    assert_eq!(req["route"], "GET /orders/{id}");
 }

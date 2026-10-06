@@ -89,12 +89,14 @@ the agent before adding them. A policy without them keeps the hash it had before
 | Key | Default | Meaning |
 |---|---|---|
 | `socket` | `/run/iohr-capture/aggregates.sock` | The companion's aggregates socket (absolute path). |
-| `layers` | `["headers", "protocols", "owners", "tcp"]` | Layers the agent may announce: `capture:<layer>` in the hello, for each one the companion also runs. |
+| `layers` | `["headers", "protocols", "owners", "tcp", "packets", "timing"]` | Layers the agent may announce: `capture:<layer>` in the hello, for each one the companion also runs. `packets` also needs the companion's root-only control socket to exist; it says the host can make pcap files for root, never that the agent can (the agent never gets packets). `packets` and `timing` need an agent with capture phase 2; a `[capture]` section without `layers` gets a new policy hash with that agent, because the default list grew. |
 | `max_snapshot_age_secs` | `30` | 1–3600. An answer whose numbers are older counts as no answer: nothing is announced. |
 
 At each session start the agent asks the socket for counts (1 s timeout). Only the
 `capture:*` strings travel to the platform; the counts stay on the admin page and in
-`iohr agent capture status`. Names, paths and addresses never reach the agent at all
+`iohr agent capture status`. `iohr agent capture lookup` asks for the numbers of one
+route and owner the caller already knows (socket protocol version 2). Names, routes, paths,
+addresses and packets never reach the agent at all
 ([install guide](capture/install.md#what-capture-never-does)).
 
 ## `[ceilings]`

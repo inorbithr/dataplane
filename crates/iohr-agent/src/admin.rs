@@ -167,6 +167,7 @@ fn esc(s: &str) -> String {
 
 /// The Traffic section: what the capture companion counted on this host. Counts only;
 /// none of it is sent to the platform (only the `capture:*` strings in the hello).
+#[allow(clippy::too_many_lines)] // one table, row by row
 fn traffic(h: &mut String, t: &crate::capture::TrafficInfo) {
     let row = |h: &mut String, k: &str, v: &str| {
         let _ = write!(h, "<tr><th>{}</th><td>{}</td></tr>", esc(k), esc(v));
@@ -243,6 +244,35 @@ fn traffic(h: &mut String, t: &crate::capture::TrafficInfo) {
         );
         row(
             h,
+            "Request timing",
+            &format!(
+                "{} requests, {} answered ({} 2xx, {} 4xx, {} 5xx), {} unanswered, {} connections out of sync",
+                c.timing.requests,
+                c.timing.responses,
+                c.timing.status_classes.c2xx,
+                c.timing.status_classes.c4xx,
+                c.timing.status_classes.c5xx,
+                c.timing.unanswered,
+                c.timing.unsynced
+            ),
+        );
+        row(
+            h,
+            "Whole packets",
+            &if c.packets.enabled {
+                format!(
+                    "on: {} copied, {} rate limited, {} ring buffer full, {} pcap files made by root on this host",
+                    c.packets.copied,
+                    c.packets.rate_limited,
+                    c.packets.ring_buffer_full,
+                    c.packets.pcaps_written
+                )
+            } else {
+                "off".to_owned()
+            },
+        );
+        row(
+            h,
             "TCP",
             &format!(
                 "{} established, {} listening, {} retransmits, {} resets in, {} out, {} listen overflows",
@@ -255,7 +285,7 @@ fn traffic(h: &mut String, t: &crate::capture::TrafficInfo) {
             ),
         );
     }
-    h.push_str("</table><p>Names, paths and addresses: <code>iohr agent capture status --tables</code> on this host.</p>");
+    h.push_str("</table><p>Names, routes, paths and addresses: <code>iohr agent capture status --tables</code> on this host. Packets never reach the agent: root makes pcap files with <code>iohr-capture pcap</code>.</p>");
 }
 
 /// The HTML page. Every value is escaped: job targets come from the platform.
