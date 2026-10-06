@@ -513,6 +513,8 @@ def run_mode(binary, mode, version):
         # privileges and sockets
         "parser_process_has_no_capabilities": snap["privileges"]["parser_capabilities"] == []
         and parser.get("CapEff") == "0000000000000000" and parser.get("CapPrm") == "0000000000000000",
+        # Run by hand as root, the parser still is not root.
+        "parser_process_is_not_root": parser.get("Uid", "0").split()[0] not in ("", "0"),
         "companion_kept_reported": sorted(snap["privileges"]["companion_kept"]) == sorted(expected_kept(mode, version)),
         "agent_user_gets_no_tables": agent_tables is None and "forbidden" in agent_tables_raw.stderr,
         "capabilities_kept": sorted(report["capabilities_after_attach"]["kept"]) == sorted(expected_kept(mode, version)),
@@ -577,7 +579,7 @@ def parser_caps(parent_pid):
         try:
             status = open(f"/proc/{k}/status").read()
             if "worker" in open(f"/proc/{k}/cmdline").read():
-                return dict(l.split(":\t", 1) for l in status.splitlines() if l.startswith("Cap"))
+                return dict(l.split(":\t", 1) for l in status.splitlines() if l.startswith(("Cap", "Uid")))
         except OSError:
             pass
     return {}
@@ -662,7 +664,7 @@ def free_ids(path, count, start=64900):
     return out
 
 
-def unit_test(binary):
+def unit_test(binary, version):
     """The shipped unit (packaging/systemd/iohr-capture.service), started by a real systemd:
     systemd runs as PID 1 of a new PID namespace inside the VM, with the guest's throwaway
     /etc and /usr. Proves the unit's sandbox (system call filter, RestrictSUIDSGID, the
@@ -733,6 +735,29 @@ def unit_test(binary):
     main_pid = sh("pgrep -f '^/usr/bin/iohr-capture run'", check=False).stdout.split()
     parser = parser_caps(main_pid[0]) if main_pid else {}
     web.kill()
+    # Stop the way systemd stops it: SIGTERM to the main process; the unit must end
+    # cleanly (exit 0, no restart) and run ExecStopPost=iohr-capture cleanup under its
+    # sandbox. (systemctl cannot reach a systemd in a PID namespace here.)
+    if main_pid:
+        os.kill(int(main_pid[0]), signal.SIGTERM)
+    kmsg = ""
+    for _ in range(60):
+        kmsg = sh("dmesg", check=False).stdout
+        if "iohr-capture.service: Deactivated successfully" in kmsg or "iohr-capture.service: Failed with result" in kmsg:
+            break
+        time.sleep(0.5)
+    clean_stop = ("iohr-capture.service: Deactivated successfully" in kmsg
+                  and "iohr-capture.service: Failed with result" not in kmsg
+                  and "iohr-capture.service: Scheduled restart" not in kmsg)
+    os.kill(int(pid), signal.SIGRTMIN + 4)  # poweroff the namespace's systemd
+    try:
+        systemd.wait(timeout=120)
+        stopped = True
+    except subprocess.TimeoutExpired:
+        stopped = False
+    left = [l for l in sh("tc filter show dev lo ingress; tc filter show dev lo egress", check=False).stdout.splitlines()
+            if "iohr_" in l]
+    unit_mode = "tcx" if version >= (6, 6) else "netlink"
     hosts = reader["tables"]["http1"]["hosts"] if reader else []
     checks = {
         "unit_started_and_serves": up and reader is not None,
@@ -744,6 +769,10 @@ def unit_test(binary):
         "agent_gets_no_tables": agent_tables is None and "forbidden" in agent_err,
         "others_kept_out": outsider is None,
         "parser_has_no_capabilities": parser.get("CapEff") == "0000000000000000",
+        "companion_kept_as_expected": sorted((reader or {}).get("privileges", {}).get("companion_kept", ["?"]))
+        == sorted(expected_kept(unit_mode, version)),
+        "stopped_cleanly": stopped and clean_stop,
+        "nothing_left_on_lo": not left,
     }
     return {
         "checks": checks,
@@ -752,6 +781,8 @@ def unit_test(binary):
         "http1_requests_on_lo": (reader or {}).get("protocols", {}).get("http1_requests"),
         "companion_kept": (reader or {}).get("privileges", {}).get("companion_kept"),
         "journal_tail": journal[-3000:],
+        "systemd_exited": stopped,
+        "kmsg_unit": [l for l in kmsg.splitlines() if "iohr-capture" in l and "systemd" in l][-40:],
         "outsider_error": outsider_err[-300:],
     }
 
@@ -806,7 +837,7 @@ def main():
     ok = results["doctor"]["doctor_root_exit_0"] and results["doctor"]["doctor_unprivileged_exit_1"]
     ok = ok and all(all(m["checks"].values()) for m in results["modes"])
     ok = ok and all(results["flood"]["checks"].values())
-    results["unit"] = unit_test(binary)
+    results["unit"] = unit_test(binary, version)
     ok = ok and all(results["unit"]["checks"].values())
     results["ok"] = ok
     with open(out_path, "w") as f:

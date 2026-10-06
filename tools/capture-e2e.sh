@@ -73,7 +73,7 @@ un = r.get("unit")
 if un:
     bad = [k for k, v in un["checks"].items() if not v]
     print(f"  unit     real systemd: dir {un['dir']}, socket {un['socket']}, http1 on lo {un['http1_requests_on_lo']},"
-          f" companion kept {un['companion_kept']}" + (f"  FAILED: {', '.join(bad)}" if bad else ""))
+          f" companion kept {un['companion_kept']}, stopped cleanly {un['checks']['stopped_cleanly']}" + (f"  FAILED: {', '.join(bad)}" if bad else ""))
 d = r["doctor"]
 print(f"  doctor   root exit 0: {d['doctor_root_exit_0']}, unprivileged exit 1: {d['doctor_unprivileged_exit_1']}")
 PY
