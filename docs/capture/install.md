@@ -249,9 +249,11 @@ docker run --rm --network host \
 
 With no command the image runs `doctor`.
 
-The image is built on every change but not yet published to `ghcr.io`. Until it is,
-build it from a release's binaries: put them in `dist/bin/linux-<arch>/` and run
-`docker build -f Dockerfile.capture .`.
+Releases publish the image to `ghcr.io/inorbithr/iohr-capture` (amd64 and arm64), signed
+by the release workflow with its build provenance and SBOM attached, from the first
+release after this change; verify it as in
+[verifying releases](../security/verifying-releases.md). To build one yourself, put a
+release's binaries in `dist/bin/linux-<arch>/` and run `docker build -f Dockerfile.capture .`.
 
 ### Kubernetes
 

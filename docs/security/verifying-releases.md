@@ -26,6 +26,9 @@ gh attestation verify oci://ghcr.io/inorbithr/iohr-agent@sha256:<digest> \
   --repo inorbithr/dataplane --signer-workflow inorbithr/dataplane/.github/workflows/release.yml
 ```
 
+The capture companion's image, `ghcr.io/inorbithr/iohr-capture`, is signed and attested
+the same way: use the same commands with that image name.
+
 The same `cosign verify` arguments work in a Kyverno or Sigstore policy-controller
 admission policy, so a cluster runs only images this workflow signed.
 
