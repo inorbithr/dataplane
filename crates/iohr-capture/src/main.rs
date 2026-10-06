@@ -33,6 +33,8 @@ mod server;
 mod sockdiag;
 #[cfg(target_os = "linux")]
 mod topk;
+#[cfg(target_os = "linux")]
+mod worker;
 
 use std::{io::Write as _, path::PathBuf, process::ExitCode, time::Duration};
 
@@ -50,6 +52,13 @@ enum Command {
     /// Attach to an interface, count and recognise until the time is up or a signal
     /// arrives, answer the agent on the aggregates socket, print totals (counts) as JSON.
     Run(Box<RunArgs>),
+    /// Internal: the unprivileged parser process `run` starts (privilege separation).
+    #[command(hide = true)]
+    Worker {
+        /// Settings from `run`, as JSON.
+        #[arg(long)]
+        config: String,
+    },
     /// Ask a running companion for its aggregates (the agent asks the same socket).
     Stats {
         /// The aggregates socket.
@@ -75,7 +84,11 @@ enum Command {
         #[arg(long)]
         json: bool,
         /// The aggregates socket's group (checked to exist).
-        #[arg(long, env = "IOHR_CAPTURE_SOCKET_GROUP", default_value = "iohr-agent")]
+        #[arg(
+            long,
+            env = "IOHR_CAPTURE_SOCKET_GROUP",
+            default_value = "iohr-capture-read"
+        )]
         socket_group: String,
     },
     /// Remove TC filters a previous run left on an interface (netlink mode; for `ExecStopPost`).
@@ -112,13 +125,13 @@ struct RunArgs {
     /// Token bucket burst, in copies.
     #[arg(long, env = "IOHR_CAPTURE_BURST", default_value_t = 500)]
     burst: u64,
-    /// Ring buffer size in KiB (rounded up to a power of two).
+    /// Ring buffer size in KiB (rounded up to a power of two; 4 to 262144).
     #[arg(long, env = "IOHR_CAPTURE_RING_BUFFER_KIB", default_value_t = 4096)]
     ring_buffer_kib: u32,
     /// Payload-carrying packets per flow whose first 512 bytes are copied.
     #[arg(long, env = "IOHR_CAPTURE_FIRST_PACKETS", default_value_t = 8)]
     first_packets: u32,
-    /// Flows tracked at once in user space; more evict the oldest (counted).
+    /// Flows tracked at once in user space; more evict the oldest (counted). At most 262144.
     #[arg(long, env = "IOHR_CAPTURE_MAX_FLOWS", default_value_t = 16_384)]
     max_flows: usize,
     /// How often the maps, sockets and host counters are read, in milliseconds.
@@ -139,7 +152,11 @@ struct RunArgs {
     )]
     control_socket: PathBuf,
     /// Group of the aggregates socket; its members may read the aggregates.
-    #[arg(long, env = "IOHR_CAPTURE_SOCKET_GROUP", default_value = "iohr-agent")]
+    #[arg(
+        long,
+        env = "IOHR_CAPTURE_SOCKET_GROUP",
+        default_value = "iohr-capture-read"
+    )]
     socket_group: String,
     /// The agent's user, allowed on the aggregates socket.
     #[arg(long, env = "IOHR_CAPTURE_AGENT_USER", default_value = "iohr-agent")]
@@ -189,6 +206,7 @@ fn main() -> ExitCode {
             }
         }
         Command::Run(args) => run(&args),
+        Command::Worker { config } => worker(&config),
         Command::Stats {
             socket,
             tables,
@@ -219,9 +237,9 @@ fn run(a: &RunArgs) -> ExitCode {
         layers,
         samples_per_sec: a.samples_per_sec,
         burst: a.burst,
-        ring_buffer_kib: a.ring_buffer_kib,
+        ring_buffer_kib: a.ring_buffer_kib.clamp(4, MAX_RING_KIB),
         first_packets: a.first_packets,
-        max_flows: a.max_flows.clamp(1, 1_048_576),
+        max_flows: a.max_flows.clamp(1, MAX_FLOWS),
         poll: Duration::from_millis(a.poll_ms.clamp(100, 60_000)),
         aggregates: a.aggregates_socket.clone(),
         control: a.control_socket.clone(),
@@ -238,6 +256,29 @@ fn run(a: &RunArgs) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Upper bounds on the sizes a person can ask for (the unit also caps memory).
+const MAX_FLOWS: usize = 262_144;
+const MAX_RING_KIB: u32 = 256 * 1024;
+
+#[cfg(target_os = "linux")]
+fn worker(config: &str) -> ExitCode {
+    match worker::run(config) {
+        Ok(counts) => {
+            emit(&serde_json::to_string(&counts).unwrap_or_default());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "parser process failed");
+            ExitCode::from(1)
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn worker(_: &str) -> ExitCode {
+    ExitCode::from(2)
 }
 
 #[cfg(target_os = "linux")]
@@ -267,7 +308,7 @@ fn stats(socket: &std::path::Path, tables: bool, json: bool) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            tracing::error!(error = %e, socket = %socket.display(), "no answer from iohr-capture (is it running? are you in the iohr-agent group?)");
+            tracing::error!(error = %e, socket = %socket.display(), "no answer from iohr-capture (is it running? are you in the iohr-capture-read group?)");
             ExitCode::from(1)
         }
     }

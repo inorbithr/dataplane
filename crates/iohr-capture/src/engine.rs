@@ -10,7 +10,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use iohr_capture_common::{CLASS_NAMES, FLAG_NAMES, PortCounters, PortKey};
+use iohr_capture_common::{CLASS_NAMES, FLAG_NAMES};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::flows::{self, CLIENT_BYTES, Flow, Key, SERVER_BYTES, State};
@@ -90,10 +91,25 @@ pub(crate) struct Settings {
     pub(crate) layers: Layers,
     pub(crate) max_flows: usize,
     pub(crate) idle: Duration,
+    /// Capabilities the privileged process kept (it never parses).
+    pub(crate) companion_kept: Vec<String>,
 }
 
-/// One reading of the kernel's maps (layer 1), summed over CPUs.
-#[derive(Debug, Clone, Default)]
+/// One row of the kernel's per-port map, summed over CPUs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PortRow {
+    pub(crate) port: u16,
+    pub(crate) proto: u8,
+    pub(crate) direction: u8,
+    pub(crate) packets: u64,
+    pub(crate) bytes: u64,
+    pub(crate) syn: u64,
+    pub(crate) rst: u64,
+}
+
+/// One reading of the kernel's maps (layer 1), summed over CPUs. The privileged process
+/// reads it and hands it to the parser process (`worker`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct KernelReading {
     /// `[direction] -> (packets, bytes)`.
     pub(crate) totals: [(u64, u64); 2],
@@ -103,7 +119,7 @@ pub(crate) struct KernelReading {
     pub(crate) flags: [[u64; 4]; 2],
     /// Copied, with payload, rate limited, ring buffer full, short.
     pub(crate) stats: [u64; 5],
-    pub(crate) ports: Vec<(PortKey, PortCounters)>,
+    pub(crate) ports: Vec<PortRow>,
 }
 
 #[derive(Debug)]
@@ -330,7 +346,7 @@ pub(crate) struct Engine {
     tcp_ports: HashMap<u16, TcpPort>,
     host_base: HashMap<(String, String), u64>,
     host_now: HashMap<(String, String), u64>,
-    kept: Vec<&'static str>,
+    parser_capabilities: Vec<&'static str>,
     /// Flows closed by a FIN or RST lately: the other side's FIN or ACK that follows is
     /// not a new flow. Bounded.
     recently_closed: HashSet<Key>,
@@ -379,7 +395,7 @@ impl Engine {
             tcp_ports: HashMap::new(),
             host_base: HashMap::new(),
             host_now: HashMap::new(),
-            kept: dropped.kept.clone(),
+            parser_capabilities: dropped.kept.clone(),
             recently_closed: HashSet::new(),
             closed_order: std::collections::VecDeque::new(),
         }
@@ -538,7 +554,6 @@ impl Engine {
             }
             self.flows_owned += 1;
         }
-        self.updated_ms = unix_ms();
     }
 
     /// The latest kernel map reading.
@@ -710,7 +725,6 @@ impl Engine {
             keep.truncate(MAX_TCP_PORTS);
             self.tcp_ports = keep.into_iter().collect();
         }
-        self.updated_ms = unix_ms();
     }
 
     fn host_delta(&self, table: &str, name: &str) -> u64 {
@@ -771,7 +785,10 @@ impl Engine {
             "uptime_secs": self.started.elapsed().as_secs(),
             "packet_unit": "skb",
             "layers": self.settings.layers.names(),
-            "privileges": {"dropped_before_parsing": true, "kept": self.kept},
+            "privileges": {
+                "parser_capabilities": self.parser_capabilities,
+                "companion_kept": self.settings.companion_kept,
+            },
             "headers": {
                 "ingress": dir(0),
                 "egress": dir(1),
@@ -863,16 +880,16 @@ impl Engine {
         let mut v = self.counts();
         let p = &self.proto;
         let top = |t: &TopK| serde_json::to_value(t.top(TOP_SHOWN)).unwrap_or_default();
-        let mut ports: Vec<&(PortKey, PortCounters)> = self.kernel.ports.iter().collect();
-        ports.sort_by_key(|a| std::cmp::Reverse(a.1.packets));
+        let mut ports: Vec<&PortRow> = self.kernel.ports.iter().collect();
+        ports.sort_by_key(|a| std::cmp::Reverse(a.packets));
         let ports: Vec<Value> = ports
             .into_iter()
             .take(64)
-            .map(|(k, c)| {
+            .map(|c| {
                 json!({
-                    "port": k.port,
-                    "proto": if k.proto == IPPROTO_TCP { "tcp" } else if k.proto == IPPROTO_UDP { "udp" } else { "other" },
-                    "direction": if k.direction == 0 { "ingress" } else { "egress" },
+                    "port": c.port,
+                    "proto": if c.proto == IPPROTO_TCP { "tcp" } else if c.proto == IPPROTO_UDP { "udp" } else { "other" },
+                    "direction": if c.direction == 0 { "ingress" } else { "egress" },
                     "packets": c.packets, "bytes": c.bytes, "syn": c.syn, "rst": c.rst,
                 })
             })
@@ -1108,6 +1125,7 @@ mod tests {
                 layers: Layers::parse("headers,protocols,owners,tcp").unwrap(),
                 max_flows: 64,
                 idle: Duration::from_secs(60),
+                companion_kept: Vec::new(),
             },
             &Dropped::for_tests(),
         )
@@ -1307,7 +1325,7 @@ mod tests {
             3,
         ));
         let mut socks = Vec::new();
-        let _ = sockdiag::parse(&buf, 6, &mut socks);
+        let _ = sockdiag::parse(&buf, 6, 1, &mut socks);
         e.sockets(Ok(socks), HashMap::new(), &mut idx, &HashMap::new());
         e.ingest(&record_v4(0, 6, ([10, 0, 0, 3], 41000), SERVER, 0x02, b""));
         let t = e.tables();
