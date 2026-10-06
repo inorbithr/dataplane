@@ -1,2 +1,4 @@
 * text=auto eol=lf
 **/CHANGELOG.md linguist-generated
+# Captured protocol bytes: compared byte for byte (CRLF included).
+crates/iohr-capture/tests/fixtures/*.bin binary
