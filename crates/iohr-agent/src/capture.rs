@@ -15,6 +15,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::policy::CapturePolicy;
 
+/// Error codes of the socket protocol (`docs/capture/design-phase1.md`).
+const KNOWN_ERRORS: [&str; 6] = [
+    "forbidden",
+    "unsupported_version",
+    "bad_request",
+    "unknown_request",
+    "too_large",
+    "not_available",
+];
+
 /// The socket protocol version this agent speaks.
 pub const WIRE_VERSION: u64 = 1;
 /// How long the hello waits for the companion.
@@ -184,12 +194,13 @@ impl Counts {
             error: String,
         }
         if let Ok(e) = serde_json::from_slice::<Error>(answer) {
-            let code: String = e
-                .error
-                .chars()
-                .filter(|c| c.is_ascii_lowercase() || *c == '_')
-                .take(32)
-                .collect();
+            // Only codes this agent knows travel on (to the admin page, status.json and
+            // the logs); anything else a companion says is `other`.
+            let code = KNOWN_ERRORS
+                .iter()
+                .find(|k| **k == e.error)
+                .copied()
+                .unwrap_or("other");
             return Err(format!("the companion answered {code}"));
         }
         let mut c: Self = serde_json::from_slice(answer)
@@ -405,6 +416,9 @@ mod tests {
                 .contains("forbidden")
         );
         assert!(Counts::parse(br#"{"version":2}"#).is_err());
+        // A code the agent does not know is never repeated (it could carry anything).
+        let e = Counts::parse(br#"{"version":1,"error":"canary-sni.example"}"#).unwrap_err();
+        assert_eq!(e, "the companion answered other");
         assert!(Counts::parse(b"garbage").is_err());
     }
 }

@@ -10,9 +10,18 @@
 //! - the admin page HTML or `status.json`,
 //! - any OTLP export (traces, metrics, logs; bodies are protobuf, strings are raw bytes),
 //!
-//! and it checks the agent never asked for `tables`, while the hello does carry the
-//! `capture:*` capability strings and the admin page does carry the counts (so the test is
-//! not vacuous). `docs/capture/install.md` ("What capture never does") cites this test.
+//! and that the counts themselves (424242, 31337) are in no frame and no OTLP export (they
+//! belong on the admin page only). It checks the agent never asked for `tables`, while the
+//! hello does carry the `capture:*` capability strings and the admin page does carry the
+//! counts (so the test is not vacuous). A companion whose error code is itself a name gets
+//! it replaced by `other` (`a_companion_error_never_carries_a_name`).
+//!
+//! Scope: what leaves the agent's process towards the platform and the OTLP collector, and
+//! what the admin page serves. The agent's local stderr (the journal under systemd) is on
+//! the host and is not covered here; it carries the same fixed reason strings as
+//! `status.json`. The companion's own enforcement (the agent's user never gets `tables`)
+//! is tested in `crates/iohr-capture/src/server.rs`. `docs/capture/install.md` ("What
+//! capture never does") cites this test.
 
 #![allow(
     clippy::unwrap_used,
@@ -31,6 +40,9 @@ use serde_json::{Value, json};
 use common::*;
 use iohr_agent::config::TelemetryConfig;
 use iohr_agent::keys::KeyAlg;
+
+/// Counts from the poisoned answer: allowed on the admin page, never in a frame or OTLP.
+const COUNT_CANARIES: [&str; 2] = ["424242", "31337"];
 
 /// Values a capture snapshot can hold. None may leave the companion's socket.
 const CANARIES: [&str; 8] = [
@@ -236,6 +248,9 @@ fn dat10_captured_traffic_stays_on_the_host() {
             "frame leaks {:?}: {text}",
             leaks(&text)
         );
+        for c in COUNT_CANARIES {
+            assert!(!text.contains(c), "frame carries the count {c}: {text}");
+        }
     }
     assert!(
         leaks(&html).is_empty(),
@@ -262,6 +277,9 @@ fn dat10_captured_traffic_stays_on_the_host() {
             "OTLP {path} leaks {:?}",
             leaks(&text)
         );
+        for c in COUNT_CANARIES {
+            assert!(!text.contains(c), "OTLP {path} carries the count {c}");
+        }
     }
 }
 
@@ -314,6 +332,51 @@ async fn no_capture_strings_when_the_companion_is_silent() {
     let info = agent.state.snapshot().capture.unwrap();
     assert_eq!(info.state, "not answering");
     assert!(iohr_agent::admin::render_html(&agent.state.snapshot()).contains("not answering"));
+    stop.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_companion_error_never_carries_a_name() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let sockdir = tempfile::tempdir().unwrap();
+    let sock = sockdir.path().join("aggregates.sock");
+    let l = tokio::net::UnixListener::bind(&sock).unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = l.accept().await else {
+                continue;
+            };
+            let mut buf = [0u8; 256];
+            let _ = s.read(&mut buf).await;
+            let _ = s
+                .write_all(
+                    br#"{"version":1,"error":"canary-sni.example","message":"canary-dns.example"}"#,
+                )
+                .await;
+            let _ = s.shutdown().await;
+        }
+    });
+    let mut h = harness_with(
+        KeyAlg::Es256,
+        &format!(
+            "[work]\ncapture = true\n[capture]\nsocket = \"{}\"\n",
+            sock.display()
+        ),
+    )
+    .await;
+    let (agent, stop, task) = start(&h).await;
+    let (_, hello) = next(&mut h.frames, "hello").await;
+    let snap = agent.state.snapshot();
+    let info = snap.capture.clone().unwrap();
+    assert_eq!(info.reason.as_deref(), Some("the companion answered other"));
+    for text in [
+        hello.to_string(),
+        serde_json::to_string(&snap).unwrap(),
+        iohr_agent::admin::render_html(&snap),
+    ] {
+        assert!(leaks(&text).is_empty(), "leaks {:?}", leaks(&text));
+    }
     stop.send(true).unwrap();
     task.await.unwrap().unwrap();
 }
