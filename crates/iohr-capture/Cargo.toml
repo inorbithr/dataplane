@@ -59,6 +59,7 @@ systemd-units = { unit-name = "iohr-capture", unit-scripts = "../../packaging/sy
 assets = [
   ["target/release/iohr-capture", "usr/bin/", "755"],
   ["../../packaging/capture.env", "etc/iohr-capture/capture.env", "640"],
+  ["../../packaging/tmpfiles/iohr-capture.conf", "usr/lib/tmpfiles.d/iohr-capture.conf", "644"],
   ["../../docs/capture/install.md", "usr/share/doc/iohr-capture/README.md", "644"],
 ]
 
@@ -73,4 +74,5 @@ assets = [
   { source = "target/release/iohr-capture", dest = "/usr/bin/iohr-capture", mode = "755" },
   { source = "../../packaging/systemd/iohr-capture.service", dest = "/usr/lib/systemd/system/iohr-capture.service", mode = "644" },
   { source = "../../packaging/capture.env", dest = "/etc/iohr-capture/capture.env", mode = "640", config = "noreplace", group = "iohr-capture" },
+  { source = "../../packaging/tmpfiles/iohr-capture.conf", dest = "/usr/lib/tmpfiles.d/iohr-capture.conf", mode = "644" },
 ]

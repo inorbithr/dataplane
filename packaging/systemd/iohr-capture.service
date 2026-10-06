@@ -34,7 +34,10 @@ EnvironmentFile=/etc/iohr-capture/capture.env
 ExecStartPre=/usr/bin/iohr-capture doctor
 ExecStart=/usr/bin/iohr-capture run
 # Kernels before 6.6 attach with netlink filters, which outlive a killed process; remove
-# them however the service ended. TCX links (6.6+) go away with the process.
+# them however the service ended. TCX links (6.6+) go away with the process. It also
+# deletes the companion's pcap files: once it stops nothing would expire them (copies made
+# with `pcap --out` live elsewhere; /usr/lib/tmpfiles.d/iohr-capture.conf is the net for a
+# host that went down hard).
 ExecStopPost=/usr/bin/iohr-capture cleanup
 Restart=on-failure
 RestartSec=5s

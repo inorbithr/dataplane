@@ -135,6 +135,13 @@ pub(crate) fn prepare_dir(dir: &Path, owner: Option<u32>, gid: Option<u32>) -> i
     if !dir.exists() {
         fs::create_dir_all(dir)?;
     }
+    if fs::symlink_metadata(dir)?.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is a symbolic link; refusing", dir.display()),
+        ));
+    }
+    pcap::check_dir(dir, owner)?;
     let meta = fs::metadata(dir)?;
     let owner = owner.filter(|u| *u != meta.uid());
     let group = gid.filter(|g| *g != meta.gid());
@@ -582,6 +589,53 @@ mod tests {
             },
             &Dropped::for_tests(),
         )))
+    }
+
+    #[derive(Clone)]
+    struct LogBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_control_log_never_carries_the_filter() {
+        let logs = LogBuf(Arc::default());
+        let sink = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || sink.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let dir = std::env::temp_dir().join(format!("iohr-ctl-log-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        prepare_dir(&dir, None, None).unwrap();
+        let bound = bind(&dir.join("a.sock"), &dir.join("c.sock")).unwrap();
+        let c = UnixListener::from_std(bound.control.try_clone().unwrap()).unwrap();
+        tokio::spawn(serve_control(c, None));
+        let v = send(
+            &dir.join("c.sock"),
+            &json!({"version": 1, "request": "pcap", "seconds": 5, "filter": "host 10.66.77.88 and port 31337"}),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert!(v.get("error").is_some());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("control socket"), "not vacuous: {text}");
+        assert!(
+            !text.contains("10.66.77.88") && !text.contains("31337"),
+            "{text}"
+        );
+        drop(bound);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

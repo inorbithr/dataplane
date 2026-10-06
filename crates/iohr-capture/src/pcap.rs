@@ -27,6 +27,8 @@ const MAX_TERMS: usize = 8;
 const MAX_FILTER: usize = 256;
 /// Bytes counted per buffered packet on top of its data (bookkeeping).
 const OVERHEAD: usize = 64;
+/// Free space a pcap file never takes from the file system.
+const DISK_MARGIN: u64 = 64 * 1024 * 1024;
 /// File name prefix and suffix: the sweeper deletes only names like these.
 const PREFIX: &str = "iohr-";
 const SUFFIX: &str = ".pcapng";
@@ -648,7 +650,7 @@ fn utc_stamp(secs: u64) -> String {
     )
 }
 
-fn ours(name: &str) -> bool {
+pub(crate) fn ours(name: &str) -> bool {
     name.starts_with(PREFIX)
         && name.ends_with(SUFFIX)
         && name
@@ -733,7 +735,21 @@ impl Manager {
 
     fn room(&self, want: u64) -> Result<u64, Refused> {
         let (_, used) = self.usage();
-        let left = self.settings.dir_max_bytes.saturating_sub(used);
+        // A running `next` file may still grow to its cap: that much is reserved.
+        let reserved = self
+            .active
+            .as_ref()
+            .map_or(0, |a| a.max_bytes.saturating_sub(a.bytes));
+        let mut left = self
+            .settings
+            .dir_max_bytes
+            .saturating_sub(used)
+            .saturating_sub(reserved);
+        // Never fill the file system: keep 64 MiB (and the reservation) free.
+        if let Ok(fs) = rustix::fs::statvfs(&self.settings.dir) {
+            let free = fs.f_bavail.saturating_mul(fs.f_frsize);
+            left = left.min(free.saturating_sub(DISK_MARGIN).saturating_sub(reserved));
+        }
         if left < 4096 {
             return Err(Refused::new(
                 "no_space",
@@ -875,8 +891,11 @@ impl Manager {
 /// directory (not a symbolic link), mode 0700, owned by `owner` when given.
 pub(crate) fn prepare_dir(dir: &Path, owner: Option<u32>) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    if fs::symlink_metadata(dir).is_err() {
+    if fs::symlink_metadata(dir).is_ok() {
+        check_dir(dir, owner)?;
+    } else {
         fs::create_dir_all(dir)?;
+        check_dir(dir, owner)?;
     }
     let meta = fs::symlink_metadata(dir)?;
     if !meta.is_dir() {
@@ -896,9 +915,74 @@ pub(crate) fn prepare_dir(dir: &Path, owner: Option<u32>) -> io::Result<()> {
     Ok(())
 }
 
+/// Deletes every file of ours in `dir` (`cleanup`, when the companion stops: nothing
+/// would expire them). Symbolic links are removed, never followed. Returns how many.
+pub(crate) fn remove_all(dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|e| e.file_name().to_str().is_some_and(ours))
+        .filter(|e| fs::remove_file(e.path()).is_ok())
+        .count() as u64
+}
+
+/// Refuses a directory someone else could have prepared: it must be owned by root or by
+/// the parser's user (`parser`, or this process's user), and its parent must not be
+/// writable by others (unless sticky, like `/tmp`, where nobody can replace it).
+pub(crate) fn check_dir(dir: &Path, parser: Option<u32>) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = fs::symlink_metadata(dir)?;
+    let parser = parser.unwrap_or_else(|| rustix::process::getuid().as_raw());
+    if meta.uid() != 0 && meta.uid() != parser {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} belongs to uid {}, neither root nor the parser's user (uid {parser}); refusing it",
+                dir.display(),
+                meta.uid()
+            ),
+        ));
+    }
+    if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let pm = fs::metadata(parent)?;
+        if pm.mode() & 0o002 != 0 && pm.mode() & 0o1000 == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} is writable by anyone; refusing to keep sockets or pcap files under it",
+                    parent.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn foreign_directories_are_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = std::env::temp_dir().join(format!("iohr-dircheck-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("ok")).unwrap();
+        assert!(check_dir(&base.join("ok"), None).is_ok());
+        // Owned by us but the parser is someone else (and we are not root).
+        if !rustix::process::geteuid().is_root() {
+            assert!(check_dir(&base.join("ok"), Some(4_000_000)).is_err());
+        }
+        // A parent anyone can write to, without the sticky bit.
+        fs::create_dir_all(base.join("open/d")).unwrap();
+        fs::set_permissions(base.join("open"), fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(check_dir(&base.join("open/d"), None).is_err());
+        fs::set_permissions(base.join("open"), fs::Permissions::from_mode(0o1777)).unwrap();
+        assert!(check_dir(&base.join("open/d"), None).is_ok());
+        let _ = fs::remove_dir_all(&base);
+    }
 
     fn tcp_packet(ts_ns: u64, sport: u16, dport: u16, direction: u8) -> Packet {
         let rec = crate::packet::tests::record_v4(
