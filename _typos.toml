@@ -2,6 +2,8 @@
 hr = "hr"
 # setpriv --inh-caps (tools/capture_e2e_guest.py)
 inh = "inh"
+# /proc/net/snmp field names (RtoAlgorithm, RtoMin, RtoMax; crates/iohr-capture/src/procnet.rs)
+rto = "rto"
 
 [files]
-extend-exclude = ["LICENSE", "CODE_OF_CONDUCT.md", "crates/iohr-agent/tests/fixtures/*", "*.svg"]
+extend-exclude = ["LICENSE", "CODE_OF_CONDUCT.md", "crates/iohr-agent/tests/fixtures/*", "crates/iohr-capture/tests/fixtures/*", "*.svg"]

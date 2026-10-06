@@ -7,6 +7,27 @@ use std::{fs, io};
 use rustix::thread::{self, CapabilitySet, CapabilitySets};
 use serde::Serialize;
 
+/// Proof that [`drop_all_but`] succeeded on this process. Only that function makes one
+/// (the field is private), and building the parsing engine needs one, so no byte from the
+/// kernel is parsed while the process still holds capabilities it did not mean to keep.
+#[derive(Debug, Clone)]
+pub(crate) struct Dropped {
+    /// The capabilities kept on purpose (see ADR 0002), by name.
+    pub(crate) kept: Vec<&'static str>,
+    _proof: (),
+}
+
+impl Dropped {
+    /// For unit tests of the engine, which parse fixtures, never kernel bytes.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        Self {
+            kept: Vec::new(),
+            _proof: (),
+        }
+    }
+}
+
 /// What is left after the drop, read back from the kernel.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct Remaining {
@@ -41,7 +62,7 @@ pub(crate) const NAMED: [(CapabilitySet, &str); 3] = [
 
 /// Reduces effective and permitted to `keep` (usually empty), inheritable and ambient to
 /// empty, the bounding set to `keep` where allowed, and sets `no_new_privs`.
-pub(crate) fn drop_all_but(keep: CapabilitySet) -> Result<Remaining, DropError> {
+pub(crate) fn drop_all_but(keep: CapabilitySet) -> Result<(Remaining, Dropped), DropError> {
     let threads = thread_count();
     if threads != 1 {
         return Err(DropError::Threads(threads));
@@ -76,16 +97,20 @@ pub(crate) fn drop_all_but(keep: CapabilitySet) -> Result<Remaining, DropError> 
     if !leftover.is_empty() {
         return Err(DropError::Leftover(leftover.bits()));
     }
-    Ok(Remaining {
-        effective: format!("{:016x}", now.effective.bits()),
-        permitted: format!("{:016x}", now.permitted.bits()),
-        kept: NAMED
-            .iter()
-            .filter(|(c, _)| now.effective.contains(*c))
-            .map(|(_, n)| *n)
-            .collect(),
-        bounding_set_cleared,
-    })
+    let kept: Vec<&'static str> = NAMED
+        .iter()
+        .filter(|(c, _)| now.effective.contains(*c))
+        .map(|(_, n)| *n)
+        .collect();
+    Ok((
+        Remaining {
+            effective: format!("{:016x}", now.effective.bits()),
+            permitted: format!("{:016x}", now.permitted.bits()),
+            kept: kept.clone(),
+            bounding_set_cleared,
+        },
+        Dropped { kept, _proof: () },
+    ))
 }
 
 fn thread_count() -> usize {

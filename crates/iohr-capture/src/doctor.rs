@@ -1,6 +1,6 @@
 //! `iohr-capture doctor`: read-only checks that say whether capture can run on this host,
-//! one line per requirement with the exact fix. The facts are read from `/proc` and `/sys`
-//! once ([`Facts::gather`]); [`evaluate`] is a pure function of them, so every probe is
+//! one line per requirement with the exact fix. The facts are read from `/proc`, `/sys`
+//! and `/etc/group` once ([`Facts::gather`]); [`evaluate`] is a pure function of them, so every probe is
 //! unit-tested with fixtures.
 
 use std::{fmt::Write as _, fs, path::Path};
@@ -42,12 +42,19 @@ pub(crate) struct Facts {
     pub(crate) selinux_enforce: Option<String>,
     /// `/sys/module/apparmor/parameters/enabled`.
     pub(crate) apparmor_enabled: Option<String>,
+    /// `/etc/group`, for the aggregates socket's group.
+    pub(crate) groups: Option<String>,
+    /// The socket group asked for (`--socket-group`).
+    pub(crate) socket_group: String,
 }
 
 impl Facts {
     /// Reads the facts from this host. Never writes anything.
-    pub(crate) fn gather(interface: Option<&str>) -> Self {
-        Self::gather_from(Path::new("/"), interface)
+    pub(crate) fn gather(interface: Option<&str>, socket_group: &str) -> Self {
+        Self {
+            socket_group: socket_group.to_owned(),
+            ..Self::gather_from(Path::new("/"), interface)
+        }
     }
 
     /// Reads the facts below `root` (a fixture tree in tests).
@@ -72,6 +79,8 @@ impl Facts {
             cgroup2: exists("sys/fs/cgroup/cgroup.controllers"),
             selinux_enforce: read("sys/fs/selinux/enforce"),
             apparmor_enabled: read("sys/module/apparmor/parameters/enabled"),
+            groups: read("etc/group"),
+            socket_group: "iohr-agent".into(),
         }
     }
 }
@@ -135,6 +144,8 @@ pub(crate) fn evaluate(facts: &Facts) -> Vec<Check> {
             facts.selinux_enforce.as_deref(),
             facts.apparmor_enabled.as_deref(),
         ),
+        check_owners(version, facts.cgroup2),
+        check_socket_group(facts.groups.as_deref(), &facts.socket_group),
     ]
 }
 
@@ -386,6 +397,50 @@ fn check_cgroup2(present: bool) -> Check {
     }
 }
 
+fn check_owners(version: Option<Version>, cgroup2: bool) -> Check {
+    match (version, cgroup2) {
+        (Some(v), true) if v >= kernel::SOCK_DIAG_CGROUP_ID => Check::new(
+            "owners",
+            Status::Pass,
+            "sockets carry their cgroup id: owners named by systemd unit, container or pod (layer 4)",
+        ),
+        (Some(_), true) => Check::new(
+            "owners",
+            Status::Warn,
+            "before Linux 5.9 sock_diag has no cgroup id: owners are named by user only",
+        )
+        .fix("upgrade to Linux 5.9 or newer for owners by unit, container and pod"),
+        _ => Check::new(
+            "owners",
+            Status::Warn,
+            "no cgroup v2: owners are named by user only",
+        )
+        .fix("boot with systemd.unified_cgroup_hierarchy=1 (default on current distributions)"),
+    }
+}
+
+/// Whether `name` is a group in an `/etc/group`-format text.
+fn group_exists(groups: &str, name: &str) -> bool {
+    groups.lines().any(|l| l.split(':').next() == Some(name))
+}
+
+fn check_socket_group(groups: Option<&str>, name: &str) -> Check {
+    if groups.is_some_and(|g| group_exists(g, name)) {
+        Check::new(
+            "socket group",
+            Status::Pass,
+            format!("{name} exists: the aggregates socket is 0660 {name}, readable by the agent"),
+        )
+    } else {
+        Check::new(
+            "socket group",
+            Status::Warn,
+            format!("group {name} not found: the aggregates socket will be 0600 and the agent cannot read it"),
+        )
+        .fix(format!("install iohr-agent (it creates the group), or `sudo groupadd --system {name}`"))
+    }
+}
+
 fn check_lsm(selinux: Option<&str>, apparmor: Option<&str>) -> Check {
     let selinux_enforcing = selinux.is_some_and(|s| s.trim() == "1");
     let apparmor_on = apparmor.is_some_and(|s| s.trim().eq_ignore_ascii_case("y"));
@@ -425,6 +480,8 @@ mod tests {
             cgroup2: true,
             selinux_enforce: None,
             apparmor_enabled: None,
+            groups: Some("root:x:0:\niohr-agent:x:998:alice\n".into()),
+            socket_group: "iohr-agent".into(),
         }
     }
 
@@ -563,6 +620,19 @@ mod tests {
         facts.selinux_enforce = Some("0\n".into());
         facts.apparmor_enabled = Some("Y\n".into());
         assert!(find(&evaluate(&facts), "lsm").detail.contains("AppArmor"));
+    }
+
+    #[test]
+    fn owners_and_socket_group() {
+        let checks = evaluate(&host("6.8.0"));
+        assert_eq!(find(&checks, "owners").status, Status::Pass);
+        assert_eq!(find(&checks, "socket group").status, Status::Pass);
+        let mut facts = host("5.8.0");
+        facts.groups = Some("root:x:0:\n".into());
+        let checks = evaluate(&facts);
+        assert_eq!(find(&checks, "owners").status, Status::Warn);
+        assert_eq!(find(&checks, "socket group").status, Status::Warn);
+        assert!(can_run(&checks), "warnings never stop capture");
     }
 
     #[test]

@@ -47,6 +47,9 @@ pub(crate) const MINIMUM: Version = Version::new(5, 8, 0);
 pub(crate) const MEMCG_ACCOUNTING: Version = Version::new(5, 11, 0);
 /// TCX links (`bpf_link` based TC attachment) from 6.6.
 pub(crate) const TCX: Version = Version::new(6, 6, 0);
+/// `sock_diag` reports a socket's cgroup id (`INET_DIAG_CGROUP_ID`) from 5.9; before,
+/// owners are named by user only.
+pub(crate) const SOCK_DIAG_CGROUP_ID: Version = Version::new(5, 9, 0);
 /// From 6.5 the `bpf()` syscall checks privileges only when creating maps and loading
 /// programs; before, every command (map reads too) needs `CAP_BPF` when
 /// `kernel.unprivileged_bpf_disabled` is set.
