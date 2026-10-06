@@ -27,6 +27,8 @@ mod packet;
 #[cfg(target_os = "linux")]
 mod pcap;
 #[cfg(target_os = "linux")]
+mod pcapout;
+#[cfg(target_os = "linux")]
 mod privileges;
 #[cfg(target_os = "linux")]
 mod procnet;
@@ -115,6 +117,14 @@ enum Command {
         /// Interface to clean.
         #[arg(long, short = 'i', env = "IOHR_CAPTURE_INTERFACE")]
         interface: String,
+        /// The pcap directory: the companion's own files in it are deleted too (it stopped,
+        /// so nothing would expire them; copies made with `pcap --out` are elsewhere).
+        #[arg(
+            long,
+            env = "IOHR_CAPTURE_PCAP_DIR",
+            default_value = "/var/lib/iohr-capture/pcap"
+        )]
+        pcap_dir: PathBuf,
     },
     /// Write a pcap file from the packets a running companion keeps (root only, on this
     /// host; needs `--packets`). The file stays on this host and expires.
@@ -162,10 +172,17 @@ struct PcapArgs {
     /// Capture the next --seconds instead of the last ones; waits until the file is done.
     #[arg(long)]
     next: bool,
-    /// Also copy the file here (must not exist), mode 0600, owned by the user who ran sudo,
-    /// so that user can `dissect` it without root.
+    /// Also copy the file here (must not exist), mode 0600, created as the user who ran
+    /// sudo, so that user can `dissect` it without root.
     #[arg(long)]
     out: Option<PathBuf>,
+    /// The companion's pcap directory: a file is copied only from here.
+    #[arg(
+        long,
+        env = "IOHR_CAPTURE_PCAP_DIR",
+        default_value = "/var/lib/iohr-capture/pcap"
+    )]
+    pcap_dir: PathBuf,
     /// Print the answer as JSON.
     #[arg(long)]
     json: bool,
@@ -279,7 +296,8 @@ struct RunArgs {
     /// Largest pcap file a request may ask for, bytes (at most 1 GiB).
     #[arg(long, env = "IOHR_CAPTURE_PCAP_MAX_BYTES", default_value_t = 64 * 1024 * 1024)]
     pcap_max_bytes: u64,
-    /// Most bytes of pcap files kept at once.
+    /// Most bytes of pcap files kept at once (at least one largest file, at most 64 GiB;
+    /// a request also leaves 64 MiB of the file system free).
     #[arg(long, env = "IOHR_CAPTURE_PCAP_DIR_MAX_BYTES", default_value_t = 512 * 1024 * 1024)]
     pcap_dir_max_bytes: u64,
     /// Seconds a pcap file is kept before it is deleted (1-86400).
@@ -341,7 +359,10 @@ fn main() -> ExitCode {
             tables,
             json,
         } => stats(&socket, tables, json),
-        Command::Cleanup { interface } => cleanup(&interface),
+        Command::Cleanup {
+            interface,
+            pcap_dir,
+        } => cleanup(&interface, &pcap_dir),
         Command::Pcap(args) => pcap_cmd(&args),
         Command::Dissect(args) => dissect(&args),
         Command::Lookup {
@@ -389,7 +410,10 @@ fn run(a: &RunArgs) -> ExitCode {
             buffer_mib: a.packets_buffer_mib.clamp(1, 128),
             pcap_dir: a.pcap_dir.clone(),
             pcap_max_bytes: a.pcap_max_bytes.clamp(4096, 1 << 30),
-            pcap_dir_max_bytes: a.pcap_dir_max_bytes.max(4096),
+            // At least one file of the largest size, at most 64 GiB.
+            pcap_dir_max_bytes: a
+                .pcap_dir_max_bytes
+                .clamp(a.pcap_max_bytes.clamp(4096, 1 << 30), 64 << 30),
             pcap_retention_secs: a.pcap_retention_secs.clamp(1, 86_400),
         }),
     };
@@ -566,7 +590,11 @@ fn render_stats(v: &serde_json::Value) -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn cleanup(interface: &str) -> ExitCode {
+fn cleanup(interface: &str, pcap_dir: &std::path::Path) -> ExitCode {
+    let gone = pcap::remove_all(pcap_dir);
+    if gone > 0 {
+        tracing::info!(files = gone, "pcap files removed: the companion stopped");
+    }
     match capture::cleanup(interface) {
         Ok(removed) => {
             tracing::info!(interface, removed, "stale filters removed");
@@ -612,6 +640,7 @@ fn lookup(socket: &std::path::Path, owner: &str, route: &str) -> ExitCode {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_lines)] // ask, wait, check, copy: one sequence
 fn pcap_cmd(a: &PcapArgs) -> ExitCode {
     if !rustix::process::geteuid().is_root() {
         tracing::error!("the control socket is for root only: run `sudo iohr-capture pcap …`");
@@ -673,10 +702,31 @@ fn pcap_cmd(a: &PcapArgs) -> ExitCode {
             std::thread::sleep(Duration::from_millis(500));
         }
     }
-    let size = std::fs::metadata(&path).map_or(0, |m| m.len());
+    // The parser named the file: nothing in its answer is trusted (pcapout.rs).
+    let mut size = answer["bytes"].as_u64().unwrap_or(0);
     if let Some(out) = &a.out {
-        match copy_to_person(&path, out) {
-            Ok(owner) => tracing::info!(out = %out.display(), owner, "copied"),
+        let cap = a.max_bytes.unwrap_or(1 << 30).min(1 << 30);
+        let src = match pcapout::open_source(&a.pcap_dir, &path.to_string_lossy(), cap) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "not copied");
+                return ExitCode::from(1);
+            }
+        };
+        size = src.size;
+        // No more socket work: the runtime goes, so this thread is the only one, and root
+        // becomes the person before anything is created.
+        drop(rt);
+        if let Some((uid, gid)) = pcapout::sudo_user()
+            && let Err(e) = pcapout::become_user(uid, gid)
+        {
+            tracing::error!(error = %e, "could not become the sudo user; not copied");
+            return ExitCode::from(1);
+        }
+        match pcapout::copy(src, out) {
+            Ok(n) => {
+                tracing::info!(out = %out.display(), bytes = n, uid = rustix::process::getuid().as_raw(), "copied");
+            }
             Err(e) => {
                 tracing::error!(error = %e, out = %out.display(), "copy failed");
                 return ExitCode::from(1);
@@ -704,29 +754,6 @@ fn pcap_cmd(a: &PcapArgs) -> ExitCode {
         ));
     }
     ExitCode::SUCCESS
-}
-
-/// Copies `from` to `to` (which must not exist; no symbolic link is followed), mode 0600,
-/// owned by the user who ran sudo (`SUDO_UID`/`SUDO_GID`) when there is one. Returns the
-/// owner's uid.
-#[cfg(target_os = "linux")]
-fn copy_to_person(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<u32> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let mut src = std::fs::File::open(from)?;
-    let mut dst = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
-        .open(to)?;
-    let id = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u32>().ok());
-    let (uid, gid) = (id("SUDO_UID"), id("SUDO_GID"));
-    if uid.is_some() {
-        std::os::unix::fs::fchown(&dst, uid, gid)?;
-    }
-    std::io::copy(&mut src, &mut dst)?;
-    dst.sync_all()?;
-    Ok(uid.unwrap_or_else(|| rustix::process::getuid().as_raw()))
 }
 
 #[cfg(target_os = "linux")]
@@ -757,11 +784,18 @@ fn dissect(a: &DissectArgs) -> ExitCode {
         return ExitCode::from(1);
     }
     // -n: no name lookups (captured addresses are never sent to a resolver).
-    let status = std::process::Command::new(&tshark)
-        .args(["-n", "-r", "-"])
-        .args(&a.args)
-        .stdin(file)
-        .status();
+    let mut cmd = std::process::Command::new(&tshark);
+    cmd.args(["-n", "-r", "-"]).args(&a.args).stdin(file);
+    if rustix::process::geteuid().is_root() {
+        // --as-root: nothing from the caller's environment but PATH and LANG.
+        cmd.env_clear().env("HOME", "/root");
+        for k in ["PATH", "LANG"] {
+            if let Some(v) = std::env::var_os(k) {
+                cmd.env(k, v);
+            }
+        }
+    }
+    let status = cmd.status();
     match status {
         Ok(s) => ExitCode::from(u8::try_from(s.code().unwrap_or(1)).unwrap_or(1)),
         Err(e) => {
@@ -777,6 +811,7 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt as _;
     std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths)
+            .filter(|d| d.is_absolute())
             .map(|d| d.join(name))
             .find(|p| {
                 std::fs::metadata(p)
@@ -816,7 +851,7 @@ fn stats(_: &std::path::Path, _: bool, _: bool) -> ExitCode {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn cleanup(_: &str) -> ExitCode {
+fn cleanup(_: &str, _: &std::path::Path) -> ExitCode {
     tracing::error!("iohr-capture runs on Linux only");
     ExitCode::from(2)
 }
