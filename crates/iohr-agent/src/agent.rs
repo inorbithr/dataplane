@@ -16,6 +16,27 @@ use crate::state::{AgentInfo, AgentState, PolicyInfo, how_to_stop};
 use crate::tls::TlsContext;
 use crate::token::TokenSource;
 
+/// How often the admin page's Traffic section is refreshed.
+const CAPTURE_REFRESH: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Keeps the admin page's Traffic section current (counts only).
+async fn watch_capture(
+    policy: crate::policy::CapturePolicy,
+    state: Arc<AgentState>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut tick = tokio::time::interval(CAPTURE_REFRESH);
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => return,
+            _ = tick.tick() => {
+                let info = crate::capture::check(&policy, crate::capture::HELLO_TIMEOUT).await;
+                state.capture_checked(info);
+            }
+        }
+    }
+}
+
 /// A ready-to-run agent.
 #[derive(Debug)]
 pub struct Agent {
@@ -138,6 +159,13 @@ impl Agent {
             }
             tokio::spawn(crate::admin::serve(
                 listener,
+                Arc::clone(&self.state),
+                shutdown.clone(),
+            ));
+        }
+        if let Some(policy) = self.policy.capture() {
+            tokio::spawn(watch_capture(
+                policy,
                 Arc::clone(&self.state),
                 shutdown.clone(),
             ));

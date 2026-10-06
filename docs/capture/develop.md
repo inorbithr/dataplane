@@ -9,7 +9,7 @@ How the capture crates are built and tested. Installing and running it:
 |---|---|---|
 | `crates/iohr-capture-ebpf` | the eBPF programs (`no_std`, `aya-ebpf`), `MIT OR GPL-2.0`, not a workspace member, its own `Cargo.lock` and `deny.toml` | the pinned nightly in its `rust-toolchain.toml`, `bpf-linker` |
 | `crates/iohr-capture-common` | `no_std` types shared by kernel and user space; `unsafe impl aya::Pod` behind the `user` feature | stable |
-| `crates/iohr-capture` | the program: `run`, `doctor`, `cleanup` | stable; its `build.rs` builds the eBPF crate |
+| `crates/iohr-capture` | the program: `run`, `stats`, `doctor`, `cleanup`; layers 1, 2, 4, 5 ([design-phase1.md](design-phase1.md)) | stable; its `build.rs` builds the eBPF crate |
 
 `crates/iohr-capture/build.rs` calls `aya-build`, which runs
 `cargo build --target bpfel-unknown-none -Z build-std=core` for the eBPF crate with the
@@ -54,20 +54,53 @@ always, TCX from 6.6) it:
 
 1. makes a veth pair, one end in a network namespace, IPv6 off and static neighbour
    entries so there is no background traffic;
-2. starts `iohr-capture run` on the root namespace's end;
-3. sends 1000 UDP datagrams and 100 TCP connections (64 bytes each) from the namespace;
-4. stops capture and asserts.
+2. starts servers on the root namespace's end: UDP and TCP counters, an HTTP/1 server in
+   its own cgroup (`/sys/fs/cgroup/iohr-e2e-web`), `openssl s_server`, a DNS responder, a
+   minimal HTTP/2 cleartext server, a listener that never accepts and one that holds a
+   connection;
+3. starts `iohr-capture run` on that end, its sockets in a scratch directory;
+4. sends from the namespace: 1000 UDP datagrams and 100 TCP connections (64 bytes each),
+   20 HTTP/1 requests (`curl`, with a Host), 10 TLS handshakes (`openssl s_client` with a
+   known SNI), 15 DNS queries (`dig`, one known name), 5 gRPC calls and 5 h2c requests
+   (`curl --http2-prior-knowledge`), 5 connections to a closed port, 8 into the full
+   listen queue;
+5. asks the aggregates socket (`stats --tables --json`), checks its access rules (a group
+   member may read, another user with the group only as a supplementary group is refused
+   by `SO_PEERCRED`, the agent's user gets counts but never the tables), the socket modes,
+   the control socket and the parser process's capabilities (`CapEff` and `CapPrm` zero)
+   and user (not root, though `run` was started as root), then stops capture and asserts.
 
-How counts are compared: capture's ingress and egress packet counts must equal the
-interface's own rx and tx packet counters over the same window, exactly. Both count
-socket buffers, and with small payloads on veth (no GRO without XDP, nothing for TSO to
-merge) one socket buffer is one packet; on real NICs GRO can merge packets, which is why
-the report says `packet_unit: "skb"`. Bytes may differ from the interface counters only
-by the Ethernet header (0 or 14 bytes per packet). It also checks that at least the sent
-traffic was seen, that the capabilities left after attaching are the expected ones for
-the kernel and mode, that nothing is left on the interface afterwards, that `cleanup` and
-the next start remove the filters of a `SIGKILL`ed netlink run, and that `doctor` exits 0
-as root and 1 without capabilities.
+What is asserted: capture's ingress and egress packet counts equal the interface's own rx
+and tx packet counters over the same window, exactly. Both count socket buffers, and with
+small payloads on veth (no GRO without XDP, nothing for TSO to merge) one socket buffer is
+one packet; on real NICs GRO can merge packets, which is why the report says
+`packet_unit: "skb"`. Bytes may differ from the interface counters only by the Ethernet
+header (0 or 14 bytes per packet). Per layer: resets on the closed port (1); exact HTTP/1
+request and response counts, Host and path template, TLS hellos and SNI, DNS queries and
+name, h2c connections, gRPC calls and method, and that the query strings sent never appear
+(2); the HTTP/1 flows owned by the cgroup and `python3` (4); an RTT sample from the held
+connection and the listen overflow (5); no copy drops at this rate; the capabilities left
+after attaching are the expected ones for the kernel and mode; nothing is left on the
+interface and the sockets are gone afterwards; `cleanup` and the next start remove the
+filters of a `SIGKILL`ed netlink run; `doctor` exits 0 as root and 1 without capabilities.
+
+Then three floods of 40000 new UDP flows: with a 4 KiB ring buffer and a 512-flow table
+(ring buffer full and flows evicted must be counted), with a 100/s copy rate (rate
+limited must be counted), and with a 16 MiB ring and no rate limit (the reader must keep
+up: every copied record read, and 5 DNS queries sent after the flood counted). In all the
+totals stay exact and both processes stay under 64 MiB.
+
+Last, the shipped unit: `packaging/systemd/iohr-capture.service` is started by a real
+systemd running as PID 1 of a new PID namespace inside the VM (the guest's `/etc` and
+`/usr` are throwaway overlays, so users, groups, the binary and the unit are installed
+there), on `lo`. It checks the unit starts without failures or restarts under its
+sandbox, the runtime directory is 2750 `iohr-capture-read`, the socket 0660
+`iohr-capture-read`, a member reads the tables, the agent's user reads counts only,
+anyone else is kept out, the parser has no capabilities and the privileged process kept
+exactly what the kernel needs. Then it stops the service the way systemd does (SIGTERM
+to the main process): the unit must end with "Deactivated successfully" (exit 0, its
+`ExecStopPost` cleanup ran under the sandbox, no restart) and leave no filter on `lo`. (On `lo` every packet passes
+egress and ingress, so 3 requests count 6.)
 
 Results: `dist/capture-e2e/<kernel>.json` and `.log`.
 

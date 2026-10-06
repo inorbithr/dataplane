@@ -4,6 +4,14 @@ if [ "$1" = "configure" ]; then
   if ! getent passwd iohr-agent >/dev/null; then
     adduser --system --group --no-create-home --home /var/lib/iohr-agent iohr-agent >/dev/null
   fi
+  # Read the capture companion's counts (its aggregates socket's group), if installed.
+  if getent group iohr-capture-read >/dev/null && ! id -nG iohr-agent | grep -qw iohr-capture-read; then
+    adduser iohr-agent iohr-capture-read >/dev/null
+    # A running agent sees a new group only after a restart.
+    if command -v systemctl >/dev/null && systemctl is-active --quiet iohr-agent 2>/dev/null; then
+      echo "iohr-agent: the agent's user joined iohr-capture-read; restart the agent to read capture counts: sudo systemctl restart iohr-agent"
+    fi
+  fi
   chown root:iohr-agent /etc/iohr-agent /etc/iohr-agent/agent.toml /etc/iohr-agent/policy.toml
   chmod 0750 /etc/iohr-agent
   chmod 0640 /etc/iohr-agent/agent.toml /etc/iohr-agent/policy.toml

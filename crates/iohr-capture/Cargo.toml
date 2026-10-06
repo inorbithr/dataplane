@@ -19,7 +19,7 @@ clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt", "time", "signal", "macros"] }
+tokio = { workspace = true, features = ["rt", "time", "signal", "macros", "net", "io-util", "io-std", "process"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

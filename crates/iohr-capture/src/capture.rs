@@ -1,36 +1,47 @@
-//! Load, attach, drop privileges, count, report, detach.
+//! Load, attach, prepare the sockets' directory, drop privileges, start the parser
+//! process, relay, and on exit detach and print the totals.
 //!
-//! Order matters and is the point of the phase 0 spike:
+//! Order matters (ADR 0002):
 //!
 //! 1. refuse kernels older than 5.8 or without BTF;
-//! 2. load both classifiers and attach them to ingress and egress (TCX on 6.6+, netlink
-//!    filters before, after removing filters a killed run left behind);
-//! 3. drop capabilities while still single-threaded: everything on TCX; on netlink keep
-//!    `CAP_NET_ADMIN` to remove the filters on exit, and before 6.5 also `CAP_BPF`, because
-//!    those kernels check it on every `bpf()` call when unprivileged BPF is disabled;
-//! 4. only then start the (current-thread) runtime, wait, read the per-CPU counters;
-//! 5. detach and print the totals.
+//! 2. load the programs, write their settings, attach them to ingress and egress (TCX on
+//!    6.6+, netlink filters before, after removing filters a killed run left behind);
+//! 3. take the maps and the ring buffer, prepare the sockets' directory (filesystem work);
+//! 4. drop capabilities while still single-threaded: everything on TCX; on netlink keep
+//!    `CAP_NET_ADMIN` to remove the filters on exit, and before 6.5 also `CAP_BPF`,
+//!    because those kernels check it on every `bpf()` call when unprivileged BPF is
+//!    disabled;
+//! 5. start the parser process (`worker`), which drops every capability before it does
+//!    anything, and relay ring-buffer records and map readings to it over a pipe until the
+//!    time is up or a signal arrives. This process never looks inside a record;
+//! 6. close the pipe, take the parser's last `counts`, detach and print the totals
+//!    (counts only: the report goes to the journal).
 
-use std::{fs, io, time::Duration};
+use std::{fs, io, path::PathBuf, time::Duration};
 
 use aya::{
-    Ebpf,
-    maps::{MapData, PerCpuArray},
+    EbpfLoader,
+    maps::{Array, MapData, PerCpuArray, PerCpuHashMap, RingBuf},
     programs::{
         LinkOrder, SchedClassifier, TcAttachType,
         tc::{self, NlOptions, TcAttachOptions},
     },
 };
 use iohr_capture_common::{
-    COUNTERS_MAP, Counters, EGRESS, EGRESS_PROGRAM, INGRESS, INGRESS_PROGRAM,
+    CLASS_SLOTS, CLASSES_MAP, CONFIG_HEADERS, CONFIG_MAP, CONFIG_PROTOCOLS, COUNTERS_MAP, Config,
+    Counters, EGRESS, EGRESS_PROGRAM, EVENTS_MAP, FLAG_SLOTS, FLAGS_MAP, INGRESS, INGRESS_PROGRAM,
+    PORT_ENTRIES, PORTS_MAP, PortCounters, PortKey, STATS_MAP,
 };
 use rustix::thread::CapabilitySet;
 use serde::Serialize;
+use tokio::io::unix::AsyncFd;
 
 use crate::{
     AttachMode,
+    engine::{KernelReading, Layers, PortRow},
     kernel::{self, Version},
     privileges::{self, Remaining},
+    server,
 };
 
 /// The eBPF object built by build.rs (aya-build) from crates/iohr-capture-ebpf.
@@ -46,18 +57,40 @@ pub(crate) enum Error {
     Program(&'static str, aya::programs::ProgramError),
     #[error("program {0} missing from the eBPF object")]
     MissingProgram(&'static str),
-    #[error("map {COUNTERS_MAP} missing from the eBPF object")]
-    MissingMap,
+    #[error("map {0} missing from the eBPF object")]
+    MissingMap(&'static str),
     #[error(
-        "reading counters: {0} (on Linux before 6.5 with unprivileged BPF disabled this needs CAP_BPF)"
+        "reading a map: {0} (on Linux before 6.5 with unprivileged BPF disabled this needs CAP_BPF)"
     )]
     Map(#[from] aya::maps::MapError),
     #[error("tc on {0}: {1}")]
     Tc(String, tc::TcError),
     #[error("dropping capabilities: {0}")]
     Drop(#[from] privileges::DropError),
+    #[error("sockets: {0}")]
+    Socket(io::Error),
     #[error("runtime: {0}")]
     Runtime(#[from] io::Error),
+}
+
+/// What `run` is asked to do.
+#[derive(Debug, Clone)]
+pub(crate) struct Options {
+    pub(crate) interface: String,
+    pub(crate) duration: Option<Duration>,
+    pub(crate) mode: AttachMode,
+    pub(crate) layers: Layers,
+    /// Copies per second per CPU; 0 = no limit.
+    pub(crate) samples_per_sec: u64,
+    pub(crate) burst: u64,
+    pub(crate) ring_buffer_kib: u32,
+    pub(crate) first_packets: u32,
+    pub(crate) max_flows: usize,
+    pub(crate) poll: Duration,
+    pub(crate) aggregates: PathBuf,
+    pub(crate) control: PathBuf,
+    pub(crate) group: String,
+    pub(crate) agent_user: String,
 }
 
 /// Totals per direction.
@@ -85,16 +118,23 @@ pub(crate) struct Report {
     /// Capabilities left while counting, read back after the drop.
     pub(crate) capabilities_after_attach: Remaining,
     pub(crate) detached: bool,
+    /// The aggregates' `counts` answer at exit (numbers only).
+    pub(crate) counts: serde_json::Value,
 }
 
-/// Runs capture on `interface` for `duration` (or until SIGINT/SIGTERM).
-pub(crate) fn run(
-    interface: &str,
-    duration: Option<Duration>,
-    mode: AttachMode,
-) -> Result<Report, Error> {
+struct Maps {
+    counters: PerCpuArray<MapData, Counters>,
+    classes: PerCpuArray<MapData, Counters>,
+    flags: PerCpuArray<MapData, u64>,
+    stats: PerCpuArray<MapData, u64>,
+    ports: PerCpuHashMap<MapData, PortKey, PortCounters>,
+}
+
+/// Runs capture until the duration ends or SIGINT/SIGTERM.
+#[allow(clippy::too_many_lines)] // the privileged sequence reads best in one place
+pub(crate) fn run(opts: &Options) -> Result<Report, Error> {
     let version = preflight()?;
-    let mode = match mode {
+    let mode = match opts.mode {
         AttachMode::Auto if version >= kernel::TCX => AttachMode::Tcx,
         AttachMode::Auto => AttachMode::Netlink,
         AttachMode::Tcx if version < kernel::TCX => {
@@ -107,15 +147,24 @@ pub(crate) fn run(
     if version < kernel::MEMCG_ACCOUNTING {
         raise_memlock();
     }
-
-    let mut ebpf = Ebpf::load(EBPF_OBJECT)?;
+    let ring_bytes = ring_bytes(opts.ring_buffer_kib);
+    let mut ebpf = EbpfLoader::new()
+        .map_max_entries(EVENTS_MAP, ring_bytes)
+        .load(EBPF_OBJECT)?;
+    {
+        let mut config: Array<&mut MapData, Config> = ebpf
+            .map_mut(CONFIG_MAP)
+            .ok_or(Error::MissingMap(CONFIG_MAP))?
+            .try_into()?;
+        config.set(0, kernel_config(opts, l2_len(&opts.interface)), 0)?;
+    }
     let mut stale = 0;
     if mode == AttachMode::Netlink {
         // A clsact qdisc may already be there (ours from before, or someone else's).
-        if let Err(e) = tc::qdisc_add_clsact(interface) {
+        if let Err(e) = tc::qdisc_add_clsact(&opts.interface) {
             tracing::debug!(error = %e, "clsact qdisc not added (usually: already present)");
         }
-        stale = cleanup(interface)?;
+        stale = cleanup(&opts.interface)?;
     }
     let mut links = Vec::with_capacity(2);
     for (name, hook) in [
@@ -134,25 +183,73 @@ pub(crate) fn run(
             TcAttachOptions::Netlink(NlOptions::default())
         };
         let link = program
-            .attach_with_options(interface, hook, options)
+            .attach_with_options(&opts.interface, hook, options)
             .map_err(|e| Error::Program(name, e))?;
         links.push((name, link));
     }
-    let counters: PerCpuArray<MapData, Counters> = ebpf
-        .take_map(COUNTERS_MAP)
-        .ok_or(Error::MissingMap)?
-        .try_into()?;
+    let take = |ebpf: &mut aya::Ebpf, name: &'static str| {
+        ebpf.take_map(name).ok_or(Error::MissingMap(name))
+    };
+    let maps = Maps {
+        counters: take(&mut ebpf, COUNTERS_MAP)?.try_into()?,
+        classes: take(&mut ebpf, CLASSES_MAP)?.try_into()?,
+        flags: take(&mut ebpf, FLAGS_MAP)?.try_into()?,
+        stats: take(&mut ebpf, STATS_MAP)?.try_into()?,
+        ports: take(&mut ebpf, PORTS_MAP)?.try_into()?,
+    };
+    let ring: RingBuf<MapData> = take(&mut ebpf, EVENTS_MAP)?.try_into()?;
 
-    let remaining = privileges::drop_all_but(keep_after_attach(mode, version))?;
+    // The sockets' directory gets the read group and the set-group-id bit now, while
+    // privileged: the parser process creates its sockets there without any chown.
+    let own_uid = rustix::process::getuid().as_raw();
+    let access = server::Access::lookup(&opts.agent_user, &opts.group, own_uid);
+    if access.group_gid.is_none() {
+        tracing::warn!(group = %opts.group, "socket group not found; the aggregates socket belongs to this process's group");
+    }
+    access.warn_if_unguarded(&opts.agent_user);
+    // Run by hand as root, the parser still must not be root: it runs as `iohr-capture`
+    // (or nobody), and the sockets' directory is made its own.
+    let parser = parser_identity(&access);
+    for dir in [opts.aggregates.parent(), opts.control.parent()]
+        .into_iter()
+        .flatten()
+    {
+        server::prepare_dir(dir, parser.map(|(u, _)| u), access.group_gid)
+            .map_err(Error::Socket)?;
+    }
+
+    let keep = keep_after_attach(mode, version);
     let started = std::time::Instant::now();
-    tokio::runtime::Builder::new_current_thread()
+    let worker = crate::worker::Config {
+        interface: opts.interface.clone(),
+        layers: opts.layers.names().join(","),
+        max_flows: opts.max_flows,
+        poll_ms: u64::try_from(opts.poll.as_millis()).unwrap_or(2000),
+        aggregates: opts.aggregates.clone(),
+        control: opts.control.clone(),
+        group: opts.group.clone(),
+        agent_user: opts.agent_user.clone(),
+        companion_kept: privileges::NAMED
+            .iter()
+            .filter(|(c, _)| keep.contains(*c))
+            .map(|(_, n)| (*n).to_owned())
+            .collect(),
+    };
+    let (counts, remaining) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
-        .block_on(wait(duration, interface, mode, &remaining.kept))?;
+        .block_on(async {
+            // The parser is started first, while this process may still change its user;
+            // then this process drops (still one thread: the runtime has no other).
+            let child = spawn_parser(&worker, parser)?;
+            let (remaining, _) = privileges::drop_all_but(keep)?;
+            let counts = relay(opts, mode, &remaining, &maps, ring, child).await?;
+            Ok::<_, Error>((counts, remaining))
+        })?;
     let seconds = started.elapsed().as_secs_f64();
 
-    let ingress = total(&counters, INGRESS)?;
-    let egress = total(&counters, EGRESS)?;
+    let ingress = total(&maps.counters, INGRESS)?;
+    let egress = total(&maps.counters, EGRESS)?;
 
     let mut detached = true;
     for (name, link) in links {
@@ -168,7 +265,7 @@ pub(crate) fn run(
     drop(ebpf);
 
     Ok(Report {
-        interface: interface.to_owned(),
+        interface: opts.interface.clone(),
         kernel: version,
         attach: mode,
         seconds,
@@ -178,7 +275,286 @@ pub(crate) fn run(
         egress,
         capabilities_after_attach: remaining,
         detached,
+        counts,
     })
+}
+
+/// The ring buffer size: a power of two of at least one page.
+fn ring_bytes(kib: u32) -> u32 {
+    // At most 32 MiB (the unit's MemoryMax=256M also holds the flow table), so the power
+    // of two never overflows.
+    kib.clamp(4, 32 * 1024)
+        .saturating_mul(1024)
+        .next_power_of_two()
+}
+
+/// Settings for the programs.
+fn kernel_config(opts: &Options, l2_len: u32) -> Config {
+    let interval_ns = 1_000_000_000u64
+        .checked_div(opts.samples_per_sec)
+        .map_or(0, |i| i.max(1));
+    let mut flags = 0;
+    if opts.layers.headers {
+        flags |= CONFIG_HEADERS;
+    }
+    if opts.layers.protocols {
+        flags |= CONFIG_PROTOCOLS;
+    }
+    Config {
+        interval_ns,
+        burst_ns: interval_ns.saturating_mul(opts.burst.max(1)),
+        l2_len,
+        first_packets: opts.first_packets,
+        flags,
+        reserved: 0,
+    }
+}
+
+/// 14 on interfaces with 6-byte link-layer addresses (Ethernet, Wi-Fi, veth, loopback
+/// reports 6 too), 0 on L3 devices (`WireGuard`, tun) that have none.
+fn l2_len(interface: &str) -> u32 {
+    let valid = !interface.contains('/') && interface != "." && interface != "..";
+    let len = valid
+        .then(|| fs::read_to_string(format!("/sys/class/net/{interface}/addr_len")).ok())
+        .flatten();
+    match len.as_deref().map(str::trim) {
+        Some("0") => 0,
+        _ => 14,
+    }
+}
+
+/// How long one write to the parser may block (a stuck parser must not keep this process
+/// from answering SIGTERM within the unit's stop timeout).
+const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
+
+async fn send(to: &mut tokio::process::ChildStdin, bytes: &[u8]) -> io::Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+    tokio::time::timeout(WRITE_TIMEOUT, to.write_all(bytes))
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the parser process stopped reading",
+            )
+        })?
+}
+
+/// The user and group the parser runs as when this process is root: `iohr-capture`, or
+/// nobody, and the read group (`None`: this process is not root, the parser inherits its
+/// user, as under the unit).
+fn parser_identity(access: &server::Access) -> Option<(u32, u32)> {
+    if !rustix::process::geteuid().is_root() {
+        return None;
+    }
+    let passwd = fs::read_to_string("/etc/passwd").unwrap_or_default();
+    let (uid, primary) = passwd
+        .lines()
+        .find_map(|l| {
+            let f: Vec<&str> = l.split(':').collect();
+            (f.first() == Some(&"iohr-capture"))
+                .then(|| Some((f.get(2)?.parse().ok()?, f.get(3)?.parse().ok()?)))
+                .flatten()
+        })
+        .unwrap_or((65_534, 65_534));
+    Some((uid, access.group_gid.unwrap_or(primary)))
+}
+
+/// Starts `iohr-capture worker` with pipes for input and output; as another user when
+/// `identity` says so (supplementary groups are cleared).
+fn spawn_parser(
+    config: &crate::worker::Config,
+    identity: Option<(u32, u32)>,
+) -> Result<tokio::process::Child, Error> {
+    let exe = std::env::current_exe()?;
+    let config = serde_json::to_string(config).unwrap_or_default();
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.args(["worker", "--config", &config])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    if let Some((uid, gid)) = identity {
+        cmd.uid(uid).gid(gid);
+    }
+    Ok(cmd.spawn()?)
+}
+
+/// Records handed to the parser per wake-up of the ring buffer before the other events
+/// get a turn.
+const BATCH: usize = 8192;
+
+/// The privileged process's loop: copy ring-buffer records and map readings to the parser
+/// process (never parse them), until the time is up or a signal arrives; then close the
+/// pipe and collect the parser's last `counts`.
+#[allow(clippy::too_many_lines)] // one select loop reads best in one place
+async fn relay(
+    opts: &Options,
+    mode: AttachMode,
+    remaining: &Remaining,
+    maps: &Maps,
+    ring: RingBuf<MapData>,
+    mut child: tokio::process::Child,
+) -> Result<serde_json::Value, Error> {
+    use crate::worker::{FRAME_KERNEL, FRAME_RECORD, frame};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate())?;
+    let mut int = signal(SignalKind::interrupt())?;
+    let mut to_parser = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("no pipe to the parser"))?;
+    let mut from_parser = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("no pipe from the parser"))?;
+    let mut ring = AsyncFd::with_interest(ring, tokio::io::Interest::READABLE)?;
+    let mut poll = tokio::time::interval(opts.poll);
+    let mut last_warn: Option<std::time::Instant> = None;
+    tracing::info!(
+        interface = %opts.interface, attach = ?mode, kept = ?remaining.kept,
+        parser_pid = ?child.id(), layers = ?opts.layers.names(),
+        aggregates = %opts.aggregates.display(),
+        "attached; capabilities dropped; the parser process has none; counting"
+    );
+    let timer = async {
+        match opts.duration {
+            Some(d) => tokio::time::sleep(d).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(timer);
+    let mut batch: Vec<u8> = Vec::with_capacity(1024 * 1024);
+    let outcome: Result<(), Error> = loop {
+        tokio::select! {
+            () = &mut timer => break Ok(()),
+            _ = term.recv() => { tracing::info!("SIGTERM"); break Ok(()) }
+            _ = int.recv() => { tracing::info!("SIGINT"); break Ok(()) }
+            status = child.wait() => {
+                break Err(Error::Runtime(io::Error::other(format!("the parser process exited ({status:?})"))));
+            }
+            guard = ring.readable_mut() => {
+                let mut guard = guard?;
+                batch.clear();
+                let mut drained = false;
+                for _ in 0..BATCH {
+                    if let Some(item) = guard.get_inner_mut().next() {
+                        let _ = frame(FRAME_RECORD, &item, &mut batch);
+                    } else {
+                        drained = true;
+                        break;
+                    }
+                }
+                // Readiness is cleared only once the ring is empty: the kernel wakes a
+                // reader when the consumer catches up with the producer, so clearing with
+                // records left would wait for a wake-up that never comes.
+                if drained {
+                    guard.clear_ready();
+                }
+                drop(guard);
+                if let Err(e) = send(&mut to_parser, &batch).await {
+                    break Err(Error::Runtime(e));
+                }
+                if !drained {
+                    tokio::task::yield_now().await;
+                }
+            }
+            _ = poll.tick() => {
+                match read_kernel(maps) {
+                    Ok(r) => {
+                        batch.clear();
+                        let _ = frame(FRAME_KERNEL, &serde_json::to_vec(&r).unwrap_or_default(), &mut batch);
+                        if let Err(e) = send(&mut to_parser, &batch).await {
+                            break Err(Error::Runtime(e));
+                        }
+                    }
+                    Err(err) => {
+                        // At most once a minute: a failing read repeats every poll.
+                        if last_warn.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
+                            tracing::warn!(error = %err, "reading the counters failed");
+                            last_warn = Some(std::time::Instant::now());
+                        }
+                    }
+                }
+            }
+        }
+    };
+    // One last reading, then end of input: the parser answers with its last counts.
+    if outcome.is_ok()
+        && let Ok(r) = read_kernel(maps)
+    {
+        batch.clear();
+        frame(
+            FRAME_KERNEL,
+            &serde_json::to_vec(&r).unwrap_or_default(),
+            &mut batch,
+        );
+        let _ = send(&mut to_parser, &batch).await;
+    }
+    let _ = to_parser.flush().await;
+    drop(to_parser);
+    let mut out = Vec::new();
+    let read = tokio::time::timeout(
+        Duration::from_secs(10),
+        (&mut from_parser)
+            .take(server::MAX_ANSWER as u64)
+            .read_to_end(&mut out),
+    )
+    .await;
+    if read.is_err() {
+        let _ = child.start_kill();
+    }
+    let _ = child.wait().await;
+    outcome?;
+    Ok(serde_json::from_slice(&out).unwrap_or(serde_json::Value::Null))
+}
+
+fn read_kernel(m: &Maps) -> Result<KernelReading, Error> {
+    let mut r = KernelReading::default();
+    for d in [INGRESS, EGRESS] {
+        let di = d as usize;
+        let t = total(&m.counters, d)?;
+        r.totals[di] = (t.packets, t.bytes);
+        for (i, slot) in r.classes[di].iter_mut().enumerate() {
+            let c = sum(&m.classes, d * CLASS_SLOTS + u32::try_from(i).unwrap_or(0))?;
+            *slot = (c.packets, c.bytes);
+        }
+        for (i, slot) in r.flags[di].iter_mut().enumerate() {
+            *slot = sum_u64(&m.flags, d * FLAG_SLOTS + u32::try_from(i).unwrap_or(0))?;
+        }
+    }
+    for (i, slot) in r.stats.iter_mut().enumerate() {
+        *slot = sum_u64(&m.stats, u32::try_from(i).unwrap_or(0))?;
+    }
+    for item in m.ports.iter().take(PORT_ENTRIES as usize) {
+        let (k, values) = item?;
+        let c = values
+            .iter()
+            .fold(PortCounters::default(), |acc, v| acc.plus(*v));
+        r.ports.push(PortRow {
+            port: k.port,
+            proto: k.proto,
+            direction: k.direction,
+            packets: c.packets,
+            bytes: c.bytes,
+            syn: c.syn,
+            rst: c.rst,
+        });
+    }
+    Ok(r)
+}
+
+fn sum(map: &PerCpuArray<MapData, Counters>, index: u32) -> Result<Counters, Error> {
+    Ok(map
+        .get(&index, 0)?
+        .iter()
+        .fold(Counters::default(), |acc, c| acc.plus(*c)))
+}
+
+fn sum_u64(map: &PerCpuArray<MapData, u64>, index: u32) -> Result<u64, Error> {
+    Ok(map
+        .get(&index, 0)?
+        .iter()
+        .fold(0u64, |acc, c| acc.saturating_add(*c)))
 }
 
 /// Removes filters named like ours from the interface's ingress and egress (netlink mode).
@@ -255,38 +631,56 @@ fn raise_memlock() {
 }
 
 fn total(map: &PerCpuArray<MapData, Counters>, direction: u32) -> Result<Direction, Error> {
-    let sum = map
-        .get(&direction, 0)?
-        .iter()
-        .fold(Counters::default(), |acc, c| acc.plus(*c));
+    let s = sum(map, direction)?;
     Ok(Direction {
-        packets: sum.packets,
-        bytes: sum.bytes,
+        packets: s.packets,
+        bytes: s.bytes,
     })
 }
 
-/// Waits for the duration or a signal. "attached" is logged only once the signal handlers
-/// are in place, so a supervisor that signals right after seeing it gets a clean stop.
-async fn wait(
-    duration: Option<Duration>,
-    interface: &str,
-    mode: AttachMode,
-    kept: &[&str],
-) -> io::Result<()> {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut term = signal(SignalKind::terminate())?;
-    let mut int = signal(SignalKind::interrupt())?;
-    tracing::info!(interface, attach = ?mode, kept = ?kept, "attached; capabilities dropped; counting");
-    let timer = async {
-        match duration {
-            Some(d) => tokio::time::sleep(d).await,
-            None => std::future::pending().await,
-        }
-    };
-    tokio::select! {
-        () = timer => {}
-        _ = term.recv() => tracing::info!("SIGTERM"),
-        _ = int.recv() => tracing::info!("SIGINT"),
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ring_sizes_are_powers_of_two() {
+        assert_eq!(ring_bytes(0), 4096);
+        assert_eq!(ring_bytes(4), 4096);
+        assert_eq!(ring_bytes(4096), 4 * 1024 * 1024);
+        assert_eq!(ring_bytes(3000), 4 * 1024 * 1024);
+        assert_eq!(ring_bytes(u32::MAX), 32 * 1024 * 1024);
     }
-    Ok(())
+
+    #[test]
+    fn token_bucket_settings() {
+        let opts = Options {
+            interface: "lo".into(),
+            duration: None,
+            mode: AttachMode::Auto,
+            layers: Layers::parse("headers,protocols,owners,tcp").unwrap(),
+            samples_per_sec: 2000,
+            burst: 500,
+            ring_buffer_kib: 4096,
+            first_packets: 8,
+            max_flows: 16_384,
+            poll: Duration::from_secs(2),
+            aggregates: "/run/iohr-capture/aggregates.sock".into(),
+            control: "/run/iohr-capture/control.sock".into(),
+            group: "iohr-capture-read".into(),
+            agent_user: "iohr-agent".into(),
+        };
+        let c = kernel_config(&opts, 14);
+        assert_eq!(c.interval_ns, 500_000);
+        assert_eq!(c.burst_ns, 250_000_000);
+        assert_eq!(c.flags, CONFIG_HEADERS | CONFIG_PROTOCOLS);
+        let unlimited = kernel_config(
+            &Options {
+                samples_per_sec: 0,
+                ..opts
+            },
+            0,
+        );
+        assert_eq!(unlimited.interval_ns, 0);
+        assert_eq!(unlimited.l2_len, 0);
+    }
 }

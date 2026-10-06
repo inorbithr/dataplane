@@ -1,6 +1,17 @@
 #!/bin/sh
 set -e
 if [ "$1" = "configure" ]; then
+  # Who may read the aggregates socket: the agent's user, and people added on purpose.
+  if ! getent group iohr-capture-read >/dev/null; then
+    addgroup --system iohr-capture-read >/dev/null
+  fi
+  if getent passwd iohr-agent >/dev/null && ! id -nG iohr-agent | grep -qw iohr-capture-read; then
+    adduser iohr-agent iohr-capture-read >/dev/null
+    # A running agent sees a new group only after a restart.
+    if command -v systemctl >/dev/null && systemctl is-active --quiet iohr-agent 2>/dev/null; then
+      echo "iohr-capture: the agent's user joined iohr-capture-read; restart the agent to read capture counts: sudo systemctl restart iohr-agent"
+    fi
+  fi
   if ! getent passwd iohr-capture >/dev/null; then
     adduser --system --group --no-create-home --home /nonexistent iohr-capture >/dev/null
   fi

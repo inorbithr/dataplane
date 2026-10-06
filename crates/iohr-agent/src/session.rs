@@ -182,10 +182,20 @@ async fn once(agent: &Arc<Agent>, shutdown: &mut watch::Receiver<bool>) -> Resul
     drop(token);
     let (mut sink, mut stream) = ws.split();
 
+    let mut capabilities = agent.executor.capabilities();
+    if let Some(policy) = agent.policy.capture() {
+        // Only the capability strings travel: what this host can show, never what it saw.
+        let info = crate::capture::check(&policy, crate::capture::HELLO_TIMEOUT).await;
+        if info.state != "answering" {
+            tracing::info!(state = %info.state, reason = info.reason.as_deref().unwrap_or(""), "capture companion not announced");
+        }
+        capabilities.extend(info.capabilities.iter().cloned());
+        agent.state.capture_checked(info);
+    }
     let hello = AgentFrame::Hello {
         agent_version: env!("CARGO_PKG_VERSION").into(),
         policy_hash: agent.policy_hash.clone(),
-        capabilities: agent.executor.capabilities(),
+        capabilities,
         domains: agent.policy.domains.bound.clone(),
         agent_time: now_utc_seconds(),
         checks_hash: agent.checks.as_ref().map(|c| c.hash.clone()),

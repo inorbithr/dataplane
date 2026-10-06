@@ -165,6 +165,99 @@ fn esc(s: &str) -> String {
     out
 }
 
+/// The Traffic section: what the capture companion counted on this host. Counts only;
+/// none of it is sent to the platform (only the `capture:*` strings in the hello).
+fn traffic(h: &mut String, t: &crate::capture::TrafficInfo) {
+    let row = |h: &mut String, k: &str, v: &str| {
+        let _ = write!(h, "<tr><th>{}</th><td>{}</td></tr>", esc(k), esc(v));
+    };
+    h.push_str("<h2>Traffic</h2><p>Counted by iohr-capture on this host. Counts only; they stay on this machine. The platform learns only which capture layers this host offers.</p><table>");
+    row(h, "Companion", &t.state);
+    if let Some(r) = &t.reason {
+        row(h, "Why", r);
+    }
+    row(
+        h,
+        "Announced",
+        &if t.capabilities.is_empty() {
+            "nothing".to_owned()
+        } else {
+            t.capabilities.join(", ")
+        },
+    );
+    if let Some(a) = t.age_secs {
+        row(h, "Numbers from", &format!("{a} s ago"));
+    }
+    if let Some(c) = &t.counts {
+        let n = |v: u64| v.to_string();
+        row(
+            h,
+            "Ingress",
+            &format!(
+                "{} skb, {} bytes",
+                c.headers.ingress.packets, c.headers.ingress.bytes
+            ),
+        );
+        row(
+            h,
+            "Egress",
+            &format!(
+                "{} skb, {} bytes",
+                c.headers.egress.packets, c.headers.egress.bytes
+            ),
+        );
+        row(
+            h,
+            "Drops",
+            &format!(
+                "{} rate limited, {} ring buffer full, {} flows evicted",
+                c.drops.rate_limited, c.drops.ring_buffer_full, c.drops.flows_evicted
+            ),
+        );
+        row(
+            h,
+            "Flows",
+            &format!(
+                "{} seen, {} active, {} recognised",
+                c.flows.seen, c.flows.active, c.flows.recognised
+            ),
+        );
+        row(h, "HTTP/1 requests", &n(c.protocols.http1_requests));
+        row(h, "TLS handshakes", &n(c.protocols.tls_client_hellos));
+        row(h, "DNS queries", &n(c.protocols.dns_queries));
+        row(
+            h,
+            "HTTP/2 connections (gRPC calls)",
+            &format!(
+                "{} ({})",
+                c.protocols.http2_connections, c.protocols.grpc_calls
+            ),
+        );
+        row(
+            h,
+            "Owners",
+            &format!(
+                "{} sockets, {} owners, {} flows owned, {} unowned",
+                c.owners.sockets, c.owners.owners, c.owners.flows_owned, c.owners.flows_unowned
+            ),
+        );
+        row(
+            h,
+            "TCP",
+            &format!(
+                "{} established, {} listening, {} retransmits, {} resets in, {} out, {} listen overflows",
+                c.tcp.established,
+                c.tcp.listening,
+                c.tcp.retransmits_sampled,
+                c.tcp.resets_in,
+                c.tcp.resets_out,
+                c.tcp.host.listen_overflows
+            ),
+        );
+    }
+    h.push_str("</table><p>Names, paths and addresses: <code>iohr agent capture status --tables</code> on this host.</p>");
+}
+
 /// The HTML page. Every value is escaped: job targets come from the platform.
 #[must_use]
 pub fn render_html(s: &Snapshot) -> String {
@@ -238,9 +331,13 @@ table{{border-collapse:collapse;width:100%}}td,th{{text-align:left;padding:.25re
             j.latency_ms
         );
     }
+    h.push_str("</table>");
+    if let Some(t) = &s.capture {
+        traffic(&mut h, t);
+    }
     let _ = write!(
         h,
-        "</table><h2>How to stop it</h2><p>{}</p><p><a href=/status.json>status.json</a></p></html>",
+        "<h2>How to stop it</h2><p>{}</p><p><a href=/status.json>status.json</a></p></html>",
         esc(&s.stop)
     );
     h

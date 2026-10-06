@@ -43,6 +43,9 @@ pub struct Snapshot {
     pub recent_jobs: VecDeque<JobRecord>,
     /// How to stop the agent here.
     pub stop: String,
+    /// The capture companion, when `[work] capture = true`: counts only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<crate::capture::TrafficInfo>,
 }
 
 /// Identity.
@@ -190,6 +193,11 @@ impl AgentState {
             s.revoked = true;
             s.connected = false;
         });
+    }
+
+    /// The latest answer from the capture companion.
+    pub fn capture_checked(&self, info: crate::capture::TrafficInfo) {
+        self.with(|s| s.capture = Some(info));
     }
 
     /// A heartbeat went out.

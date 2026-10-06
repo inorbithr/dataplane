@@ -1,0 +1,5 @@
+GET /items/123?token=secret HTTP/1.1
+Host: web.e2e.test
+User-Agent: curl/8.12.1
+Accept: */*
+

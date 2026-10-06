@@ -32,7 +32,8 @@ for k in $KERNELS; do
   rm -f "$out/$k.json"
   # --user root inside the guest only; the guest sees this host's files read-only, with
   # $out writable (as /tmp/e2e) for the result.
-  if ! vng --run "$k" --user root --cpus 2 --memory 2G --rwdir="/tmp/e2e=$out" \
+  # A guest that hangs must not hang the run: 20 minutes per kernel at most.
+  if ! timeout 1200 vng --run "$k" --user root --cpus 2 --memory 2G --rwdir="/tmp/e2e=$out" \
       --exec "python3 $(pwd)/tools/capture_e2e_guest.py $bin /tmp/e2e/$k.json" \
       </dev/null >"$out/$k.log" 2>&1; then
     fail=1
@@ -45,10 +46,34 @@ print(f"kernel {r['kernel']}: {'PASS' if r['ok'] else 'FAIL'}")
 for m in r["modes"]:
     c = m["capture"]
     bad = [k for k, v in m["checks"].items() if not v]
-    print(f"  {m['mode']:8} ingress {c['ingress']['packets']} pkts / {c['ingress']['bytes']} B,"
-          f" egress {c['egress']['packets']} pkts / {c['egress']['bytes']} B,"
+    L = m["layers"]
+    p = L["protocols"]
+    print(f"  {m['mode']:8} ingress {c['ingress']['packets']} skb / {c['ingress']['bytes']} B,"
+          f" egress {c['egress']['packets']} skb / {c['egress']['bytes']} B,"
           f" kept {c['capabilities_after_attach']['kept'] or 'nothing'}"
           + (f"  FAILED: {', '.join(bad)}" if bad else ""))
+    print(f"           protocols: http1 {p['http1_requests']}/{p['http1_responses']} req/resp, tls {p['tls_client_hellos']} (sni {p['tls_with_sni']}),"
+          f" dns {p['dns_queries']}/{p['dns_responses']}, h2c {p['http2_connections']}, grpc {p['grpc_calls']}")
+    w = L["owners"]["web"]
+    print(f"           owners: {L['owners']['summary']['sockets']} sockets, web owner {w.get('owner')} ({w.get('process')}) flows {w.get('flows')}")
+    t = L["tcp"]
+    print(f"           tcp: rtt samples {sum(t['rtt_ms'].values())}, resets out {t['resets_out']}, listen overflows {t['host']['listen_overflows']};"
+          f" drops {L['drops']}")
+f = r.get("flood")
+if f:
+    bad = [k for k, v in f["checks"].items() if not v]
+    s, l = f["small_ring"], f["rate_limited"]
+    print(f"  flood    4 KiB ring: ring full {s['drops']['ring_buffer_full']}, flows evicted {s['flows']['evicted']}, rss {s['memory']['rss_kib']} KiB;"
+          f" 100/s: rate limited {l['drops']['rate_limited']}, rss {l['memory']['rss_kib']} KiB" + (f"  FAILED: {', '.join(bad)}" if bad else ""))
+if f:
+    u = f["unlimited"]
+    print(f"           16 MiB ring, no limit: ring full {u['drops']['ring_buffer_full']}, read {u['copy']['records_read']} of {u['copy']['records_copied']} copied,"
+          f" dns after flood {u['dns_after_flood']}, parent rss {u['parent_rss_kib']} KiB, parser rss {u['memory']['rss_kib']} KiB")
+un = r.get("unit")
+if un:
+    bad = [k for k, v in un["checks"].items() if not v]
+    print(f"  unit     real systemd: dir {un['dir']}, socket {un['socket']}, http1 on lo {un['http1_requests_on_lo']},"
+          f" companion kept {un['companion_kept']}, stopped cleanly {un['checks']['stopped_cleanly']}" + (f"  FAILED: {', '.join(bad)}" if bad else ""))
 d = r["doctor"]
 print(f"  doctor   root exit 0: {d['doctor_root_exit_0']}, unprivileged exit 1: {d['doctor_unprivileged_exit_1']}")
 PY
