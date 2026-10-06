@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.0-alpha.7](https://github.com/inorbithr/dataplane/compare/v0.1.0-alpha.6...v0.1.0-alpha.7) (2026-10-06)
+
+
+### Features
+
+* **agent:** transport check surfaces grpc, sse, ws, mqtt, mcp and graphql (RFC 0040.2) ([#22](https://github.com/inorbithr/dataplane/issues/22)) ([5ebc83b](https://github.com/inorbithr/dataplane/commit/5ebc83be00e56379e3c6bdfde52a3d2ae012ff81))
+
+
+### Documentation
+
+* **brand:** a social preview that shows what this repo builds ([#21](https://github.com/inorbithr/dataplane/issues/21)) ([6c7e25b](https://github.com/inorbithr/dataplane/commit/6c7e25b44d7a8b83b2a33ec80a83f072a0d3eaf2))
+
 ## [0.1.0-alpha.6](https://github.com/inorbithr/dataplane/compare/v0.1.0-alpha.5...v0.1.0-alpha.6) (2026-10-06)
 
 
