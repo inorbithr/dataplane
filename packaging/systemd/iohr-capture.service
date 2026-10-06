@@ -1,0 +1,69 @@
+# iohr-capture: the privileged capture companion of iohr-agent (docs/adr/0002).
+# Installed by the iohr-capture package, never enabled or started by it:
+#   echo IOHR_CAPTURE_INTERFACE=eth0 | sudo tee /etc/iohr-capture/capture.env
+#   sudo systemctl enable --now iohr-capture
+# It holds CAP_BPF, CAP_PERFMON and CAP_NET_ADMIN only to load and attach its TC
+# classifiers, then drops them (on kernels before 6.6 it keeps CAP_NET_ADMIN to remove its
+# filters on exit, and before 6.5 CAP_BPF to read its counters). It counts, never drops,
+# stores nothing and sends nothing (docs/capture/install.md).
+[Unit]
+Description=InOrbit capture companion (iohr-capture): eBPF traffic counters, counts only
+Documentation=https://github.com/inorbithr/dataplane/blob/main/docs/capture/install.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=iohr-capture
+Group=iohr-capture
+EnvironmentFile=/etc/iohr-capture/capture.env
+ExecStartPre=/usr/bin/iohr-capture doctor
+ExecStart=/usr/bin/iohr-capture run
+# Kernels before 6.6 attach with netlink filters, which outlive a killed process; remove
+# them however the service ended. TCX links (6.6+) go away with the process.
+ExecStopPost=/usr/bin/iohr-capture cleanup
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=10s
+
+# The three capabilities, nothing else, and only until the classifiers are attached.
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_ADMIN
+NoNewPrivileges=yes
+SecureBits=noroot noroot-locked
+# Maps are charged to RLIMIT_MEMLOCK before Linux 5.11.
+LimitMEMLOCK=infinity
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=all
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+DevicePolicy=closed
+IPAddressDeny=any
+# AF_NETLINK attaches and removes TC filters; AF_UNIX is for the agent socket (phase 1).
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+# @system-service plus bpf (load, attach, map reads) and capset (the drop). No
+# perf_event_open yet: TC needs none; kprobe layers add it with their phase.
+SystemCallFilter=@system-service bpf capset
+SystemCallFilter=~@mount @swap @reboot @module @obsolete @debug @cpu-emulation @raw-io @clock @setuid @chown
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

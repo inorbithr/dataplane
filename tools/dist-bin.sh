@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Static Linux binaries (musl, static-pie) into dist/bin/<os>-<arch>/iohr-agent.
+# Static Linux binaries (musl, static-pie) into dist/bin/<os>-<arch>/: iohr-agent and
+# iohr-capture (whose build.rs compiles the eBPF programs with the pinned nightly).
 # Builds the host architecture; set TARGETS to build others when a cross C compiler for
 # ring is available (CI builds each architecture on its own runner instead).
 set -euo pipefail
@@ -20,8 +21,10 @@ for t in $TARGETS; do
   if [ -z "${!cc_var:-}" ] && ! command -v "${t%%-*}-linux-musl-gcc" >/dev/null; then
     export "$cc_var"="${CC:-gcc}"
   fi
-  cargo build --release --locked --target "$t" -p iohr-agent
+  cargo build --release --locked --target "$t" -p iohr-agent -p iohr-capture
   mkdir -p "dist/bin/linux-$arch"
-  cp "$target_dir/$t/release/iohr-agent" "dist/bin/linux-$arch/iohr-agent"
-  echo "dist/bin/linux-$arch/iohr-agent"
+  for b in iohr-agent iohr-capture; do
+    cp "$target_dir/$t/release/$b" "dist/bin/linux-$arch/$b"
+    echo "dist/bin/linux-$arch/$b"
+  done
 done

@@ -92,7 +92,7 @@ shell = "bash -e -o pipefail -c"
 description = "Spelling, shell scripts, workflow lint and workflow security audit"
 run = [
   "typos",
-  "shellcheck tools/*.sh packaging/deb/*",
+  "shellcheck tools/*.sh packaging/deb/* packaging/deb-capture/*",
   "actionlint",
   "zizmor --min-severity low .github/workflows",
 ]
@@ -130,12 +130,22 @@ run = "tools/dist-packages.sh"
 
 [tasks."dist:sbom"]
 shell = "bash -e -o pipefail -c"
-description = "CycloneDX SBOM of the binary into dist/sbom"
+description = "CycloneDX SBOMs of the binaries into dist/sbom (iohr-capture's includes its eBPF programs)"
 run = """
 mkdir -p dist/sbom
-cargo cyclonedx --manifest-path crates/iohr-agent/Cargo.toml --format json --spec-version 1.5 --override-filename iohr-agent.cdx
-mv crates/iohr-agent/iohr-agent.cdx.json dist/sbom/iohr-agent.cdx.json
-cyclonedx validate --input-file dist/sbom/iohr-agent.cdx.json --input-version v1_5 --fail-on-errors
+for c in iohr-agent iohr-capture iohr-capture-ebpf; do
+  cargo cyclonedx --manifest-path "crates/$c/Cargo.toml" --format json --spec-version 1.5 --override-filename "$c.cdx"
+  mv "crates/$c/$c.cdx.json" "dist/sbom/$c.cdx.json"
+done
+# One SBOM per shipped binary: the eBPF object is embedded in iohr-capture.
+cyclonedx merge --hierarchical --name iohr-capture --version "$(cargo pkgid -p iohr-capture | sed 's/.*[#@]//')" \
+  --input-files dist/sbom/iohr-capture.cdx.json dist/sbom/iohr-capture-ebpf.cdx.json \
+  --output-file dist/sbom/iohr-capture.merged.cdx.json --output-version v1_5
+mv dist/sbom/iohr-capture.merged.cdx.json dist/sbom/iohr-capture.cdx.json
+rm dist/sbom/iohr-capture-ebpf.cdx.json
+for c in iohr-agent iohr-capture; do
+  cyclonedx validate --input-file "dist/sbom/$c.cdx.json" --input-version v1_5 --fail-on-errors
+done
 """
 
 [tasks."dist:vex"]

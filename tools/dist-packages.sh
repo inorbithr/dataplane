@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# .deb (cargo-deb) and .rpm (cargo-generate-rpm) with the systemd unit, from the static
-# binaries in dist/bin. Output: dist/packages/.
+# .deb (cargo-deb) and .rpm (cargo-generate-rpm) for iohr-agent and iohr-capture, each with
+# its systemd unit (installed, never enabled), from the static binaries in dist/bin.
+# Output: dist/packages/.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 target_dir="${CARGO_TARGET_DIR:-target}"
@@ -18,9 +19,11 @@ for dir in dist/bin/linux-*; do
   esac
   # Both tools package the binary from the target directory: put the static one there.
   mkdir -p "$target_dir/$t/release"
-  cp "$dir/iohr-agent" "$target_dir/$t/release/iohr-agent"
-  cargo deb -p iohr-agent --no-build --no-strip --target "$t" --output dist/packages/
-  cargo generate-rpm -p crates/iohr-agent --target "$t" --arch "$rpm_arch" -o dist/packages/ \
-    -s "version = \"$rpm_version\""
+  for b in iohr-agent iohr-capture; do
+    cp "$dir/$b" "$target_dir/$t/release/$b"
+    cargo deb -p "$b" --no-build --no-strip --target "$t" --output dist/packages/
+    cargo generate-rpm -p "crates/$b" --target "$t" --arch "$rpm_arch" -o dist/packages/ \
+      -s "version = \"$rpm_version\""
+  done
 done
 ls -1 dist/packages

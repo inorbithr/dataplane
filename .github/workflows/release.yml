@@ -43,10 +43,11 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          - { os: ubuntu-24.04, target: x86_64-unknown-linux-musl, dir: linux-amd64 }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, dir: linux-arm64 }
-          - { os: macos-15, target: aarch64-apple-darwin, dir: darwin-arm64 }
-          - { os: macos-15, target: x86_64-apple-darwin, dir: darwin-amd64 }
+          # iohr-capture (eBPF) is Linux only; its build needs the pinned nightly and bpf-linker.
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-musl, dir: linux-amd64, tools: "rust cargo-binstall cargo:bpf-linker", bins: "iohr-agent iohr-capture" }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, dir: linux-arm64, tools: "rust cargo-binstall cargo:bpf-linker", bins: "iohr-agent iohr-capture" }
+          - { os: macos-15, target: aarch64-apple-darwin, dir: darwin-arm64, tools: "rust", bins: "iohr-agent" }
+          - { os: macos-15, target: x86_64-apple-darwin, dir: darwin-amd64, tools: "rust", bins: "iohr-agent" }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -54,17 +55,20 @@ jobs:
       - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
         with:
           cache: false
-          install_args: "rust"
+          install_args: ${{ matrix.tools }}
       - name: Build
         env:
           TARGET: ${{ matrix.target }}
           DIR: ${{ matrix.dir }}
+          BINS: ${{ matrix.bins }}
         run: |
           rustup target add "$TARGET"
           if [[ "$TARGET" == *-linux-musl ]]; then export "CC_${TARGET//-/_}=gcc"; fi
-          cargo build --release --locked -p iohr-agent --target "$TARGET"
           mkdir -p "dist/bin/$DIR"
-          cp "${CARGO_TARGET_DIR:-target}/$TARGET/release/iohr-agent" "dist/bin/$DIR/iohr-agent"
+          for b in $BINS; do
+            cargo build --release --locked -p "$b" --target "$TARGET"
+            cp "${CARGO_TARGET_DIR:-target}/$TARGET/release/$b" "dist/bin/$DIR/$b"
+          done
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bin-${{ matrix.dir }}
@@ -91,7 +95,7 @@ jobs:
       - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
         with:
           cache: false
-          install_args: "rust cargo-binstall cargo:cargo-deb cargo:cargo-generate-rpm cargo:cargo-cyclonedx cyclonedx helm oras"
+          install_args: "rust cargo-binstall cargo:cargo-deb cargo:cargo-generate-rpm cargo:cargo-cyclonedx cyclonedx helm oras cargo:bpf-linker"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: bin-*
@@ -101,7 +105,7 @@ jobs:
         env:
           REF: ${{ github.ref_name }}
         run: echo "version=${REF#v}" >> "$GITHUB_OUTPUT"
-      - run: chmod +x dist/bin/*/iohr-agent
+      - run: chmod +x dist/bin/*/iohr-*
       - run: tools/dist-packages.sh
       - run: mise run dist:sbom
       - run: mkdir -p dist && python3 tools/vex.py > dist/iohr-agent.openvex.json
@@ -112,9 +116,12 @@ jobs:
           mkdir -p dist/release
           for d in dist/bin/*/; do
             p="$(basename "$d")"
-            tar -C "$d" -czf "dist/release/iohr-agent-$VERSION-$p.tar.gz" iohr-agent
+            for b in iohr-agent iohr-capture; do
+              [ -f "$d/$b" ] || continue
+              tar -C "$d" -czf "dist/release/$b-$VERSION-$p.tar.gz" "$b"
+            done
           done
-          cp dist/packages/* dist/sbom/iohr-agent.cdx.json dist/iohr-agent.openvex.json dist/release/
+          cp dist/packages/* dist/sbom/iohr-agent.cdx.json dist/sbom/iohr-capture.cdx.json dist/iohr-agent.openvex.json dist/release/
           (cd dist/release && sha256sum -- * > SHA256SUMS)
       - name: Push image, chart and extension
         id: push
@@ -228,10 +235,19 @@ jobs:
       - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
           subject-path: |
-            dist/release/*.tar.gz
-            dist/release/*.deb
-            dist/release/*.rpm
+            dist/release/iohr-agent-*.tar.gz
+            dist/release/iohr-agent_*.deb
+            dist/release/iohr-agent-*.rpm
           sbom-path: dist/release/iohr-agent.cdx.json
+      # iohr-capture: its own SBOM (user space and the embedded eBPF programs). Its image is
+      # not pushed yet: ghcr.io/inorbithr/iohr-capture needs the owner's package grant first.
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: |
+            dist/release/iohr-capture-*.tar.gz
+            dist/release/iohr-capture_*.deb
+            dist/release/iohr-capture-*.rpm
+          sbom-path: dist/release/iohr-capture.cdx.json
       - name: GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
