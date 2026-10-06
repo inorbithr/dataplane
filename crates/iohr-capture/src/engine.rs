@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::flows::{self, CLIENT_BYTES, Flow, Key, SERVER_BYTES, State};
-use crate::owners::{self, CgroupIndex, Owner};
+#[cfg(test)]
+use crate::owners::CgroupIndex;
+use crate::owners::{self, Owner};
 use crate::packet::{self, IPPROTO_TCP, IPPROTO_UDP, TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN};
 use crate::privileges::Dropped;
 use crate::proto::{Detect, Event, dns, http1, http2, postgres, redis, tls};
@@ -568,7 +570,7 @@ impl Engine {
         &mut self,
         dump: std::io::Result<Vec<Socket>>,
         host: HashMap<(String, String), u64>,
-        cgroups: &mut CgroupIndex,
+        cgroups: &HashMap<u64, (String, Option<String>)>,
         users: &HashMap<u32, String>,
     ) {
         if self.host_base.is_empty() {
@@ -583,7 +585,6 @@ impl Engine {
                 return;
             }
         };
-        cgroups.new_round();
         let flows_by_owner: HashMap<String, u64> = self
             .owners
             .iter()
@@ -613,11 +614,8 @@ impl Engine {
                 _ => {}
             }
             if self.settings.layers.owners && s.state != sockdiag::TCP_TIME_WAIT {
-                let owner = match s.cgroup_id.and_then(|id| cgroups.path(id)) {
-                    Some(path) => {
-                        let o = owners::classify(&path);
-                        (o, cgroups.processes(&path))
-                    }
+                let owner = match s.cgroup_id.and_then(|id| cgroups.get(&id)) {
+                    Some((path, procs)) => (owners::classify(path), procs.clone()),
                     None => (
                         Owner {
                             kind: "user",
@@ -1326,7 +1324,8 @@ mod tests {
         ));
         let mut socks = Vec::new();
         let _ = sockdiag::parse(&buf, 6, 1, &mut socks);
-        e.sockets(Ok(socks), HashMap::new(), &mut idx, &HashMap::new());
+        let resolved = owners::resolve(&socks, &mut idx);
+        e.sockets(Ok(socks), HashMap::new(), &resolved, &HashMap::new());
         e.ingest(&record_v4(0, 6, ([10, 0, 0, 3], 41000), SERVER, 0x02, b""));
         let t = e.tables();
         assert_eq!(t["owners"]["flows_owned"], 1);

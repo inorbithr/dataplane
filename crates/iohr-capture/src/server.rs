@@ -76,6 +76,21 @@ impl Access {
         a
     }
 
+    /// Says loudly when the guard that keeps the tables from the agent cannot work.
+    pub(crate) fn warn_if_unguarded(&self, agent_user: &str) {
+        match self.agent_uid {
+            None => tracing::warn!(
+                agent_user,
+                "the agent's user does not exist: the guard that gives it counts only is off until it does (set --agent-user)"
+            ),
+            Some(0) => tracing::warn!(
+                agent_user,
+                "the agent's user is root: root may read the tables, so the guard that gives the agent counts only is off"
+            ),
+            Some(_) => {}
+        }
+    }
+
     /// Whether `uid` is the agent's user (which may read counts only). Root is never
     /// treated as the agent: a person with sudo may read the tables.
     pub(crate) fn is_agent(&self, uid: u32) -> bool {
@@ -113,28 +128,39 @@ impl Drop for Bound {
 /// socket made in it later belongs to the group without any `chown` (the unit's system
 /// call filter forbids `chown`; under the unit the directory already has the group, so
 /// nothing is changed but the mode).
-pub(crate) fn prepare_dir(dir: &Path, gid: Option<u32>) -> io::Result<()> {
+pub(crate) fn prepare_dir(dir: &Path, owner: Option<u32>, gid: Option<u32>) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt as _;
     if !dir.exists() {
         fs::create_dir_all(dir)?;
     }
-    let mode = match gid {
-        Some(g) => {
-            if fs::metadata(dir)?.gid() != g
-                && let Err(e) = std::os::unix::fs::chown(dir, None, Some(g))
-            {
-                // Under the unit the directory has the unit's Group= already; a different
-                // --socket-group there cannot be applied (no chown) and is reported.
-                tracing::warn!(error = %e, dir = %dir.display(), "the socket directory keeps its group");
-            }
-            0o2750
+    let meta = fs::metadata(dir)?;
+    let owner = owner.filter(|u| *u != meta.uid());
+    let group = gid.filter(|g| *g != meta.gid());
+    if (owner.is_some() || group.is_some())
+        && let Err(e) = std::os::unix::fs::chown(dir, owner, group)
+    {
+        // Under the unit the directory has the unit's user and Group= already; a different
+        // --socket-group there cannot be applied (no chown) and is reported.
+        tracing::warn!(error = %e, dir = %dir.display(), "the socket directory keeps its owner and group");
+    }
+    let mode = if gid.is_some() { 0o2750 } else { 0o755 };
+    let meta = fs::metadata(dir)?;
+    if meta.mode() & 0o7777 != mode
+        && let Err(e) = fs::set_permissions(dir, fs::Permissions::from_mode(mode))
+    {
+        // The unit creates the directory itself and forbids setting the set-group-id bit
+        // (RestrictSUIDSGID). If the group is right, a different mode (a drop-in's
+        // RuntimeDirectoryMode=) must not stop the start: it is reported.
+        if gid.is_some_and(|g| g == meta.gid()) {
+            tracing::warn!(
+                error = %e,
+                dir = %dir.display(),
+                mode = format!("{:o}", meta.mode() & 0o7777),
+                "the socket directory keeps its mode; 2750 is expected"
+            );
+        } else {
+            return Err(e);
         }
-        None => 0o755,
-    };
-    // Only when it differs: the unit creates the directory 2750 itself and forbids
-    // setting the set-group-id bit (RestrictSUIDSGID).
-    if fs::metadata(dir)?.mode() & 0o7777 != mode {
-        fs::set_permissions(dir, fs::Permissions::from_mode(mode))?;
     }
     Ok(())
 }
@@ -435,7 +461,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("iohr-capture-server-{}", std::process::id()));
         let agg = dir.join("a.sock");
         let ctl = dir.join("c.sock");
-        prepare_dir(&dir, None).unwrap();
+        prepare_dir(&dir, None, None).unwrap();
         let bound = bind(&agg, &ctl).unwrap();
         let mode = fs::metadata(&agg).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o660);

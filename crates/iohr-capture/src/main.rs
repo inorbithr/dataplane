@@ -125,13 +125,13 @@ struct RunArgs {
     /// Token bucket burst, in copies.
     #[arg(long, env = "IOHR_CAPTURE_BURST", default_value_t = 500)]
     burst: u64,
-    /// Ring buffer size in KiB (rounded up to a power of two; 4 to 262144).
+    /// Ring buffer size in KiB (rounded up to a power of two; 4 to 32768).
     #[arg(long, env = "IOHR_CAPTURE_RING_BUFFER_KIB", default_value_t = 4096)]
     ring_buffer_kib: u32,
     /// Payload-carrying packets per flow whose first 512 bytes are copied.
     #[arg(long, env = "IOHR_CAPTURE_FIRST_PACKETS", default_value_t = 8)]
     first_packets: u32,
-    /// Flows tracked at once in user space; more evict the oldest (counted). At most 262144.
+    /// Flows tracked at once in user space; more evict the oldest (counted). At most 65536.
     #[arg(long, env = "IOHR_CAPTURE_MAX_FLOWS", default_value_t = 16_384)]
     max_flows: usize,
     /// How often the maps, sockets and host counters are read, in milliseconds.
@@ -258,9 +258,10 @@ fn run(a: &RunArgs) -> ExitCode {
     }
 }
 
-/// Upper bounds on the sizes a person can ask for (the unit also caps memory).
-const MAX_FLOWS: usize = 262_144;
-const MAX_RING_KIB: u32 = 256 * 1024;
+/// Upper bounds on the sizes a person can ask for, so the worst case (a 32 MiB ring buffer
+/// plus 65536 undecided flows of about 2 KiB) stays well under the unit's MemoryMax=256M.
+const MAX_FLOWS: usize = 65_536;
+const MAX_RING_KIB: u32 = 32 * 1024;
 
 #[cfg(target_os = "linux")]
 fn worker(config: &str) -> ExitCode {

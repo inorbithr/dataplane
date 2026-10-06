@@ -27,15 +27,19 @@ pub(crate) const FRAME_KERNEL: u8 = 2;
 /// Largest frame accepted.
 pub(crate) const MAX_FRAME: usize = 1024 * 1024;
 
-/// One frame: kind, little-endian length, payload.
-pub(crate) fn frame(kind: u8, payload: &[u8], out: &mut Vec<u8>) {
+/// Appends one frame (kind, little-endian length, payload). A payload larger than
+/// [`MAX_FRAME`] is not framed (the reader would refuse it); returns whether it was.
+pub(crate) fn frame(kind: u8, payload: &[u8], out: &mut Vec<u8>) -> bool {
+    let Some(len) = u32::try_from(payload.len())
+        .ok()
+        .filter(|l| *l as usize <= MAX_FRAME)
+    else {
+        return false;
+    };
     out.push(kind);
-    out.extend_from_slice(
-        &u32::try_from(payload.len())
-            .unwrap_or(u32::MAX)
-            .to_le_bytes(),
-    );
+    out.extend_from_slice(&len.to_le_bytes());
     out.extend_from_slice(payload);
+    true
 }
 
 /// Reads one frame; `None` at end of input.
@@ -85,6 +89,19 @@ pub(crate) struct Config {
 /// breaks.
 pub(crate) fn run(config: &str) -> Result<serde_json::Value, String> {
     let cfg: Config = serde_json::from_str(config).map_err(|e| format!("worker config: {e}"))?;
+    // Never parse as root, even with no capability: root owns /etc and /run.
+    if rustix::process::geteuid().is_root() {
+        return Err(
+            "the parser refuses to run as root (`run` starts it as iohr-capture or nobody)".into(),
+        );
+    }
+    // Only standard input, output and error may come from `run`.
+    let inherited = inherited_fds();
+    if !inherited.is_empty() {
+        return Err(format!(
+            "the parser inherited open files {inherited:?}; refusing"
+        ));
+    }
     // First thing, while single-threaded: no capability at all from here on.
     let (_, dropped) =
         privileges::drop_all_but(CapabilitySet::empty()).map_err(|e| e.to_string())?;
@@ -109,6 +126,21 @@ pub(crate) fn run(config: &str) -> Result<serde_json::Value, String> {
     rt.block_on(serve(&cfg, layers, &engine))?;
     let counts = lock(&engine).counts();
     Ok(counts)
+}
+
+/// File descriptors above 2 open at start, other than the one listing them.
+fn inherited_fds() -> Vec<u32> {
+    let Ok(dir) = std::fs::read_dir("/proc/self/fd") else {
+        return Vec::new();
+    };
+    dir.flatten()
+        .filter_map(|e| {
+            let fd: u32 = e.file_name().to_str()?.parse().ok()?;
+            let target = std::fs::read_link(e.path()).ok()?;
+            // The directory being read shows up as an open file of its own.
+            (fd > 2 && !target.to_string_lossy().contains("/fd")).then_some(fd)
+        })
+        .collect()
 }
 
 fn lock(e: &Mutex<Engine>) -> std::sync::MutexGuard<'_, Engine> {
@@ -154,20 +186,37 @@ async fn serve(cfg: &Config, layers: Layers, engine: &Arc<Mutex<Engine>>) -> Res
         let engine = Arc::clone(engine);
         let poll_ms = cfg.poll_ms;
         tokio::spawn(async move {
-            let mut cgroups = CgroupIndex::new(
-                std::path::Path::new("/sys/fs/cgroup"),
-                std::path::Path::new("/proc"),
-            );
-            let users =
-                crate::owners::users(&std::fs::read_to_string("/etc/passwd").unwrap_or_default());
+            let new_index = || {
+                CgroupIndex::new(
+                    std::path::Path::new("/sys/fs/cgroup"),
+                    std::path::Path::new("/proc"),
+                )
+            };
+            let mut cgroups = Some(new_index());
+            let users = Arc::new(crate::owners::users(
+                &std::fs::read_to_string("/etc/passwd").unwrap_or_default(),
+            ));
             let deep = layers.owners || layers.tcp;
             let mut poll = tokio::time::interval(Duration::from_millis(poll_ms));
             loop {
                 poll.tick().await;
-                if deep {
-                    let dump = sockdiag::dump();
-                    let host = procnet::read(std::path::Path::new("/proc"));
-                    lock(&engine).sockets(dump, host, &mut cgroups, &users);
+                if deep && let Some(mut idx) = cgroups.take() {
+                    // Netlink, /proc and the cgroup walk block: on their own thread, and the
+                    // engine is locked only to apply the result, so frames keep flowing.
+                    let engine = Arc::clone(&engine);
+                    let users = Arc::clone(&users);
+                    let back = tokio::task::spawn_blocking(move || {
+                        let dump = sockdiag::dump();
+                        let host = procnet::read(std::path::Path::new("/proc"));
+                        let resolved = match &dump {
+                            Ok(socks) => crate::owners::resolve(socks, &mut idx),
+                            Err(_) => std::collections::HashMap::new(),
+                        };
+                        lock(&engine).sockets(dump, host, &resolved, &users);
+                        idx
+                    })
+                    .await;
+                    cgroups = Some(back.unwrap_or_else(|_| new_index()));
                 }
                 lock(&engine).tick();
             }
@@ -205,8 +254,11 @@ mod tests {
     #[tokio::test]
     async fn frames_round_trip_and_bound() {
         let mut out = Vec::new();
-        frame(FRAME_RECORD, b"abc", &mut out);
-        frame(FRAME_KERNEL, b"{}", &mut out);
+        assert!(frame(FRAME_RECORD, b"abc", &mut out));
+        assert!(frame(FRAME_KERNEL, b"{}", &mut out));
+        let mut none = Vec::new();
+        assert!(!frame(FRAME_RECORD, &vec![0; MAX_FRAME + 1], &mut none));
+        assert_eq!(none, Vec::<u8>::new());
         let mut r = &out[..];
         let mut buf = Vec::new();
         assert_eq!(

@@ -206,14 +206,19 @@ pub(crate) fn run(opts: &Options) -> Result<Report, Error> {
     if access.group_gid.is_none() {
         tracing::warn!(group = %opts.group, "socket group not found; the aggregates socket belongs to this process's group");
     }
+    access.warn_if_unguarded(&opts.agent_user);
+    // Run by hand as root, the parser still must not be root: it runs as `iohr-capture`
+    // (or nobody), and the sockets' directory is made its own.
+    let parser = parser_identity(&access);
     for dir in [opts.aggregates.parent(), opts.control.parent()]
         .into_iter()
         .flatten()
     {
-        server::prepare_dir(dir, access.group_gid).map_err(Error::Socket)?;
+        server::prepare_dir(dir, parser.map(|(u, _)| u), access.group_gid)
+            .map_err(Error::Socket)?;
     }
 
-    let (remaining, _) = privileges::drop_all_but(keep_after_attach(mode, version))?;
+    let keep = keep_after_attach(mode, version);
     let started = std::time::Instant::now();
     let worker = crate::worker::Config {
         interface: opts.interface.clone(),
@@ -224,12 +229,23 @@ pub(crate) fn run(opts: &Options) -> Result<Report, Error> {
         control: opts.control.clone(),
         group: opts.group.clone(),
         agent_user: opts.agent_user.clone(),
-        companion_kept: remaining.kept.iter().map(|k| (*k).to_owned()).collect(),
+        companion_kept: privileges::NAMED
+            .iter()
+            .filter(|(c, _)| keep.contains(*c))
+            .map(|(_, n)| (*n).to_owned())
+            .collect(),
     };
-    let counts = tokio::runtime::Builder::new_current_thread()
+    let (counts, remaining) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
-        .block_on(relay(opts, mode, &remaining, &maps, ring, &worker))?;
+        .block_on(async {
+            // The parser is started first, while this process may still change its user;
+            // then this process drops (still one thread: the runtime has no other).
+            let child = spawn_parser(&worker, parser)?;
+            let (remaining, _) = privileges::drop_all_but(keep)?;
+            let counts = relay(opts, mode, &remaining, &maps, ring, child).await?;
+            Ok::<_, Error>((counts, remaining))
+        })?;
     let seconds = started.elapsed().as_secs_f64();
 
     let ingress = total(&maps.counters, INGRESS)?;
@@ -265,8 +281,9 @@ pub(crate) fn run(opts: &Options) -> Result<Report, Error> {
 
 /// The ring buffer size: a power of two of at least one page.
 fn ring_bytes(kib: u32) -> u32 {
-    // At most 256 MiB, so the power of two never overflows.
-    kib.clamp(4, 256 * 1024)
+    // At most 32 MiB (the unit's MemoryMax=256M also holds the flow table), so the power
+    // of two never overflows.
+    kib.clamp(4, 32 * 1024)
         .saturating_mul(1024)
         .next_power_of_two()
 }
@@ -306,6 +323,61 @@ fn l2_len(interface: &str) -> u32 {
     }
 }
 
+/// How long one write to the parser may block (a stuck parser must not keep this process
+/// from answering SIGTERM within the unit's stop timeout).
+const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
+
+async fn send(to: &mut tokio::process::ChildStdin, bytes: &[u8]) -> io::Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+    tokio::time::timeout(WRITE_TIMEOUT, to.write_all(bytes))
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the parser process stopped reading",
+            )
+        })?
+}
+
+/// The user and group the parser runs as when this process is root: `iohr-capture`, or
+/// nobody, and the read group (`None`: this process is not root, the parser inherits its
+/// user, as under the unit).
+fn parser_identity(access: &server::Access) -> Option<(u32, u32)> {
+    if !rustix::process::geteuid().is_root() {
+        return None;
+    }
+    let passwd = fs::read_to_string("/etc/passwd").unwrap_or_default();
+    let (uid, primary) = passwd
+        .lines()
+        .find_map(|l| {
+            let f: Vec<&str> = l.split(':').collect();
+            (f.first() == Some(&"iohr-capture"))
+                .then(|| Some((f.get(2)?.parse().ok()?, f.get(3)?.parse().ok()?)))
+                .flatten()
+        })
+        .unwrap_or((65_534, 65_534));
+    Some((uid, access.group_gid.unwrap_or(primary)))
+}
+
+/// Starts `iohr-capture worker` with pipes for input and output; as another user when
+/// `identity` says so (supplementary groups are cleared).
+fn spawn_parser(
+    config: &crate::worker::Config,
+    identity: Option<(u32, u32)>,
+) -> Result<tokio::process::Child, Error> {
+    let exe = std::env::current_exe()?;
+    let config = serde_json::to_string(config).unwrap_or_default();
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.args(["worker", "--config", &config])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    if let Some((uid, gid)) = identity {
+        cmd.uid(uid).gid(gid);
+    }
+    Ok(cmd.spawn()?)
+}
+
 /// Records handed to the parser per wake-up of the ring buffer before the other events
 /// get a turn.
 const BATCH: usize = 8192;
@@ -320,21 +392,13 @@ async fn relay(
     remaining: &Remaining,
     maps: &Maps,
     ring: RingBuf<MapData>,
-    worker: &crate::worker::Config,
+    mut child: tokio::process::Child,
 ) -> Result<serde_json::Value, Error> {
     use crate::worker::{FRAME_KERNEL, FRAME_RECORD, frame};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::signal::unix::{SignalKind, signal};
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
-    let exe = std::env::current_exe()?;
-    let config = serde_json::to_string(worker).unwrap_or_default();
-    let mut child = tokio::process::Command::new(exe)
-        .args(["worker", "--config", &config])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
     let mut to_parser = child
         .stdin
         .take()
@@ -374,7 +438,7 @@ async fn relay(
                 let mut drained = false;
                 for _ in 0..BATCH {
                     if let Some(item) = guard.get_inner_mut().next() {
-                        frame(FRAME_RECORD, &item, &mut batch);
+                        let _ = frame(FRAME_RECORD, &item, &mut batch);
                     } else {
                         drained = true;
                         break;
@@ -387,7 +451,7 @@ async fn relay(
                     guard.clear_ready();
                 }
                 drop(guard);
-                if let Err(e) = to_parser.write_all(&batch).await {
+                if let Err(e) = send(&mut to_parser, &batch).await {
                     break Err(Error::Runtime(e));
                 }
                 if !drained {
@@ -398,8 +462,8 @@ async fn relay(
                 match read_kernel(maps) {
                     Ok(r) => {
                         batch.clear();
-                        frame(FRAME_KERNEL, &serde_json::to_vec(&r).unwrap_or_default(), &mut batch);
-                        if let Err(e) = to_parser.write_all(&batch).await {
+                        let _ = frame(FRAME_KERNEL, &serde_json::to_vec(&r).unwrap_or_default(), &mut batch);
+                        if let Err(e) = send(&mut to_parser, &batch).await {
                             break Err(Error::Runtime(e));
                         }
                     }
@@ -424,7 +488,7 @@ async fn relay(
             &serde_json::to_vec(&r).unwrap_or_default(),
             &mut batch,
         );
-        let _ = to_parser.write_all(&batch).await;
+        let _ = send(&mut to_parser, &batch).await;
     }
     let _ = to_parser.flush().await;
     drop(to_parser);
@@ -584,7 +648,7 @@ mod tests {
         assert_eq!(ring_bytes(4), 4096);
         assert_eq!(ring_bytes(4096), 4 * 1024 * 1024);
         assert_eq!(ring_bytes(3000), 4 * 1024 * 1024);
-        assert_eq!(ring_bytes(u32::MAX), 256 * 1024 * 1024);
+        assert_eq!(ring_bytes(u32::MAX), 32 * 1024 * 1024);
     }
 
     #[test]

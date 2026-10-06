@@ -243,6 +243,29 @@ impl CgroupIndex {
     }
 }
 
+/// Most distinct cgroups resolved per poll.
+const MAX_RESOLVED: usize = 4096;
+
+/// Resolves the cgroup ids of a socket dump to `(path, process names)`, outside any lock
+/// (it walks `/sys/fs/cgroup` and reads `/proc`).
+pub(crate) fn resolve(
+    sockets: &[crate::sockdiag::Socket],
+    index: &mut CgroupIndex,
+) -> HashMap<u64, (String, Option<String>)> {
+    index.new_round();
+    let mut out = HashMap::new();
+    for id in sockets.iter().filter_map(|s| s.cgroup_id) {
+        if out.len() >= MAX_RESOLVED || out.contains_key(&id) {
+            continue;
+        }
+        if let Some(path) = index.path(id) {
+            let procs = index.processes(&path);
+            out.insert(id, (path, procs));
+        }
+    }
+    out
+}
+
 /// User names by uid from an `/etc/passwd`-format file.
 pub(crate) fn users(passwd: &str) -> HashMap<u32, String> {
     passwd
