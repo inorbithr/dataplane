@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.0-alpha.6](https://github.com/inorbithr/dataplane/compare/v0.1.0-alpha.5...v0.1.0-alpha.6) (2026-10-06)
+
+
+### Bug fixes
+
+* **release:** Cargo.lock carries the capture crates' version, so a release builds with --locked ([#18](https://github.com/inorbithr/dataplane/issues/18)) ([4fd2bbf](https://github.com/inorbithr/dataplane/commit/4fd2bbf0645707f8953b49a29b560534b8d0ae54))
+* **release:** the eBPF crate's own Cargo.lock follows the capture-common version ([#19](https://github.com/inorbithr/dataplane/issues/19)) ([1a93b6b](https://github.com/inorbithr/dataplane/commit/1a93b6b534c57f67d66de1a3956a10640c18f94b))
+
 ## [0.1.0-alpha.5](https://github.com/inorbithr/dataplane/compare/v0.1.0-alpha.4...v0.1.0-alpha.5) (2026-10-06)
 
 

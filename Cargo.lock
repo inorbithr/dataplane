@@ -1097,7 +1097,7 @@ dependencies = [
 
 [[package]]
 name = "iohr-agent"
-version = "0.1.0-alpha.5"
+version = "0.1.0-alpha.6"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -1136,7 +1136,7 @@ dependencies = [
 
 [[package]]
 name = "iohr-capture"
-version = "0.1.0-alpha.5"
+version = "0.1.0-alpha.6"
 dependencies = [
  "aya",
  "aya-build",
@@ -1154,7 +1154,7 @@ dependencies = [
 
 [[package]]
 name = "iohr-capture-common"
-version = "0.1.0-alpha.5"
+version = "0.1.0-alpha.6"
 dependencies = [
  "aya",
 ]
