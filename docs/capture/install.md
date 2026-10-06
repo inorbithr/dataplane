@@ -54,7 +54,8 @@ These are guarantees of this version, each backed by code and a test:
   `CAP_NET_ADMIN` to remove its filters when it stops, and before 6.5 also `CAP_BPF` to
   read its own maps; that process only copies bytes. All parsing, the tables, `sock_diag`
   and both sockets run in a second process (`iohr-capture worker`) with an empty
-  capability set on every kernel (`privileges` in the answer shows both).
+  capability set on every kernel, and never as root: run by hand with `sudo`, it runs as
+  `iohr-capture` (or `nobody`) (`privileges` in the answer shows both processes).
 - **It never decrypts anything.** TLS is seen up to the plaintext ClientHello (server name,
   offered protocols); HTTP/2 inside TLS is counted as TLS.
 - **It is never `--privileged`** in a container and never runs as part of the agent.
@@ -137,7 +138,9 @@ sudo systemctl enable --now iohr-capture
 
 The package creates the system user `iohr-capture` and the group `iohr-capture-read`, adds
 the `iohr-agent` user to that group if the agent is installed (the agent's package does
-the same when it comes second), and installs the binary, the settings file
+the same when it comes second; a failure to create a user or group fails the
+installation), tells you to restart a running agent so it sees the group, and installs
+the binary, the settings file
 `/etc/iohr-capture/capture.env` (every setting is listed there, commented, with its
 default) and the unit ([`iohr-capture.service`](../../packaging/systemd/iohr-capture.service)).
 It never enables or starts the service by itself. `tshark` is only suggested, never
@@ -317,8 +320,18 @@ the journal under the unit):
 Without `--for` it runs until `Ctrl-C` or `SIGTERM`. `--attach tcx|netlink` forces the
 attach mode (TCX needs 6.6). Every setting has a flag and an `IOHR_CAPTURE_*` variable
 (`iohr-capture run --help`): `--layers`, `--samples-per-sec`, `--burst`,
-`--ring-buffer-kib` (4 to 262144), `--first-packets`, `--max-flows` (at most 262144),
+`--ring-buffer-kib` (4 to 32768), `--first-packets`, `--max-flows` (at most 65536),
 `--poll-ms`, the socket paths, `--socket-group`, `--agent-user`.
+
+Run by hand as root, `run` keeps root only for the privileged process: the parser runs as
+`iohr-capture` (or `nobody`), and `/run/iohr-capture` is made that user's, in the read
+group. A later start of the unit takes the directory back (`RuntimeDirectory=`).
+
+**Memory.** Both processes share the unit's `MemoryMax=256M`. The ring buffer (at most
+32 MiB) and the flow table (about 2 KiB per flow while its protocol is undecided, at most
+65536 flows, so about 140 MiB in the worst case) fit under it with room for the rest; the
+defaults (4 MiB, 16384 flows) use a few tens of MiB. Raising `MemoryMax` in a drop-in is
+the way to go beyond.
 
 **Counts are socket buffers, not wire packets** (`packet_unit: "skb"`). With GRO
 (receive) or TSO/GSO (send) one buffer can carry several packets as they were on the wire,
@@ -348,6 +361,9 @@ Ethernet header on, without the frame check sequence. The interface's own counte
 | the agent's admin page: Traffic "not answering" | as above, for the agent user | the agent's user needs `iohr-capture-read` (the packages set it); restart the agent after adding it |
 | `journalctl -u iohr-capture`: "the parser process exited" | the parser crashed or was killed (for example by `MemoryMax`) | the unit restarts it; report it with the log lines before |
 | the service is killed for memory | `MemoryMax=256M` with a large ring or flow table | lower `IOHR_CAPTURE_RING_BUFFER_KIB` / `IOHR_CAPTURE_MAX_FLOWS`, or raise `MemoryMax` in a drop-in |
+| log: "the agent's user does not exist" or "is root" | `IOHR_CAPTURE_AGENT_USER` names no user, or root | the guard that gives the agent counts only is off: set it to the agent's real user |
+| log: "the socket directory keeps its mode" | a drop-in changed `RuntimeDirectoryMode=` | capture still starts; set it back to 2750 so only the read group reaches the socket |
+| the package says "restart the agent" | the agent's user just joined `iohr-capture-read` | `sudo systemctl restart iohr-agent` (a running process does not see a new group) |
 | the agent's admin page: Traffic "stale" | the companion's numbers are older than `max_snapshot_age_secs` | the companion is stuck or overloaded: `journalctl -u iohr-capture` |
 | `drops.rate_limited` grows | more new flows than the token bucket allows | expected under load (counted, not queued); raise `IOHR_CAPTURE_SAMPLES_PER_SEC` if the CPU allows |
 | `drops.ring_buffer_full` grows | user space cannot keep up | raise `IOHR_CAPTURE_RING_BUFFER_KIB`, or lower the sample rate |

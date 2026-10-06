@@ -67,8 +67,8 @@ always, TCX from 6.6) it:
 5. asks the aggregates socket (`stats --tables --json`), checks its access rules (a group
    member may read, another user with the group only as a supplementary group is refused
    by `SO_PEERCRED`, the agent's user gets counts but never the tables), the socket modes,
-   the control socket and the parser process's capabilities (`CapEff` and `CapPrm` zero),
-   then stops capture and asserts.
+   the control socket and the parser process's capabilities (`CapEff` and `CapPrm` zero)
+   and user (not root, though `run` was started as root), then stops capture and asserts.
 
 What is asserted: capture's ingress and egress packet counts equal the interface's own rx
 and tx packet counters over the same window, exactly. Both count socket buffers, and with
@@ -96,7 +96,10 @@ systemd running as PID 1 of a new PID namespace inside the VM (the guest's `/etc
 there), on `lo`. It checks the unit starts without failures or restarts under its
 sandbox, the runtime directory is 2750 `iohr-capture-read`, the socket 0660
 `iohr-capture-read`, a member reads the tables, the agent's user reads counts only,
-anyone else is kept out, and the parser has no capabilities. (On `lo` every packet passes
+anyone else is kept out, the parser has no capabilities and the privileged process kept
+exactly what the kernel needs. Then it stops the service the way systemd does (SIGTERM
+to the main process): the unit must end with "Deactivated successfully" (exit 0, its
+`ExecStopPost` cleanup ran under the sandbox, no restart) and leave no filter on `lo`. (On `lo` every packet passes
 egress and ingress, so 3 requests count 6.)
 
 Results: `dist/capture-e2e/<kernel>.json` and `.log`.

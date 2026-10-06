@@ -81,6 +81,16 @@ from network administration. So `iohr-capture run` splits in two:
   the flow table and top-K tables, reads `sock_diag`, `/proc` and the cgroup tree, and
   serves both sockets. The parsing engine can only be built with the proof value the drop
   returns. The VM test checks its `CapEff` and `CapPrm` are zero on every kernel.
+- the parser is never root. Under the unit it runs as `iohr-capture`. Run by hand as root
+  (`sudo iohr-capture run`), the privileged process starts it as `iohr-capture` (or
+  `nobody` when that user does not exist) with the read group and no supplementary groups,
+  before it drops its own capabilities, and makes the sockets' directory the parser's; the
+  parser refuses to run as root and refuses inherited files beyond standard input, output
+  and error. The VM test checks its uid is not 0.
+- the parser's blocking work (`sock_diag`, `/proc`, the cgroup walk) runs on a separate
+  thread and locks the engine only to apply the result, so reading the pipe never waits on
+  it; writes to the pipe time out after 3 s, so a stuck parser cannot keep the privileged
+  process from stopping within the unit's `TimeoutStopSec`.
 
 `counts` reports both: `privileges.parser_capabilities` (always empty) and
 `privileges.companion_kept`.
