@@ -397,6 +397,7 @@ pub(crate) struct Engine {
     closed_order: std::collections::VecDeque<Key>,
     // layer 7
     timing: timing::Table,
+    budget: timing::Budget,
     owner_tcp: HashMap<String, OwnerTcp>,
     // layer 3
     pub(crate) packets: PacketsInfo,
@@ -448,6 +449,7 @@ impl Engine {
             recently_closed: HashSet::new(),
             closed_order: std::collections::VecDeque::new(),
             timing: timing::Table::default(),
+            budget: timing::Budget::default(),
             owner_tcp: HashMap::new(),
             packets: PacketsInfo::default(),
         }
@@ -525,7 +527,7 @@ impl Engine {
             }
             if self.settings.layers.timing
                 && p.proto == IPPROTO_TCP
-                && timing_segment(flow, &p, ingress, &mut outcomes)
+                && timing_segment(flow, &p, ingress, &mut self.budget, &mut outcomes)
             {
                 self.timing.unsynced += 1;
             }
@@ -583,6 +585,7 @@ impl Engine {
         if let Some(t) = flow.timing.as_mut() {
             let mut outcomes = Vec::new();
             t.finish(&mut outcomes);
+            self.budget.release(t);
             self.record(key, &outcomes);
         }
         if flow.pending_tls
@@ -882,6 +885,15 @@ impl Engine {
         timing["keys"] = t.keys.len().into();
         timing["keys_dropped"] = t.keys_dropped.into();
         timing["untracked"] = t.untracked.into();
+        timing["budget"] = json!({
+            "pending": self.budget.pending,
+            "pending_max": timing::MAX_PENDING_TOTAL,
+            "kept_bytes": self.budget.kept,
+            "kept_bytes_max": timing::MAX_KEPT_TOTAL,
+            "refused": self.budget.refused,
+            "pending_peak": self.budget.peak.0,
+            "kept_bytes_peak": self.budget.peak.1,
+        });
         if let Some(m) = timing.as_object_mut() {
             m.remove("grpc_status");
         }
@@ -1135,6 +1147,7 @@ fn timing_segment(
     flow: &mut Flow,
     p: &packet::Packet<'_>,
     ingress: bool,
+    budget: &mut timing::Budget,
     out: &mut Vec<Outcome>,
 ) -> bool {
     let syn = p.tcp_flags & TCP_SYN != 0;
@@ -1151,6 +1164,7 @@ fn timing_segment(
     if !t.active() {
         return false;
     }
+    let room = budget.room();
     t.segment(
         &timing::Segment {
             ts_ns: p.ts_ns,
@@ -1160,9 +1174,17 @@ fn timing_segment(
             fin: p.tcp_flags & TCP_FIN != 0,
             payload: p.payload,
             payload_len: p.payload_len,
+            room,
         },
         out,
     );
+    budget.charge(t);
+    if !room {
+        budget.refused += out
+            .iter()
+            .filter(|o| matches!(o, Outcome::Abandoned { .. }))
+            .count() as u64;
+    }
     // An inactive tracker is never fed again, so this is true once per flow at most.
     t.unsynced && !t.active()
 }
@@ -1550,6 +1572,145 @@ mod tests {
         assert_eq!(t["tcp"]["retransmits_sampled"], 3);
         assert_eq!(t["tcp"]["rtt_ms"]["lt_10"], 1);
         assert_eq!(t["tables"]["tcp_ports"][0]["port"], 8080);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn big_engine(max_flows: usize) -> Engine {
+        Engine::new(
+            Settings {
+                interface: "veth0".into(),
+                layers: Layers::parse("headers,protocols,owners,tcp,timing").unwrap(),
+                max_flows,
+                idle: Duration::from_secs(60),
+                companion_kept: Vec::new(),
+                packets: false,
+            },
+            &Dropped::for_tests(),
+        )
+    }
+
+    fn client(i: u32) -> ([u8; 4], u16) {
+        let [_, a, b, c] = i.to_be_bytes();
+        ([10, a, b, c], 40_000 + u16::try_from(i % 20_000).unwrap())
+    }
+
+    #[test]
+    fn timing_memory_stays_in_budget_under_a_spoofed_flood() {
+        use crate::packet::tests::record_v4_at;
+        // HTTP/1: 40000 flows, each 16 pipelined requests never answered.
+        let mut e = big_engine(65_536);
+        let req = b"GET /flood/1 HTTP/1.1\r\n\r\n";
+        let rl = u32::try_from(req.len()).unwrap();
+        for i in 0..40_000u32 {
+            let c = client(i);
+            e.ingest(&record_v4_at(0, 6, c, SERVER, 0x02, 1000, 1, b""));
+            for k in 0..16 {
+                e.ingest(&record_v4_at(0, 6, c, SERVER, 0x18, 1001 + k * rl, 2, req));
+            }
+        }
+        let t = &e.counts()["timing"]["budget"];
+        assert!(
+            t["pending"].as_u64().unwrap() <= timing::MAX_PENDING_TOTAL as u64,
+            "{t}"
+        );
+        assert!(t["refused"].as_u64().unwrap() > 0, "{t}");
+        // HTTP/2: 6000 flows, each a header block that never ends (no END_HEADERS).
+        let mut e = big_engine(65_536);
+        let mut h2 = crate::proto::http2::PREFACE.to_vec();
+        let block = vec![0x40u8; 4000];
+        h2.extend_from_slice(&[0x00, 0x0f, 0xa0, 0x01, 0x00, 0, 0, 0, 1]);
+        h2.extend_from_slice(&block);
+        for i in 0..6_000u32 {
+            let c = client(i);
+            e.ingest(&record_v4_at(0, 6, c, SERVER, 0x02, 5000, 1, b""));
+            // Only the first 512 bytes are copied, but the kernel says the payload is longer:
+            // the frame's bytes are kept as they arrive, in later segments too.
+            let mut seq = 5001;
+            for chunk in h2.chunks(400) {
+                e.ingest(&record_v4_at(0, 6, c, SERVER, 0x18, seq, 2, chunk));
+                seq += u32::try_from(chunk.len()).unwrap();
+            }
+        }
+        let t = &e.counts()["timing"]["budget"];
+        assert!(
+            t["kept_bytes_peak"].as_u64().unwrap() <= (timing::MAX_KEPT_TOTAL + 2 * 4096) as u64,
+            "{t}"
+        );
+        assert!(e.flows.buffered_bytes() < 64 * 1024 * 1024);
+        // Flows leaving the table give their charge back.
+        let mut e = big_engine(8);
+        for i in 0..100u32 {
+            let c = client(i);
+            e.ingest(&record_v4_at(0, 6, c, SERVER, 0x02, 1000, 1, b""));
+            e.ingest(&record_v4_at(0, 6, c, SERVER, 0x18, 1001, 2, req));
+        }
+        assert!(e.counts()["timing"]["budget"]["pending"].as_u64().unwrap() <= 8);
+    }
+
+    #[test]
+    fn routes_and_owners_never_reach_counts_or_lookups() {
+        use crate::packet::tests::record_v4_at;
+        use crate::sockdiag::tests::message;
+        use std::os::unix::fs::MetadataExt as _;
+        let mut e = big_engine(64);
+        let dir = std::env::temp_dir().join(format!("iohr-capture-canary-{}", std::process::id()));
+        let cg = dir.join("cg/canary-owner-cg");
+        std::fs::create_dir_all(&cg).unwrap();
+        std::fs::write(cg.join("cgroup.procs"), "1\n").unwrap();
+        std::fs::create_dir_all(dir.join("proc/1")).unwrap();
+        std::fs::write(dir.join("proc/1/comm"), "canary-proc\n").unwrap();
+        let ino = std::fs::metadata(&cg).unwrap().ino();
+        let mut idx = CgroupIndex::new(&dir.join("cg"), &dir.join("proc"));
+        let buf = message(sockdiag::TCP_LISTEN, SERVER, ([0, 0, 0, 0], 0), ino, 0, 0);
+        let mut socks = Vec::new();
+        let _ = sockdiag::parse(&buf, 6, 1, &mut socks);
+        let resolved = owners::resolve(&socks, &mut idx);
+        e.sockets(Ok(socks), HashMap::new(), &resolved, &HashMap::new());
+        let req = b"GET /canary-route-word/7?canary-query=1 HTTP/1.1\r\nHost: canary-host.example\r\n\r\n";
+        let ok = b"HTTP/1.1 200 OK\r\n\r\n";
+        e.ingest(&record_v4_at(0, 6, CLIENT, SERVER, 0x02, 99, 1, b""));
+        e.ingest(&record_v4_at(1, 6, SERVER, CLIENT, 0x12, 499, 1, b""));
+        e.ingest(&record_v4_at(
+            0, 6, CLIENT, SERVER, 0x18, 100, 1_000_000, req,
+        ));
+        e.ingest(&record_v4_at(
+            1, 6, SERVER, CLIENT, 0x18, 500, 31_000_000, ok,
+        ));
+        let found = e.lookup("cgroup:/canary-owner-cg", "GET /canary-route-word/{id}");
+        assert_eq!(found["found"], true, "not vacuous: {found}");
+        assert_eq!(found["requests"], 1);
+        assert_eq!(found["latency_ms"]["counts"][6], 1, "30 ms");
+        let engine = std::sync::Mutex::new(e);
+        let v1 = crate::server::answer(
+            Ok(&json!({"version": 1, "request": "counts"})),
+            &engine,
+            true,
+        );
+        let v2 = crate::server::answer(
+            Ok(&json!({"version": 2, "request": "counts"})),
+            &engine,
+            true,
+        );
+        assert_eq!(v1["timing"]["requests"], 1);
+        for text in [v1.to_string(), v2.to_string(), found.to_string()] {
+            for canary in [
+                "canary-route-word",
+                "canary-owner-cg",
+                "canary-proc",
+                "canary-host",
+                "canary-query",
+                "10.0.0.2",
+            ] {
+                assert!(!text.contains(canary), "{canary} in {text}");
+            }
+        }
+        // A person's tables do carry them (the guard is about who asks).
+        let t = crate::server::answer(
+            Ok(&json!({"version": 2, "request": "tables"})),
+            &engine,
+            false,
+        );
+        assert!(t.to_string().contains("canary-route-word"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

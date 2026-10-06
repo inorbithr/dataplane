@@ -30,6 +30,46 @@ const MAX_STREAMS: usize = 64;
 const MAX_BLOCK: usize = 4096;
 /// Most keys (method, route, owner) aggregated.
 pub(crate) const MAX_KEYS: usize = 2048;
+/// Requests waiting for a response over every flow together (HTTP/1 queues and HTTP/2
+/// streams). Each costs a few hundred bytes at most (the route is at most 256).
+pub(crate) const MAX_PENDING_TOTAL: usize = 32_768;
+/// Header block bytes kept over every flow together.
+pub(crate) const MAX_KEPT_TOTAL: usize = 8 * 1024 * 1024;
+
+/// The memory every tracker together may hold, charged after each segment
+/// ([`Tracker::usage`]). With the budget spent, a new request is dropped (`Abandoned`,
+/// counted in `refused`) and no header block is kept: spoofed traffic on many flows can
+/// fill it, never the parser's memory.
+#[derive(Debug, Default)]
+pub(crate) struct Budget {
+    pub(crate) pending: usize,
+    pub(crate) kept: usize,
+    pub(crate) refused: u64,
+    /// The highest `pending` and `kept` seen.
+    pub(crate) peak: (usize, usize),
+}
+
+impl Budget {
+    /// Whether a segment may allocate.
+    pub(crate) fn room(&self) -> bool {
+        self.pending < MAX_PENDING_TOTAL && self.kept < MAX_KEPT_TOTAL
+    }
+
+    /// Moves a tracker's charge to what it holds now.
+    pub(crate) fn charge(&mut self, t: &mut Tracker) {
+        let (p, k) = t.usage();
+        self.pending = self.pending.saturating_sub(t.charged.0) + p;
+        self.kept = self.kept.saturating_sub(t.charged.1) + k;
+        t.charged = (p, k);
+        self.peak = (self.peak.0.max(self.pending), self.peak.1.max(self.kept));
+    }
+
+    /// A tracker is gone (after [`Tracker::finish`]).
+    pub(crate) fn release(&mut self, t: &Tracker) {
+        self.pending = self.pending.saturating_sub(t.charged.0);
+        self.kept = self.kept.saturating_sub(t.charged.1);
+    }
+}
 
 /// Latency histogram upper bounds, milliseconds; one more bucket above the last.
 pub(crate) const BOUNDS_MS: [f64; 14] = [
@@ -67,6 +107,7 @@ pub(crate) enum Outcome {
 
 /// One segment as the tracker needs it.
 #[derive(Debug, Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)] // the TCP flags and the budget, as read
 pub(crate) struct Segment<'a> {
     pub(crate) ts_ns: u64,
     pub(crate) from_client: bool,
@@ -77,6 +118,8 @@ pub(crate) struct Segment<'a> {
     pub(crate) payload: &'a [u8],
     /// The payload's full length.
     pub(crate) payload_len: usize,
+    /// Whether the global [`Budget`] allows new requests and kept bytes.
+    pub(crate) room: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +147,8 @@ pub(crate) struct Tracker {
     next: [Option<u32>; 2],
     /// Set once the flow lost sync (counted once).
     pub(crate) unsynced: bool,
+    /// What this tracker is charged in the [`Budget`]: (pending requests, kept bytes).
+    charged: (usize, usize),
 }
 
 impl Default for Tracker {
@@ -112,11 +157,38 @@ impl Default for Tracker {
             proto: Proto::Unknown,
             next: [None, None],
             unsynced: false,
+            charged: (0, 0),
         }
     }
 }
 
 impl Tracker {
+    /// What it holds: requests waiting, header block bytes kept.
+    pub(crate) fn usage(&self) -> (usize, usize) {
+        match &self.proto {
+            Proto::Http1(q) => (q.len(), 0),
+            Proto::Http2(h2) => {
+                let kept: usize = h2
+                    .sides
+                    .iter()
+                    .map(|sd| {
+                        let c = match &sd.cursor {
+                            Cursor::Payload { keep: Some(k), .. } => k.capacity(),
+                            _ => 0,
+                        };
+                        let b = match &sd.block {
+                            Some((_, _, Some(b), _)) => b.capacity(),
+                            _ => 0,
+                        };
+                        c + b
+                    })
+                    .sum();
+                (h2.streams.len(), kept)
+            }
+            Proto::Unknown | Proto::Off => (0, 0),
+        }
+    }
+
     /// Whether this flow is still being timed.
     pub(crate) fn active(&self) -> bool {
         !matches!(self.proto, Proto::Off)
@@ -263,6 +335,13 @@ fn h1_segment(q: &mut VecDeque<Pending>, s: &Segment<'_>, out: &mut Vec<Outcome>
             )),
             None => "unknown".to_owned(),
         };
+        if !s.room {
+            out.push(Outcome::Abandoned {
+                method: method.to_owned(),
+                route,
+            });
+            return H1::Go;
+        }
         if q.len() >= MAX_WAITING
             && let Some(old) = q.pop_front()
         {
@@ -354,6 +433,8 @@ struct Side {
 
 #[derive(Debug)]
 struct H2 {
+    /// The budget's verdict for the segment being read.
+    room: bool,
     sides: [Side; 2],
     streams: HashMap<u32, Stream>,
     lost: bool,
@@ -362,6 +443,7 @@ struct H2 {
 impl Default for H2 {
     fn default() -> Self {
         Self {
+            room: true,
             sides: [
                 Side {
                     cursor: Cursor::Preface(PREFACE.len()),
@@ -390,6 +472,7 @@ struct Block {
 
 impl H2 {
     fn feed(&mut self, s: &Segment<'_>, out: &mut Vec<Outcome>) {
+        self.room = s.room;
         let side = usize::from(!s.from_client);
         let mut blocks = Vec::new();
         let mut resets = Vec::new();
@@ -431,8 +514,10 @@ impl H2 {
                                 | (usize::from(h[1]) << 8)
                                 | usize::from(h[2]);
                             let stream = u32::from_be_bytes([h[5], h[6], h[7], h[8]]) & 0x7fff_ffff;
-                            let keep = matches!(h[3], FRAME_HEADERS | FRAME_CONTINUATION)
-                                .then(|| Vec::with_capacity(len.min(MAX_BLOCK)));
+                            // Allocated as bytes arrive, and only within the budget.
+                            let keep = (s.room
+                                && matches!(h[3], FRAME_HEADERS | FRAME_CONTINUATION))
+                            .then(Vec::new);
                             sd.cursor = Cursor::Payload {
                                 kind: h[3],
                                 flags: h[4],
@@ -442,7 +527,7 @@ impl H2 {
                                 ts_ns: s.ts_ns,
                             };
                             if len == 0 {
-                                finish_frame(sd, s.from_client, &mut blocks, &mut resets);
+                                finish_frame(sd, s.from_client, s.room, &mut blocks, &mut resets);
                             }
                         }
                     }
@@ -457,15 +542,21 @@ impl H2 {
                             *keep = None;
                         } else {
                             let take = (*remaining).min(data.len());
+                            if !s.room {
+                                // The budget is spent: this block is not kept.
+                                *keep = None;
+                            }
                             if let Some(k) = keep {
                                 let room = MAX_BLOCK.saturating_sub(k.len());
-                                k.extend_from_slice(data.get(..take.min(room)).unwrap_or_default());
+                                let part = data.get(..take.min(room)).unwrap_or_default();
+                                k.reserve_exact(part.len());
+                                k.extend_from_slice(part);
                             }
                             data = data.get(take..).unwrap_or_default();
                             *remaining -= take;
                         }
                         if *remaining == 0 {
-                            finish_frame(sd, s.from_client, &mut blocks, &mut resets);
+                            finish_frame(sd, s.from_client, s.room, &mut blocks, &mut resets);
                         }
                     }
                 }
@@ -514,7 +605,7 @@ impl H2 {
                     }
                 }
             }
-            if self.streams.len() >= MAX_STREAMS {
+            if self.streams.len() >= MAX_STREAMS || !self.room {
                 out.push(Outcome::Abandoned { method, route });
                 return;
             }
@@ -570,7 +661,13 @@ impl H2 {
 
 /// A frame's payload is complete: emit a header block or a reset, then read the next
 /// header.
-fn finish_frame(sd: &mut Side, from_client: bool, blocks: &mut Vec<Block>, resets: &mut Vec<u32>) {
+fn finish_frame(
+    sd: &mut Side,
+    from_client: bool,
+    room: bool,
+    blocks: &mut Vec<Block>,
+    resets: &mut Vec<u32>,
+) {
     let cursor = std::mem::replace(&mut sd.cursor, Cursor::Header { have: [0; 9], n: 0 });
     let Cursor::Payload {
         kind,
@@ -605,9 +702,11 @@ fn finish_frame(sd: &mut Side, from_client: bool, blocks: &mut Vec<Block>, reset
                     return;
                 }
                 match (&mut bytes, keep) {
-                    (Some(b), Some(k)) => {
-                        let room = MAX_BLOCK.saturating_sub(b.len());
-                        b.extend_from_slice(k.get(..room.min(k.len())).unwrap_or_default());
+                    (Some(b), Some(k)) if room => {
+                        let left = MAX_BLOCK.saturating_sub(b.len());
+                        let part = k.get(..left.min(k.len())).unwrap_or_default();
+                        b.reserve_exact(part.len());
+                        b.extend_from_slice(part);
                     }
                     _ => bytes = None,
                 }
@@ -780,6 +879,7 @@ mod tests {
             fin: false,
             payload,
             payload_len: payload.len(),
+            room: true,
         }
     }
 
