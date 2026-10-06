@@ -1,9 +1,12 @@
 #!/bin/sh
 set -e
 if [ "$1" = "configure" ]; then
-  # The agent's group owns the aggregates socket; iohr-agent's package uses it if present.
-  if ! getent group iohr-agent >/dev/null; then
-    addgroup --system iohr-agent >/dev/null
+  # Who may read the aggregates socket: the agent's user, and people added on purpose.
+  if ! getent group iohr-capture-read >/dev/null; then
+    addgroup --system iohr-capture-read >/dev/null
+  fi
+  if getent passwd iohr-agent >/dev/null; then
+    adduser iohr-agent iohr-capture-read >/dev/null
   fi
   if ! getent passwd iohr-capture >/dev/null; then
     adduser --system --group --no-create-home --home /nonexistent iohr-capture >/dev/null
