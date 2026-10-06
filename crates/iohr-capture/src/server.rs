@@ -1,8 +1,8 @@
 //! The two local sockets (`docs/capture/design-phase1.md`):
 //!
-//! - **aggregates** (0660, group `iohr-agent`): one JSON request line, one JSON answer
-//!   (`counts`, or `tables` for a person), bounded in size and time; peers are checked
-//!   with `SO_PEERCRED`.
+//! - **aggregates** (0660, group `iohr-capture-read`): one JSON request line, one JSON
+//!   answer (`counts`, or `tables` for a person, never for the agent's user), bounded in
+//!   size, time and concurrency; peers are checked with `SO_PEERCRED`.
 //! - **control** (0600, root only): reserved for pcap on request (phase 2); every request
 //!   is answered `not_available`.
 //!
@@ -76,6 +76,12 @@ impl Access {
         a
     }
 
+    /// Whether `uid` is the agent's user (which may read counts only). Root is never
+    /// treated as the agent: a person with sudo may read the tables.
+    pub(crate) fn is_agent(&self, uid: u32) -> bool {
+        uid != 0 && Some(uid) == self.agent_uid
+    }
+
     /// Whether a peer with this uid and primary gid may read the aggregates.
     pub(crate) fn allows(&self, uid: u32, gid: u32) -> bool {
         uid == 0
@@ -102,19 +108,40 @@ impl Drop for Bound {
     }
 }
 
-/// Binds a socket at `path` with `mode`, replacing a stale socket file; never replaces
-/// anything that is not a socket.
-fn bind_one(
-    path: &Path,
-    mode: u32,
-    gid: Option<u32>,
-) -> io::Result<std::os::unix::net::UnixListener> {
-    if let Some(dir) = path.parent()
-        && !dir.exists()
-    {
+/// Prepares the directory the sockets live in, before the capability drop: created if
+/// missing; with a read group, owned by that group and set-group-id (02750), so every
+/// socket made in it later belongs to the group without any `chown` (the unit's system
+/// call filter forbids `chown`; under the unit the directory already has the group, so
+/// nothing is changed but the mode).
+pub(crate) fn prepare_dir(dir: &Path, gid: Option<u32>) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    if !dir.exists() {
         fs::create_dir_all(dir)?;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o755))?;
     }
+    let mode = match gid {
+        Some(g) => {
+            if fs::metadata(dir)?.gid() != g
+                && let Err(e) = std::os::unix::fs::chown(dir, None, Some(g))
+            {
+                // Under the unit the directory has the unit's Group= already; a different
+                // --socket-group there cannot be applied (no chown) and is reported.
+                tracing::warn!(error = %e, dir = %dir.display(), "the socket directory keeps its group");
+            }
+            0o2750
+        }
+        None => 0o755,
+    };
+    // Only when it differs: the unit creates the directory 2750 itself and forbids
+    // setting the set-group-id bit (RestrictSUIDSGID).
+    if fs::metadata(dir)?.mode() & 0o7777 != mode {
+        fs::set_permissions(dir, fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
+}
+
+/// Binds a socket at `path` with `mode`, replacing a stale socket file; never replaces
+/// anything that is not a socket, nor a socket another process still serves.
+fn bind_one(path: &Path, mode: u32) -> io::Result<std::os::unix::net::UnixListener> {
     match fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_socket() => {
             if std::os::unix::net::UnixStream::connect(path).is_ok() {
@@ -137,25 +164,42 @@ fn bind_one(
         Err(_) => {}
     }
     let l = std::os::unix::net::UnixListener::bind(path)?;
-    if let Some(g) = gid {
-        std::os::unix::fs::chown(path, None, Some(g))?;
-    }
     fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     l.set_nonblocking(true)?;
     Ok(l)
 }
 
-/// Binds both sockets: aggregates 0660 with the group (0600 when the group is unknown),
-/// control 0600.
-pub(crate) fn bind(aggregates: &Path, control: &Path, group_gid: Option<u32>) -> io::Result<Bound> {
-    let mode = if group_gid.is_some() { 0o660 } else { 0o600 };
-    let a = bind_one(aggregates, mode, group_gid)?;
-    let c = bind_one(control, 0o600, None)?;
+/// Binds both sockets: aggregates 0660 (its group is the directory's, see
+/// [`prepare_dir`]), control 0600.
+pub(crate) fn bind(aggregates: &Path, control: &Path) -> io::Result<Bound> {
+    let a = bind_one(aggregates, 0o660)?;
+    let c = bind_one(control, 0o600)?;
     Ok(Bound {
         aggregates: a,
         control: c,
         paths: [aggregates.to_owned(), control.to_owned()],
     })
+}
+
+/// Connections served at once; more are closed right away.
+const MAX_CONNECTIONS: usize = 16;
+/// How long writing an answer may take.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Accepts with a back-off on errors (for example `EMFILE`), so a failing accept never
+/// spins.
+async fn accept(l: &UnixListener) -> UnixStream {
+    let mut delay = Duration::from_millis(50);
+    loop {
+        match l.accept().await {
+            Ok((s, _)) => return s,
+            Err(e) => {
+                tracing::warn!(error = %e, "accept failed; backing off");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(2));
+            }
+        }
+    }
 }
 
 /// Serves the aggregates socket until the task is dropped.
@@ -164,13 +208,18 @@ pub(crate) async fn serve_aggregates(
     engine: Arc<Mutex<Engine>>,
     access: Arc<Access>,
 ) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
-        let Ok((sock, _)) = l.accept().await else {
+        let sock = accept(&l).await;
+        let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else {
+            tracing::warn!("aggregates socket: too many connections at once; one closed");
+            drop(sock);
             continue;
         };
         let engine = Arc::clone(&engine);
         let access = Arc::clone(&access);
         tokio::spawn(async move {
+            let _permit = permit;
             let _ = aggregates_conn(sock, &engine, &access).await;
         });
     }
@@ -187,16 +236,26 @@ async fn aggregates_conn(
     let request = read_request(&mut sock).await;
     if !access.allows(cred.uid(), cred.gid()) {
         tracing::warn!(uid = cred.uid(), pid = ?cred.pid(), "aggregates socket: peer refused");
-        let a = json!({"version": WIRE_VERSION, "error": "forbidden", "message": "this user may not read capture aggregates (join the iohr-agent group)"});
+        let a = json!({"version": WIRE_VERSION, "error": "forbidden", "message": "this user may not read capture aggregates (join the iohr-capture-read group)"});
         return write(&mut sock, &a).await;
     }
-    let answer = answer(request.as_ref(), engine);
-    tracing::debug!(uid = cred.uid(), request = ?request.as_ref().ok().and_then(|v| v["request"].as_str()), ok = answer.get("error").is_none(), "aggregates socket");
+    let answer = answer(request.as_ref(), engine, access.is_agent(cred.uid()));
+    tracing::debug!(
+        uid = cred.uid(),
+        request = ?request.as_ref().ok().and_then(|v| v["request"].as_str()),
+        error = answer.get("error").and_then(serde_json::Value::as_str).unwrap_or("none"),
+        "aggregates socket"
+    );
     write(&mut sock, &answer).await
 }
 
-/// The answer to one request (pure, for tests).
-pub(crate) fn answer(request: Result<&Value, &String>, engine: &Mutex<Engine>) -> Value {
+/// The answer to one request (pure, for tests). The agent may only ever have `counts`:
+/// the companion enforces that names, paths and addresses never reach it (DAT-10).
+pub(crate) fn answer(
+    request: Result<&Value, &String>,
+    engine: &Mutex<Engine>,
+    peer_is_agent: bool,
+) -> Value {
     let req = match request {
         Ok(v) => v,
         Err(e) => return json!({"version": WIRE_VERSION, "error": "bad_request", "message": e}),
@@ -204,16 +263,22 @@ pub(crate) fn answer(request: Result<&Value, &String>, engine: &Mutex<Engine>) -
     if req["version"].as_u64() != Some(u64::from(WIRE_VERSION)) {
         return json!({"version": WIRE_VERSION, "error": "unsupported_version", "message": "this companion speaks version 1"});
     }
-    let e = match engine.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
     match req["request"].as_str() {
-        Some("counts") => e.counts(),
-        Some("tables") => e.tables(),
+        Some("counts") => lock(engine).counts(),
+        Some("tables") if peer_is_agent => {
+            json!({"version": WIRE_VERSION, "error": "forbidden", "message": "the agent may read counts only"})
+        }
+        Some("tables") => lock(engine).tables(),
         _ => {
             json!({"version": WIRE_VERSION, "error": "unknown_request", "message": "ask for \"counts\" or \"tables\""})
         }
+    }
+}
+
+fn lock(e: &Mutex<Engine>) -> std::sync::MutexGuard<'_, Engine> {
+    match e.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
     }
 }
 
@@ -249,25 +314,41 @@ async fn write(sock: &mut UnixStream, v: &Value) -> io::Result<()> {
             .unwrap_or_default();
     }
     body.push(b'\n');
-    sock.write_all(&body).await?;
-    sock.shutdown().await
+    tokio::time::timeout(WRITE_TIMEOUT, async {
+        sock.write_all(&body).await?;
+        sock.shutdown().await
+    })
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "the client did not read the answer",
+        )
+    })?
 }
 
 /// Serves the control socket: root only, and nothing is available in phase 1.
 pub(crate) async fn serve_control(l: UnixListener) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
-        let Ok((mut sock, _)) = l.accept().await else {
+        let mut sock = accept(&l).await;
+        let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else {
             continue;
         };
         tokio::spawn(async move {
+            let _permit = permit;
             let uid = sock.peer_cred().map(|c| c.uid()).ok();
             let _ = read_request(&mut sock).await;
-            let a = if uid == Some(0) {
-                json!({"version": WIRE_VERSION, "error": "not_available", "message": "pcap on request arrives in a later version (phase 2)"})
+            let (code, message) = if uid == Some(0) {
+                (
+                    "not_available",
+                    "pcap on request arrives in a later version (phase 2)",
+                )
             } else {
-                json!({"version": WIRE_VERSION, "error": "forbidden", "message": "the control socket is for root only"})
+                ("forbidden", "the control socket is for root only")
             };
-            tracing::info!(uid = ?uid, "control socket: request answered not_available");
+            tracing::info!(uid = ?uid, answer = code, "control socket");
+            let a = json!({"version": WIRE_VERSION, "error": code, "message": message});
             let _ = write(&mut sock, &a).await;
         });
     }
@@ -303,6 +384,7 @@ mod tests {
                 layers: Layers::parse("headers,protocols").unwrap(),
                 max_flows: 16,
                 idle: Duration::from_secs(60),
+                companion_kept: Vec::new(),
             },
             &Dropped::for_tests(),
         )))
@@ -319,25 +401,33 @@ mod tests {
         assert!(a.allows(1000, 1000), "a member of the group");
         assert!(!a.allows(1001, 1001), "anyone else");
         assert!(a.allows(1001, 998), "primary group");
+        assert!(a.is_agent(998) && !a.is_agent(0) && !a.is_agent(1000));
     }
 
     #[test]
     fn answers() {
         let e = engine();
-        let ok = answer(Ok(&json!({"version": 1, "request": "counts"})), &e);
+        let ok = answer(Ok(&json!({"version": 1, "request": "counts"})), &e, true);
         assert_eq!(ok["version"], 1);
         assert!(ok.get("tables").is_none());
-        let t = answer(Ok(&json!({"version": 1, "request": "tables"})), &e);
+        let t = answer(Ok(&json!({"version": 1, "request": "tables"})), &e, false);
         assert!(t.get("tables").is_some());
         assert_eq!(
-            answer(Ok(&json!({"version": 2, "request": "counts"})), &e)["error"],
+            answer(Ok(&json!({"version": 2, "request": "counts"})), &e, false)["error"],
             "unsupported_version"
         );
         assert_eq!(
-            answer(Ok(&json!({"version": 1, "request": "pcap"})), &e)["error"],
+            answer(Ok(&json!({"version": 1, "request": "pcap"})), &e, false)["error"],
             "unknown_request"
         );
-        assert_eq!(answer(Err(&"x".to_owned()), &e)["error"], "bad_request");
+        assert_eq!(
+            answer(Err(&"x".to_owned()), &e, false)["error"],
+            "bad_request"
+        );
+        // The agent's user never gets the tables, whatever it asks.
+        let agent = answer(Ok(&json!({"version": 1, "request": "tables"})), &e, true);
+        assert_eq!(agent["error"], "forbidden");
+        assert!(agent.get("tables").is_none());
     }
 
     #[tokio::test]
@@ -345,7 +435,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("iohr-capture-server-{}", std::process::id()));
         let agg = dir.join("a.sock");
         let ctl = dir.join("c.sock");
-        let bound = bind(&agg, &ctl, None).unwrap();
+        prepare_dir(&dir, None).unwrap();
+        let bound = bind(&agg, &ctl).unwrap();
+        let mode = fs::metadata(&agg).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o660);
         let mode = fs::metadata(&ctl).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         let own = rustix::process::getuid().as_raw();

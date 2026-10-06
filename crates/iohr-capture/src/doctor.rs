@@ -80,7 +80,7 @@ impl Facts {
             selinux_enforce: read("sys/fs/selinux/enforce"),
             apparmor_enabled: read("sys/module/apparmor/parameters/enabled"),
             groups: read("etc/group"),
-            socket_group: "iohr-agent".into(),
+            socket_group: "iohr-capture-read".into(),
         }
     }
 }
@@ -429,15 +429,17 @@ fn check_socket_group(groups: Option<&str>, name: &str) -> Check {
         Check::new(
             "socket group",
             Status::Pass,
-            format!("{name} exists: the aggregates socket is 0660 {name}, readable by the agent"),
+            format!(
+                "{name} exists: the aggregates socket is 0660 {name}; the agent reads it as a member"
+            ),
         )
     } else {
         Check::new(
             "socket group",
             Status::Warn,
-            format!("group {name} not found: the aggregates socket will be 0600 and the agent cannot read it"),
+            format!("group {name} not found: the agent cannot read the aggregates socket"),
         )
-        .fix(format!("install iohr-agent (it creates the group), or `sudo groupadd --system {name}`"))
+        .fix(format!("install the iohr-capture package (it creates the group and adds iohr-agent), or `sudo groupadd --system {name} && sudo usermod -aG {name} iohr-agent`"))
     }
 }
 
@@ -480,8 +482,8 @@ mod tests {
             cgroup2: true,
             selinux_enforce: None,
             apparmor_enabled: None,
-            groups: Some("root:x:0:\niohr-agent:x:998:alice\n".into()),
-            socket_group: "iohr-agent".into(),
+            groups: Some("root:x:0:\niohr-capture-read:x:998:iohr-agent\n".into()),
+            socket_group: "iohr-capture-read".into(),
         }
     }
 
