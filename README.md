@@ -1,3 +1,20 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/logo-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset=".github/assets/logo-light.svg">
+    <img alt="InOrbit data plane logo: concentric rings around an amber dot" src=".github/assets/logo-light.svg" width="88" height="88">
+  </picture>
+</p>
+
+<h1 align="center">dataplane</h1>
+
+<p align="center">InOrbit data plane for reliability testing, observability, and experiment execution.</p>
+
+<p align="center">
+  <a href="https://github.com/inorbithr/dataplane/actions/workflows/ci.yml"><img alt="ci (builds the agent and capture images)" src="https://github.com/inorbithr/dataplane/actions/workflows/ci.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/inorbithr/dataplane/actions/workflows/release.yml"><img alt="release (publishes the images to ghcr.io)" src="https://github.com/inorbithr/dataplane/actions/workflows/release.yml/badge.svg"></a>
+</p>
+
 # InOrbit data plane: the agent
 
 `iohr-agent` runs checks for the InOrbit platform inside your own network, where the
