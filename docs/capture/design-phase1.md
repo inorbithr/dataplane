@@ -18,12 +18,18 @@ metric, label, span or log carries anything from capture. A test enforces it
 
 | Socket | Path (fixed) | Mode | Who may connect | Answers |
 |---|---|---|---|---|
-| aggregates | `/run/iohr-capture/aggregates.sock` | 0660, group `iohr-agent` | checked with `SO_PEERCRED`: root, the companion's own user, the `iohr-agent` user, members of the `iohr-agent` group | counts, and on request the bounded top-K tables |
+| aggregates | `/run/iohr-capture/aggregates.sock` (directory 2750, set-group-id) | 0660, group `iohr-capture-read` | checked with `SO_PEERCRED`: root, the companion's own user, the `iohr-agent` user, members of `iohr-capture-read` | counts; the bounded top-K tables too, but never to the agent's user |
 | control | `/run/iohr-capture/control.sock` | 0600 | root only (`SO_PEERCRED` uid 0) | phase 1: `not_available` for everything; phase 2: pcap on request |
 
 Both are Unix sockets, not network listeners (ADR 0001's "no new listener" holds). The
-companion creates them before it drops its capabilities (filesystem work only) and parses
-nothing from the kernel until after the drop.
+parser process (`iohr-capture worker`, started by `run`, with no capability at all)
+creates and serves them; the privileged process only prepares the directory. The sockets
+get their group from the directory (set-group-id) or the unit's `Group=`, never by
+`chown`. At most 16 connections are served at once; a client has 2 s to send its request
+and 5 s to read the answer.
+
+The companion enforces DAT-10 itself: a peer whose uid is the agent's user gets
+`forbidden` for `tables`, whatever it asks.
 
 ### Protocol (version 1)
 
@@ -40,6 +46,9 @@ One request per connection, one answer, then the companion closes it.
   ALPN, DNS names, gRPC methods, remote addresses, owners, per-port TCP health). Only
   `iohr agent capture status --tables` and `iohr-capture stats --tables` ask for it, for a
   person on the host.
+- Error codes: `forbidden`, `unsupported_version`, `bad_request`, `unknown_request`,
+  `too_large`, `not_available` (control socket). The agent repeats only these; any other
+  code becomes `other` on its side.
 - A request with another `version` gets `{"version": 1, "error": "unsupported_version"}`;
   the client decides. New fields may be added within version 1; clients ignore unknown
   fields. Removing or renaming a field is version 2.

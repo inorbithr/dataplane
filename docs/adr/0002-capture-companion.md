@@ -46,8 +46,8 @@ customer, including the ones that never turn capture on.
   `AF_UNIX` only, no IP traffic (`IPAddressDeny=any`), `LimitMEMLOCK=infinity` (maps are
   charged to `RLIMIT_MEMLOCK` before 5.11), and the usual protections
   (`ProtectSystem=strict`, `PrivateDevices`, `MemoryDenyWriteExecute`, and so on).
-  `systemd-analyze security` rates it 1.4 with phase 1's runtime directory and
-  supplementary group (the agent's unit: 1.4); what it flags is what the companion exists
+  `systemd-analyze security` rates it 1.3 with phase 1's runtime directory,
+  `Group=` and `MemoryMax=` (the agent's unit: 1.4); what it flags is what the companion exists
   for: BPF, network administration, netlink.
 
 ### Why the agent stays unprivileged
@@ -59,13 +59,31 @@ reviewed on its own: it opens no network connection at all.
 
 ### Two local sockets (built in phase 1)
 
-- **Aggregates** for the agent: a Unix socket, mode 0660, group `iohr-agent`. The
+- **Aggregates** for the agent: a Unix socket, mode 0660, group `iohr-capture-read`. The
   companion checks the peer with `SO_PEERCRED` (root, itself, the `iohr-agent` user and
   that group's members) and answers with counts, or for a person the bounded top-K tables
-  too. It is not a network listener, so ADR 0001's "no new listener" holds. The protocol:
+  too; the agent's user never gets the tables. It is not a network listener, so ADR 0001's "no new listener" holds. The protocol:
   [design-phase1.md](../capture/design-phase1.md).
-- Both are bound before the drop (filesystem work); nothing from the kernel is parsed
-  before it: the parsing engine can only be built with the proof value the drop returns.
+- The group comes from the unit's `Group=iohr-capture-read` and the set-group-id runtime
+  directory, never from `chown` (the unit's system call filter forbids it).
+
+### Privilege separation (phase 1)
+
+Before Linux 6.6 the companion keeps `CAP_NET_ADMIN` after attaching, and before 6.5
+also `CAP_BPF`. Parsing untrusted packet bytes with those would put a parser bug one step
+from network administration. So `iohr-capture run` splits in two:
+
+- the **privileged process** loads, attaches, drops to what the kernel requires, reads the
+  maps and the ring buffer, and copies the records and map readings as framed bytes into a
+  pipe. It never looks inside a record;
+- the **parser process** (`iohr-capture worker`, started by `run` with the pipe as its
+  standard input) sets its capabilities to empty before anything else, then parses, keeps
+  the flow table and top-K tables, reads `sock_diag`, `/proc` and the cgroup tree, and
+  serves both sockets. The parsing engine can only be built with the proof value the drop
+  returns. The VM test checks its `CapEff` and `CapPrm` are zero on every kernel.
+
+`counts` reports both: `privileges.parser_capabilities` (always empty) and
+`privileges.companion_kept`.
 - **Control**, root only (0600): pcap on request. No platform job can ever start a pcap;
   a person on the host can.
 

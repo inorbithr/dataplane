@@ -34,21 +34,27 @@ These are guarantees of this version, each backed by code and a test:
   path templates (ids replaced, queries dropped), TLS server names, DNS names, gRPC
   methods, remote addresses and owners exist only as fixed-size top-K tables (64 rows each,
   128 bytes per key) in the companion's memory. Only a person on the host sees them
-  (`--tables`). They are never in a result frame, the hello, an admin page value, a log
-  line or an OTLP export or label: the agent only ever asks for numbers, and parses the
+  (`--tables`, members of `iohr-capture-read`). They are never in a result frame, the
+  hello, an admin page value, a log line or an OTLP export or label: the companion refuses
+  the tables to the agent's user, the agent only ever asks for numbers and parses the
   answer into numeric fields, so nothing else reaches its memory.
 - **Evidence (control DAT-10, "captured traffic stays on the host"):** the test
   `dat10_captured_traffic_stays_on_the_host` in
   [`crates/iohr-agent/tests/capture_privacy.rs`](../../crates/iohr-agent/tests/capture_privacy.rs)
   runs the agent against a companion that deliberately puts names, paths, SNI, DNS names,
-  addresses and pod ids into every field it answers, with OTLP export on, and fails if any
-  of them appears in a frame sent to the platform, the admin page, `status.json` or any
-  OTLP export. It runs in every `mise run ci`.
-- **It does not keep its privileges.** Right after attaching it gives up its capabilities
-  and checks that they are gone; it parses nothing from the kernel before that (the
-  parsing code can only be built with the proof the drop returns). On kernels before 6.6
-  it keeps `CAP_NET_ADMIN` to remove its filters when it stops, and before 6.5 also
-  `CAP_BPF` to read its own counters (the run report lists what was kept).
+  addresses and pod ids into every field it answers (and into its error code), with OTLP
+  export on, and fails if any of them, or the counts themselves, appears in a frame sent
+  to the platform or an OTLP export, or any name appears on the admin page or in
+  `status.json`. The companion's refusal of tables to the agent's user is tested in
+  `crates/iohr-capture/src/server.rs` and in the VM test. Both run in every `mise run ci`
+  and `mise run capture:e2e`. Not covered: the agent's local stderr (the journal), which
+  stays on the host and carries the same fixed strings as `status.json`.
+- **Nothing is parsed with a capability.** Right after attaching the companion gives up
+  its capabilities and checks that they are gone. On kernels before 6.6 it keeps
+  `CAP_NET_ADMIN` to remove its filters when it stops, and before 6.5 also `CAP_BPF` to
+  read its own maps; that process only copies bytes. All parsing, the tables, `sock_diag`
+  and both sockets run in a second process (`iohr-capture worker`) with an empty
+  capability set on every kernel (`privileges` in the answer shows both).
 - **It never decrypts anything.** TLS is seen up to the plaintext ClientHello (server name,
   offered protocols); HTTP/2 inside TLS is counted as TLS.
 - **It is never `--privileged`** in a container and never runs as part of the agent.
@@ -76,7 +82,7 @@ reports what the process uses.
 | `CAP_BPF`, `CAP_PERFMON`, `CAP_NET_ADMIN` at start, or root | load the programs, attach them to the interface | the unit or `--cap-add` grants them |
 | x86_64 or arm64 | the release builds these | `uname -m` |
 | Linux 5.9+ and cgroup v2 (recommended) | owners by unit, container and pod (layer 4) | `iohr-capture doctor` (`owners`) |
-| the group `iohr-agent` | owns the aggregates socket so the agent can read it | `getent group iohr-agent` |
+| the group `iohr-capture-read` | owns the aggregates socket; the agent's user and people who may read the tables are members | `getent group iohr-capture-read` |
 
 Linux 6.6 or newer is better: the programs attach as TCX links, which the kernel removes
 by itself when the process ends. Older kernels use netlink filters, which iohr-capture
@@ -112,7 +118,7 @@ PASS  unprivileged_bpf      kernel.unprivileged_bpf_disabled=2 (fine: capture is
 PASS  cgroup v2             unified hierarchy at /sys/fs/cgroup
 PASS  lsm                   no SELinux enforcement, no AppArmor
 PASS  owners                sockets carry their cgroup id: owners named by systemd unit, container or pod (layer 4)
-PASS  socket group          iohr-agent exists: the aggregates socket is 0660 iohr-agent, readable by the agent
+PASS  socket group          iohr-capture-read exists: the aggregates socket is 0660 iohr-capture-read; the agent reads it as a member
 capture can run on this host
 ```
 
@@ -129,18 +135,21 @@ sudo sed -i 's/^IOHR_CAPTURE_INTERFACE=.*/IOHR_CAPTURE_INTERFACE=eth0/' /etc/ioh
 sudo systemctl enable --now iohr-capture
 ```
 
-The package creates the system user `iohr-capture` and, if missing, the group
-`iohr-agent` (the agent's package uses it), and installs the binary, the settings file
+The package creates the system user `iohr-capture` and the group `iohr-capture-read`, adds
+the `iohr-agent` user to that group if the agent is installed (the agent's package does
+the same when it comes second), and installs the binary, the settings file
 `/etc/iohr-capture/capture.env` (every setting is listed there, commented, with its
 default) and the unit ([`iohr-capture.service`](../../packaging/systemd/iohr-capture.service)).
 It never enables or starts the service by itself. `tshark` is only suggested, never
 required.
 
-The unit runs as `iohr-capture` (with the supplementary group `iohr-agent`, to hand the
-aggregates socket to that group) with exactly `CAP_BPF`, `CAP_PERFMON` and
-`CAP_NET_ADMIN`, `LimitMEMLOCK=infinity`, no IP access, a read-only system, other users'
-processes hidden and a system call filter (`systemd-analyze security iohr-capture` rates
-it 1.4, "OK").
+The unit runs as user `iohr-capture`, group `iohr-capture-read` (so its sockets belong
+to that group without any `chown`), in the set-group-id runtime directory
+`/run/iohr-capture` (2750), with exactly `CAP_BPF`, `CAP_PERFMON` and `CAP_NET_ADMIN`,
+`LimitMEMLOCK=infinity`, `MemoryMax=256M` for both processes, no IP access, a read-only
+system, other users' processes hidden and a system call filter
+(`systemd-analyze security iohr-capture` rates it 1.3, "OK"). The VM test starts this
+unit under a real systemd on every kernel in the matrix.
 
 | Task | Command |
 |---|---|
@@ -162,11 +171,13 @@ lists TCX programs; nothing of ours remains once the process is gone.
 
 | Socket | Mode | Who may use it | What it answers |
 |---|---|---|---|
-| `/run/iohr-capture/aggregates.sock` | 0660, group `iohr-agent` | checked per connection with `SO_PEERCRED`: root, `iohr-capture`, the `iohr-agent` user, members of the `iohr-agent` group; anyone else gets `forbidden` | `counts` (numbers only; what the agent asks) and `tables` (plus the top-K tables; for a person) |
+| `/run/iohr-capture/aggregates.sock` | 0660, group `iohr-capture-read` (directory 2750) | checked per connection with `SO_PEERCRED`: root, `iohr-capture`, the `iohr-agent` user, members of `iohr-capture-read`; anyone else gets `forbidden` | `counts` (numbers only; all the agent gets) and `tables` (plus the top-K tables; for a person, never for the agent's user) |
 | `/run/iohr-capture/control.sock` | 0600 | root only | phase 1: `not_available` (pcap on request is phase 2; no platform job can ever start one) |
 
-To read the aggregates as yourself, join the group: `sudo usermod -aG iohr-agent "$USER"`,
-then log in again. The protocol (one JSON line in, one JSON document out, versioned,
+To read the tables as yourself, join the read group: `sudo usermod -aG iohr-capture-read
+"$USER"`, then log in again. It is a group of its own on purpose: it grants the capture
+tables and nothing else (the `iohr-agent` group can read the agent's configuration). The
+socket serves 16 connections at once; a client has 2 s to ask and 5 s to read. The protocol (one JSON line in, one JSON document out, versioned,
 bounded to 1 MiB) is in [design-phase1.md](design-phase1.md).
 
 ### Turn it on in the agent
@@ -189,8 +200,9 @@ Then `sudo systemctl restart iohr-agent`. **These keys need an agent newer than
 upgrade the agent first, then the policy. Changing the policy changes its hash, which the
 console shows next to the agent.
 
-The agent user must be able to reach the socket: the package's `iohr-agent` user is in the
-`iohr-agent` group already. At every session start the agent asks the socket for counts
+The agent's user must be in `iohr-capture-read` (the packages arrange it; by hand:
+`sudo usermod -aG iohr-capture-read iohr-agent` and restart the agent). At every session
+start the agent asks the socket for counts
 (1 s timeout) and announces `capture:<layer>` for each layer that the policy allows, the
 companion runs, and whose numbers are at most `max_snapshot_age_secs` old. If the
 companion is not running, the agent announces nothing for capture and keeps working.
@@ -221,9 +233,12 @@ docker run --rm --network host \
   program drops them right after attaching.
 - `/sys/kernel/btf` read-only: BTF for the running kernel.
 - `/run/iohr-capture`: where the sockets are created, for the agent on the host. Inside the
-  container the `iohr-agent` group does not exist: pass `--socket-group` with a group that
-  does (and give the host's agent access to it), or read the counts with
-  `docker exec <id> iohr-capture stats`.
+  container the `iohr-capture-read` group does not exist: pass `--socket-group` with a
+  group (name in the image or numeric id) that the host's agent belongs to, or read the
+  counts with `docker exec <id> iohr-capture stats`.
+- On kernels before 6.6 the filters outlive a killed container: run
+  `iohr-capture cleanup --interface eth0` (same capabilities) after it, as the unit's
+  `ExecStopPost` does.
 - Owners need the host's cgroup tree, which a container sees only partly; on hosts that
   run containers, prefer the package.
 - `--ulimit memlock=-1` is needed only on kernels before 5.11.
@@ -302,8 +317,8 @@ the journal under the unit):
 Without `--for` it runs until `Ctrl-C` or `SIGTERM`. `--attach tcx|netlink` forces the
 attach mode (TCX needs 6.6). Every setting has a flag and an `IOHR_CAPTURE_*` variable
 (`iohr-capture run --help`): `--layers`, `--samples-per-sec`, `--burst`,
-`--ring-buffer-kib`, `--first-packets`, `--max-flows`, `--poll-ms`, the socket paths,
-`--socket-group`, `--agent-user`.
+`--ring-buffer-kib` (4 to 262144), `--first-packets`, `--max-flows` (at most 262144),
+`--poll-ms`, the socket paths, `--socket-group`, `--agent-user`.
 
 **Counts are socket buffers, not wire packets** (`packet_unit: "skb"`). With GRO
 (receive) or TSO/GSO (send) one buffer can carry several packets as they were on the wire,
@@ -322,14 +337,17 @@ Ethernet header on, without the frame check sequence. The interface's own counte
 | `doctor`: `FAIL interface` | wrong name, or a container without `--network host` | `ip -br link`; add `--network host` |
 | `doctor`: `WARN lockdown` (confidentiality) | Secure Boot lockdown | counting works; later layers that read kernel memory will not; integrity mode is enough |
 | `doctor`: `WARN owners` | Linux before 5.9 or no cgroup v2 | owners are named by user only; upgrade for units, containers and pods |
-| `doctor`: `WARN socket group` | no `iohr-agent` group | install iohr-agent, or `sudo groupadd --system iohr-agent`; until then the socket is 0600 and the agent cannot read it |
+| `doctor`: `WARN socket group` | no `iohr-capture-read` group | reinstall the package, or `sudo groupadd --system iohr-capture-read && sudo usermod -aG iohr-capture-read iohr-agent` |
 | `doctor`: `INFO lsm`, and loading fails with `EACCES` | SELinux or AppArmor policy | allow the `bpf` class (SELinux) or the three capabilities (AppArmor) for the service |
 | `run`: "TCX needs Linux 6.6" | `--attach tcx` on an older kernel | leave `--attach` at `auto` |
 | `run`: "is served by another process" | a second iohr-capture on the same socket | stop the other one (`systemctl status iohr-capture`) |
 | filters left after a crash (before 6.6) | the process was killed before it could detach | `sudo iohr-capture cleanup --interface eth0`; the next start removes them too |
-| `stats` / `capture status`: `forbidden` | your user is not in the `iohr-agent` group | `sudo usermod -aG iohr-agent "$USER"`, log in again; or use `sudo` |
+| `stats` / `capture status`: `forbidden` or permission denied | your user is not in `iohr-capture-read` | `sudo usermod -aG iohr-capture-read "$USER"`, log in again; or use `sudo` |
+| `capture status --tables` as the agent's user: `forbidden` | by design: the agent's user gets counts only | run it as yourself (a member of `iohr-capture-read`) |
 | `stats` / `capture status`: cannot reach the socket | the companion is not running, or a different socket path | `systemctl status iohr-capture`; `[capture] socket` in the policy must match |
-| the agent's admin page: Traffic "not answering" | as above, for the agent user | the agent's user needs the `iohr-agent` group (the package sets it) |
+| the agent's admin page: Traffic "not answering" | as above, for the agent user | the agent's user needs `iohr-capture-read` (the packages set it); restart the agent after adding it |
+| `journalctl -u iohr-capture`: "the parser process exited" | the parser crashed or was killed (for example by `MemoryMax`) | the unit restarts it; report it with the log lines before |
+| the service is killed for memory | `MemoryMax=256M` with a large ring or flow table | lower `IOHR_CAPTURE_RING_BUFFER_KIB` / `IOHR_CAPTURE_MAX_FLOWS`, or raise `MemoryMax` in a drop-in |
 | the agent's admin page: Traffic "stale" | the companion's numbers are older than `max_snapshot_age_secs` | the companion is stuck or overloaded: `journalctl -u iohr-capture` |
 | `drops.rate_limited` grows | more new flows than the token bucket allows | expected under load (counted, not queued); raise `IOHR_CAPTURE_SAMPLES_PER_SEC` if the CPU allows |
 | `drops.ring_buffer_full` grows | user space cannot keep up | raise `IOHR_CAPTURE_RING_BUFFER_KIB`, or lower the sample rate |

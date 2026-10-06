@@ -66,8 +66,9 @@ always, TCX from 6.6) it:
    listen queue;
 5. asks the aggregates socket (`stats --tables --json`), checks its access rules (a group
    member may read, another user with the group only as a supplementary group is refused
-   by `SO_PEERCRED`), the socket modes and the control socket, then stops capture and
-   asserts.
+   by `SO_PEERCRED`, the agent's user gets counts but never the tables), the socket modes,
+   the control socket and the parser process's capabilities (`CapEff` and `CapPrm` zero),
+   then stops capture and asserts.
 
 What is asserted: capture's ingress and egress packet counts equal the interface's own rx
 and tx packet counters over the same window, exactly. Both count socket buffers, and with
@@ -83,10 +84,20 @@ after attaching are the expected ones for the kernel and mode; nothing is left o
 interface and the sockets are gone afterwards; `cleanup` and the next start remove the
 filters of a `SIGKILL`ed netlink run; `doctor` exits 0 as root and 1 without capabilities.
 
-Then two floods of 40000 new UDP flows: with a 4 KiB ring buffer and a 512-flow table
-(ring buffer full and flows evicted must be counted), and with a 100/s copy rate (rate
-limited must be counted); in both the totals stay exact and the companion's memory stays
-under 64 MiB.
+Then three floods of 40000 new UDP flows: with a 4 KiB ring buffer and a 512-flow table
+(ring buffer full and flows evicted must be counted), with a 100/s copy rate (rate
+limited must be counted), and with a 16 MiB ring and no rate limit (the reader must keep
+up: every copied record read, and 5 DNS queries sent after the flood counted). In all the
+totals stay exact and both processes stay under 64 MiB.
+
+Last, the shipped unit: `packaging/systemd/iohr-capture.service` is started by a real
+systemd running as PID 1 of a new PID namespace inside the VM (the guest's `/etc` and
+`/usr` are throwaway overlays, so users, groups, the binary and the unit are installed
+there), on `lo`. It checks the unit starts without failures or restarts under its
+sandbox, the runtime directory is 2750 `iohr-capture-read`, the socket 0660
+`iohr-capture-read`, a member reads the tables, the agent's user reads counts only,
+anyone else is kept out, and the parser has no capabilities. (On `lo` every packet passes
+egress and ingress, so 3 requests count 6.)
 
 Results: `dist/capture-e2e/<kernel>.json` and `.log`.
 

@@ -9,7 +9,7 @@
 |---|---|
 | `crates/iohr-agent/src/` | the agent: `cli` (commands), `config` (agent.toml), `policy` (policy.toml, target checks, DNS pinning), `enroll`/`keys`/`token` (identity), `session`/`protocol` (WebSocket), `executor` (admission, ceilings), `checks/` (http, tcp, tls, grpc_health), `checks_file` (checks.toml: declared checks, `checks lint`), `secrets` (env/file/k8s/vault), `admin`/`state` (local page), `capture` (the companion's counts, `capture:*` in the hello), `telemetry` (OTLP), `extsock`/`platform` (iohr token socket, init) |
 | `crates/iohr-agent/tests/end_to_end.rs` | the agent against a fake control plane |
-| `crates/iohr-capture*/` | the capture companion: `iohr-capture` (user space: `capture` load/attach/drop, `engine` aggregates, `proto/` recognisers, `flows`, `topk`, `sockdiag`/`owners`/`procnet` for layers 4-5, `server` sockets), `-common` (shared types), `-ebpf` (eBPF programs, nightly, not a workspace member); ADR 0002, `docs/capture/` |
+| `crates/iohr-capture*/` | the capture companion: `iohr-capture` (user space: `capture` load/attach/drop, `engine` aggregates, `proto/` recognisers, `flows`, `topk`, `sockdiag`/`owners`/`procnet` for layers 4-5, `server` sockets, `worker` the unprivileged parser process), `-common` (shared types), `-ebpf` (eBPF programs, nightly, not a workspace member); ADR 0002, `docs/capture/` |
 | `charts/iohr-agent/` | Helm chart |
 | `packaging/` | systemd unit, default config, deb/rpm scripts |
 | `tools/` | release building blocks: static binaries, packages, extension artifact, VEX, local release |
