@@ -139,17 +139,23 @@ jobs:
           docker buildx build --platform linux/amd64,linux/arm64 --build-arg VERSION="$VERSION" \
             --provenance=false --sbom=false \
             --tag "$REGISTRY/iohr-agent:$VERSION" --push --metadata-file dist/image.json .
-          echo "image_digest=$(jq -r '."containerimage.digest"' dist/image.json)" >> "$GITHUB_OUTPUT"
+          image_digest="$(jq -r '."containerimage.digest"' dist/image.json)"
+          [[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "bad image digest: $image_digest"; exit 1; }
+          echo "image_digest=$image_digest" >> "$GITHUB_OUTPUT"
           # The capture companion's image (Dockerfile.capture: the static binary on distroless).
           docker buildx build --platform linux/amd64,linux/arm64 --build-arg VERSION="$VERSION" \
             --provenance=false --sbom=false -f Dockerfile.capture \
             --tag "$REGISTRY/iohr-capture:$VERSION" --push --metadata-file dist/image-capture.json .
-          echo "capture_digest=$(jq -r '."containerimage.digest"' dist/image-capture.json)" >> "$GITHUB_OUTPUT"
+          capture_digest="$(jq -r '."containerimage.digest"' dist/image-capture.json)"
+          [[ "$capture_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "bad capture image digest: $capture_digest"; exit 1; }
+          echo "capture_digest=$capture_digest" >> "$GITHUB_OUTPUT"
           helm package charts/iohr-agent --version "$VERSION" --app-version "$VERSION" -d dist/chart
           chart_digest="$(helm push "dist/chart/iohr-agent-$VERSION.tgz" "oci://$REGISTRY/charts" 2>&1 | sed -n 's/^Digest: //p')"
+          [[ "$chart_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "bad chart digest: $chart_digest"; exit 1; }
           echo "chart_digest=$chart_digest" >> "$GITHUB_OUTPUT"
           ext_digest="$(python3 tools/ext_artifact.py --version "$VERSION" --revision "$REVISION" --out dist/oci/ext-agent)"
           oras cp --from-oci-layout "dist/oci/ext-agent:$VERSION" "$REGISTRY/iohr-ext/agent:$VERSION"
+          [[ "$ext_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "bad extension digest: $ext_digest"; exit 1; }
           echo "ext_digest=$ext_digest" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
