@@ -108,8 +108,10 @@ answers only on loopback. Telemetry goes to your OpenTelemetry collector when
 
 `iohr-capture` is a separate, optional companion that counts the traffic on one interface
 with eBPF. It needs three kernel capabilities to start and drops them after attaching, so
-the agent above stays unprivileged; it never drops a packet and, in this version, stores
-and sends nothing. Requirements, `iohr-capture doctor`, the package, container and
+the agent above stays unprivileged; it never drops a packet and sends nothing anywhere.
+It times requests per route template, and, switched on, keeps whole packets in memory for
+pcap files that only root on the host can ask for (`iohr-capture pcap`, deleted after a
+retention); `iohr-capture dissect` runs the host's own `tshark` as the person who asks. Requirements, `iohr-capture doctor`, the package, container and
 troubleshooting: [docs/capture/install.md](docs/capture/install.md). Design:
 [ADR 0002](docs/adr/0002-capture-companion.md). Building and the VM tests:
 [docs/capture/develop.md](docs/capture/develop.md).

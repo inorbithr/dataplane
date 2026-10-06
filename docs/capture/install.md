@@ -3,14 +3,16 @@
 `iohr-capture` is the capture companion of the InOrbit agent. It attaches small eBPF
 programs to one network interface, counts what passes in each direction, recognises the
 protocols of new connections from their first bytes, names the services that own the
-sockets and samples TCP health. It keeps the results in memory as counts and bounded
-"top" tables and answers the agent on a local socket. It is a separate program with its
+sockets, samples TCP health and times requests per route. It keeps the results in memory
+as counts and bounded "top" tables and answers the agent on a local socket. Switched on,
+it also keeps the latest whole packets in memory and writes a pcap file when root on the
+host asks for one. It is a separate program with its
 own service because it needs three kernel capabilities to start; the agent itself stays
 unprivileged ([ADR 0002](../adr/0002-capture-companion.md)).
 
-Status: phase 1, a preview. Layers 1 (headers), 2 (protocols), 4 (owners) and 5 (TCP
-health). Full packets and pcap on request (layer 3) and request timing (layer 7) come in
-phase 2.
+Status: phase 2, a preview. Layers 1 (headers), 2 (protocols), 3 (whole packets, off by
+default, pcap on request), 4 (owners), 5 (TCP health) and 7 (request timing). Design notes:
+[phase 1](design-phase1.md), [phase 2](design-phase2.md).
 
 **Do not run iohr-capture on any host before a signed release of it exists.** Install it
 only from a release whose signatures and provenance you verified
@@ -23,26 +25,36 @@ These are guarantees of this version, each backed by code and a test:
 
 - **It never drops, delays or changes a packet.** The programs always hand the packet on
   unchanged (`TC_ACT_OK`).
-- **It writes nothing to disk.** No capture file, no database, no cache: the aggregates
-  live in the companion's memory and are gone when it stops. (Phase 2 adds pcap files,
-  made only when a person on the host asks for one, 0600, capped and deleted.)
+- **It writes nothing to disk unless root asks.** No database, no cache: the aggregates
+  live in the companion's memory and are gone when it stops. The one exception is a pcap
+  file, and only with whole packets switched on (`IOHR_CAPTURE_PACKETS=true`) and root on
+  this host asking for it (`sudo iohr-capture pcap`): mode 0600 in a 0700 directory,
+  capped in size and time, deleted after its retention (1 h by default).
+- **No platform job can ever get a packet or start a pcap.** The control socket answers
+  root only (`SO_PEERCRED`; even the companion's own user is refused), the agent never
+  runs as root, has no code that talks to that socket, and its policy has no key for
+  packets. There is deliberately no `iohr agent capture pcap`.
 - **It sends nothing off the host.** The companion opens no network connection (its unit
-  denies all IP traffic; it uses only netlink and Unix sockets). The agent sends the
-  platform only four strings, `capture:headers`, `capture:protocols`, `capture:owners`,
-  `capture:tcp`, saying what this host can show, never what it saw.
+  denies all IP traffic; it uses only netlink and Unix sockets). A pcap file is never sent
+  anywhere either. The agent sends the platform only the strings `capture:headers`,
+  `capture:protocols`, `capture:owners`, `capture:tcp`, `capture:timing` and
+  `capture:packets`, saying what this host can show, never what it saw.
 - **Names, paths and addresses stay bounded, in memory, on this host.** HTTP hosts and
   path templates (ids replaced, queries dropped), TLS server names, DNS names, gRPC
-  methods, remote addresses and owners exist only as fixed-size top-K tables (64 rows each,
+  methods, remote addresses, owners and the timing rows (route template and owner) exist
+  only as fixed-size tables (64 rows each,
   128 bytes per key) in the companion's memory. Only a person on the host sees them
   (`--tables`, members of `iohr-capture-read`). They are never in a result frame, the
   hello, an admin page value, a log line or an OTLP export or label: the companion refuses
   the tables to the agent's user, the agent only ever asks for numbers and parses the
-  answer into numeric fields, so nothing else reaches its memory.
+  answer into numeric fields, so nothing else reaches its memory. The agent's version 2
+  `lookup` sends a route and owner it already holds and gets numbers back, never a list.
 - **Evidence (control DAT-10, "captured traffic stays on the host"):** the test
   `dat10_captured_traffic_stays_on_the_host` in
   [`crates/iohr-agent/tests/capture_privacy.rs`](../../crates/iohr-agent/tests/capture_privacy.rs)
   runs the agent against a companion that deliberately puts names, paths, SNI, DNS names,
-  addresses and pod ids into every field it answers (and into its error code), with OTLP
+  addresses, pod ids, route templates and pcap paths into every field it answers (and into
+  its error code and its lookup answers), with OTLP
   export on, and fails if any of them, or the counts themselves, appears in a frame sent
   to the platform or an OTLP export, or any name appears on the admin page or in
   `status.json`. The companion's refusal of tables to the agent's user is tested in
@@ -67,7 +79,9 @@ These are guarantees of this version, each backed by code and a test:
 | 1 headers | the TC programs, per CPU, in the kernel | packets (socket buffers, `skb`) and bytes per direction and protocol class (TCP/UDP/ICMP, IPv4/IPv6, non-IP); SYN, SYN-ACK, FIN, RST per direction; per service port (the lower of the two ports) packets, bytes, SYN, RST | with GRO/TSO one skb can carry several wire packets; the per-port table keeps the 1024 most recently used ports |
 | 2 protocols | the first 128 header bytes plus 512 payload bytes of each flow's first 8 payload packets, copied through a per-CPU token bucket (2000/s per CPU, burst 500) into a 4 MiB ring buffer, parsed in user space after the privilege drop | HTTP/1 requests (method, version, Host, path template) and response status classes; TLS ClientHellos (SNI, first ALPN, TLS 1.3 offered); DNS queries (name, type) and response codes; HTTP/2 cleartext connections and gRPC calls (method from `:path`); Redis command names; PostgreSQL connection openings | only the first request of a connection is seen (keep-alive and later HTTP/2 streams are counted, not named); a ClientHello cut before its server name counts as `tls_truncated` |
 | 4 owners | `sock_diag` (what `ss` uses) every 2 s: each socket's cgroup id, mapped to `/sys/fs/cgroup` paths | per owner: systemd unit, Docker/containerd/Podman container (short id), Kubernetes pod (UID and container id), or user; listening ports, sockets, flows; process names where visible | pod and container *names* need the runtime's API and are not shown; sockets in other network namespaces (bridged containers) count as unowned; under the shipped unit other users' process names are hidden (see the unit) |
-| 5 TCP | `tcp_info` from `sock_diag` every 2 s; `/proc/net/netstat` and `/proc/net/snmp` | established/listening sockets, smoothed RTT distribution, retransmits (sampled), resets in/out (from layer 1), listen queue overflows and drops; per port: RTT average and maximum, retransmits, accept queue and backlog, times the queue was full | a sample: a connection that opens and closes between two polls has no RTT; retransmit events between polls of a closed socket are missed (tracepoints come later) |
+| 5 TCP | `tcp_info` from `sock_diag` every 2 s; `/proc/net/netstat` and `/proc/net/snmp` | established/listening sockets, smoothed RTT distribution, retransmits (sampled), resets in/out (from layer 1), listen queue overflows and drops; per port: RTT average and maximum, retransmits, accept queue and backlog, times the queue was full; per owner (for the lookup): retransmits, resets, RTT | a sample: a connection that opens and closes between two polls has no RTT; retransmit events between polls of a closed socket are missed (tracepoints come later) |
+| 7 timing | the first 512 payload bytes of every TCP segment (with timing on), through the same token bucket; the TCP sequence numbers keep each direction in order | per (method, route template, owner): requests, responses, unanswered, status classes, gRPC status codes, a latency histogram (0.5 ms to 10 s, and above); HTTP/1 over keep-alive, h2c and gRPC | latency is first request byte to first response byte as seen at this host; a lost copy stops timing for that connection (`timing.unsynced`), never mispairs; later HTTP/2 streams whose headers need the HPACK table are `unknown`; gRPC status only when the trailers are in the copied bytes; TLS is never timed |
+| 3 packets (off by default) | a second ring buffer gets each whole packet up to the snap length (65535), after its own token bucket (1000/s per CPU, burst 200) | the latest packets in the parser's memory (32 MiB, at most 300 s), and a pcapng file when root asks (`iohr-capture pcap`) | over the rate, or without room in the ring, packets are counted (`packets.rate_limited`, `packets.ring_buffer_full`), not kept |
 
 Drops are always counted, never queued: `drops.rate_limited` (over the token bucket),
 `drops.ring_buffer_full` (the ring buffer had no room), `drops.flows_evicted` (the flow
@@ -175,13 +189,15 @@ lists TCX programs; nothing of ours remains once the process is gone.
 | Socket | Mode | Who may use it | What it answers |
 |---|---|---|---|
 | `/run/iohr-capture/aggregates.sock` | 0660, group `iohr-capture-read` (directory 2750) | checked per connection with `SO_PEERCRED`: root, `iohr-capture`, the `iohr-agent` user, members of `iohr-capture-read`; anyone else gets `forbidden` | `counts` (numbers only; all the agent gets) and `tables` (plus the top-K tables; for a person, never for the agent's user) |
-| `/run/iohr-capture/control.sock` | 0600 | root only | phase 1: `not_available` (pcap on request is phase 2; no platform job can ever start one) |
+| `/run/iohr-capture/control.sock` | 0600 | root only, checked with `SO_PEERCRED` (the companion's own user is refused too) | `pcap` and `status` with whole packets on, else `not_available`; no platform job can ever start a pcap |
 
 To read the tables as yourself, join the read group: `sudo usermod -aG iohr-capture-read
 "$USER"`, then log in again. It is a group of its own on purpose: it grants the capture
 tables and nothing else (the `iohr-agent` group can read the agent's configuration). The
 socket serves 16 connections at once; a client has 2 s to ask and 5 s to read. The protocol (one JSON line in, one JSON document out, versioned,
-bounded to 1 MiB) is in [design-phase1.md](design-phase1.md).
+bounded to 1 MiB) is in [design-phase1.md](design-phase1.md); version 2 (the keyed
+`lookup`, and how a client picks the version) and the control socket's protocol are in
+[design-phase2.md](design-phase2.md).
 
 ### Turn it on in the agent
 
@@ -194,26 +210,31 @@ capture = true
 
 [capture]                                   # optional; these are the defaults
 socket = "/run/iohr-capture/aggregates.sock"
-layers = ["headers", "protocols", "owners", "tcp"]
+layers = ["headers", "protocols", "owners", "tcp", "packets", "timing"]
 max_snapshot_age_secs = 30
 ```
 
 Then `sudo systemctl restart iohr-agent`. **These keys need an agent newer than
-0.1.0-alpha.4**: older agents reject unknown policy keys and refuse to start with them, so
-upgrade the agent first, then the policy. Changing the policy changes its hash, which the
+0.1.0-alpha.4**, and the layer names `packets` and `timing` an agent with phase 2: older
+agents reject unknown policy keys and values and refuse to start with them, so upgrade the
+agent first, then the policy. Changing the policy changes its hash, which the
 console shows next to the agent.
 
 The agent's user must be in `iohr-capture-read` (the packages arrange it; by hand:
 `sudo usermod -aG iohr-capture-read iohr-agent` and restart the agent). At every session
 start the agent asks the socket for counts
 (1 s timeout) and announces `capture:<layer>` for each layer that the policy allows, the
-companion runs, and whose numbers are at most `max_snapshot_age_secs` old. If the
-companion is not running, the agent announces nothing for capture and keeps working.
+companion runs, and whose numbers are at most `max_snapshot_age_secs` old;
+`capture:packets` also needs the control socket to exist next to the aggregates socket.
+If the companion is not running, the agent announces nothing for capture and keeps working.
 
 What the agent shows locally:
 
-- `iohr agent capture status` (or `iohr-agent capture status`): the counts; `--tables`
-  for the top-K tables; `--json`.
+- `iohr agent capture status` (or `iohr-agent capture status`): the counts, timing and
+  packet totals included; `--tables` for the top-K tables and the timing rows (as a
+  member of the read group, never as the agent's user); `--json`.
+- `iohr agent capture lookup --owner 'cgroup:/…' --route 'GET /orders/{id}'`: the timing
+  and TCP numbers for that one key.
 - The admin page's **Traffic** section (refreshed every 15 s): whether the companion
   answers and why not, what is announced, and the counts. No names, paths or addresses.
 
@@ -286,6 +307,67 @@ Coming: `iohr ext install capture` will install the user commands (`iohr capture
 `pcap`, `dissect`) and control the system service, and will show the three capabilities
 before it installs anything. Until then, use the package.
 
+## Whole packets and pcap files (layer 3)
+
+Packets carry payloads: passwords in plaintext protocols, personal data, anything. Turn
+this on only on hosts where you may hold that data, and only for as long as you need it.
+
+```sh
+echo IOHR_CAPTURE_PACKETS=true | sudo tee -a /etc/iohr-capture/capture.env
+sudo systemctl restart iohr-capture
+```
+
+The companion then keeps the latest packets in memory (`IOHR_CAPTURE_PACKETS_BUFFER_MIB`,
+32 by default, never older than 300 s). Nothing is written until root asks:
+
+```sh
+# The last 30 s from memory, only HTTPS, with a copy you own for dissection:
+sudo iohr-capture pcap --seconds 30 --filter 'tcp and port 443' --out ./incident.pcapng
+# The next 60 s as they happen (waits until the file is complete):
+sudo iohr-capture pcap --next --seconds 60 --filter 'host 10.0.0.7 and not port 22'
+```
+
+- **Filter**: `tcp`, `udp`, `icmp`, `ip`, `ip6`, `[src|dst] port N`, `[src|dst] host
+  ADDR`, joined by `and`, each optionally after `not`; at most 8 terms. No `or`, no names
+  (nothing is looked up). It is a small, safe subset of tcpdump's syntax, parsed by the
+  companion, never handed to the kernel.
+- **The companion's file**: `/var/lib/iohr-capture/pcap/iohr-<UTC time>-<n>.pcapng`, mode
+  0600, in a 0700 directory of the companion's user (the unit's `StateDirectory=`). At most
+  `IOHR_CAPTURE_PCAP_MAX_BYTES` (64 MiB) per file and `IOHR_CAPTURE_PCAP_DIR_MAX_BYTES`
+  (512 MiB) in all (`no_space` past it), deleted `IOHR_CAPTURE_PCAP_RETENTION_SECS` (3600)
+  after it was written. `sudo apt purge iohr-capture` removes the directory.
+- **`--out FILE`** makes a copy for you: the file must not exist, it is created 0600 and
+  owned by the user who ran `sudo`. That copy is yours; the companion does not delete it.
+- pcapng with nanosecond timestamps and each packet's direction (inbound, outbound).
+  Packets over the copy rate are missing from the file and counted in
+  `packets.rate_limited`; `--max-bytes` cuts a file (`truncated: true`).
+- Who asked, what and the outcome go to the journal; never the filter or the content.
+
+## Dissect with tshark
+
+```sh
+iohr-capture dissect ./incident.pcapng            # as yourself, not root
+iohr-capture dissect ./incident.pcapng -- -V -Y http
+```
+
+`dissect` runs **this host's own `tshark`** (Wireshark's command line), as you, with the
+file you can read as its input and `-n` (no name lookups, so captured addresses never go
+to a resolver), and prints what tshark prints. `tshark` is a separate program under the
+GPL. iohr-capture never bundles, links or starts it from the companion; the deb only
+`Suggests:` it and the rpm suggests `wireshark-cli`. Install it yourself:
+`sudo apt install tshark` (answer "No" to letting non-root users capture; dissecting files
+needs no capture rights) or `sudo dnf install wireshark-cli`. `iohr-capture doctor` says
+whether it is there.
+
+`dissect` refuses to run as root: dissectors parse untrusted bytes, and Wireshark's own
+advice is never to run them with privileges. `--as-root` overrides that if you must.
+
+**Why not `iohr agent capture pcap` or `dissect`?** The agent is the process that talks to
+the platform. If it could reach packets, one bug in its session code would be one step
+from payloads, and a job could ask for them. So the agent never gets packets, cannot reach
+the control socket, and its commands stop at counts and lookups. A person on the host uses
+`iohr-capture` directly.
+
 ## Verify what you downloaded
 
 Archives, `.deb` and `.rpm` carry SLSA provenance and a CycloneDX SBOM attestation
@@ -323,7 +405,10 @@ Without `--for` it runs until `Ctrl-C` or `SIGTERM`. `--attach tcx|netlink` forc
 attach mode (TCX needs 6.6). Every setting has a flag and an `IOHR_CAPTURE_*` variable
 (`iohr-capture run --help`): `--layers`, `--samples-per-sec`, `--burst`,
 `--ring-buffer-kib` (4 to 32768), `--first-packets`, `--max-flows` (at most 65536),
-`--poll-ms`, the socket paths, `--socket-group`, `--agent-user`.
+`--poll-ms`, the socket paths, `--socket-group`, `--agent-user`, and for whole packets
+`--packets`, `--snaplen`, `--packets-per-sec`, `--packets-burst`, `--packets-ring-kib`,
+`--packets-buffer-mib`, `--pcap-dir`, `--pcap-max-bytes`, `--pcap-dir-max-bytes`,
+`--pcap-retention-secs`.
 
 Run by hand as root, `run` keeps root only for the privileged process: the parser runs as
 `iohr-capture` (or `nobody`), and `/run/iohr-capture` is made that user's, in the read
@@ -332,7 +417,9 @@ group. A later start of the unit takes the directory back (`RuntimeDirectory=`).
 **Memory.** Both processes share the unit's `MemoryMax=256M`. The ring buffer (at most
 32 MiB) and the flow table (about 2 KiB per flow while its protocol is undecided, at most
 65536 flows, so about 140 MiB in the worst case) fit under it with room for the rest; the
-defaults (4 MiB, 16384 flows) use a few tens of MiB. Raising `MemoryMax` in a drop-in is
+defaults (4 MiB, 16384 flows) use a few tens of MiB. Whole packets add their ring (8 MiB,
+at most 32) and the packets kept in memory (32 MiB, at most 128): with the largest of
+everything, raise `MemoryMax`. Raising `MemoryMax` in a drop-in is
 the way to go beyond.
 
 **Counts are socket buffers, not wire packets** (`packet_unit: "skb"`). With GRO
@@ -372,4 +459,14 @@ Ethernet header on, without the frame check sequence. The interface's own counte
 | `drops.flows_evicted` grows | more concurrent flows than `--max-flows` | raise `IOHR_CAPTURE_MAX_FLOWS` (each flow costs at most about 2 KiB while undecided) |
 | owners show `user:` rows only | Linux before 5.9, or no cgroup v2 | see `doctor` (`owners`) |
 | owners have no process names | the unit hides other users' processes (`ProtectProc=invisible`) | a drop-in with `ProtectProc=default` if you want process names |
+| `pcap`: `not_available` | whole packets are off | `IOHR_CAPTURE_PACKETS=true`, restart the service |
+| `pcap`: "the control socket is for root only" / `forbidden` | not run as root | `sudo iohr-capture pcap …` |
+| `pcap`: `no_space` | the pcap directory is at `IOHR_CAPTURE_PCAP_DIR_MAX_BYTES` | wait for the retention, delete files you no longer need, or raise the cap |
+| `pcap`: `busy` | a `--next` capture is running | wait until it ends |
+| `pcap`: few or no packets | over `IOHR_CAPTURE_PACKETS_PER_SEC`, or older than the buffer holds | see `packets.rate_limited` and `packets.buffer_evicted` in `stats`; raise the rate or the buffer, or use `--next` |
+| `dissect`: "tshark is not installed" | no tshark on `PATH` | `sudo apt install tshark` or `sudo dnf install wireshark-cli` |
+| `dissect`: "refusing to run tshark as root" | run with `sudo` | run it as yourself on a copy made with `pcap --out` |
+| `dissect`: cannot read the file | the companion's file is the companion's (0600) | `sudo iohr-capture pcap … --out FILE` gives you a copy |
+| `timing.unsynced` grows | copies were lost (rate limit or ring buffer full), so those connections stop being timed | raise `IOHR_CAPTURE_SAMPLES_PER_SEC` / `IOHR_CAPTURE_RING_BUFFER_KIB`; timing copies every TCP segment's first bytes |
+| timing routes show `unknown` | later HTTP/2 streams on a connection whose headers refer to the HPACK table | by design: no path is guessed |
 | many `flows_unowned` | sockets in other network namespaces (bridged containers), or connections shorter than the 2 s poll from local clients | expected in phase 1 |

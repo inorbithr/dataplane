@@ -9,7 +9,7 @@ How the capture crates are built and tested. Installing and running it:
 |---|---|---|
 | `crates/iohr-capture-ebpf` | the eBPF programs (`no_std`, `aya-ebpf`), `MIT OR GPL-2.0`, not a workspace member, its own `Cargo.lock` and `deny.toml` | the pinned nightly in its `rust-toolchain.toml`, `bpf-linker` |
 | `crates/iohr-capture-common` | `no_std` types shared by kernel and user space; `unsafe impl aya::Pod` behind the `user` feature | stable |
-| `crates/iohr-capture` | the program: `run`, `stats`, `doctor`, `cleanup`; layers 1, 2, 4, 5 ([design-phase1.md](design-phase1.md)) | stable; its `build.rs` builds the eBPF crate |
+| `crates/iohr-capture` | the program: `run`, `stats`, `lookup`, `pcap`, `dissect`, `doctor`, `cleanup`; layers 1, 2, 4, 5 ([design-phase1.md](design-phase1.md)), 3 and 7 ([design-phase2.md](design-phase2.md)) | stable; its `build.rs` builds the eBPF crate |
 
 `crates/iohr-capture/build.rs` calls `aya-build`, which runs
 `cargo build --target bpfel-unknown-none -Z build-std=core` for the eBPF crate with the
@@ -90,6 +90,20 @@ limited must be counted), and with a 16 MiB ring and no rate limit (the reader m
 up: every copied record read, and 5 DNS queries sent after the flood counted). In all the
 totals stay exact and both processes stay under 64 MiB.
 
+Phase 2, once per kernel: an HTTP/1.1 server with a fixed delay per route (0, 35, 150 and
+700 ms; one keep-alive connection per route) and an h2c/gRPC server (150 ms; 120 ms with
+`grpc-status: 0` in the trailers; 700 ms with a trailers-only `grpc-status: 5`), each in its
+own cgroup. The version 2 `lookup`, asked as the agent's user, must put every request in the
+histogram bucket its delay belongs to, with the right status classes and gRPC codes, find
+nothing for an unknown route or owner, and carry no name. With `--packets`, root asks for a
+`last` pcap with a filter and a copy for another user (0600, owned by that user), that user
+runs `iohr-capture dissect` (the host's tshark, which must be installed: it is reached
+through the read-only host filesystem) and must see the HTTP requests, `dissect` as root is
+refused, a `next` pcap must be readable by tshark, the companion's own user and another
+user are refused by the control socket, and the companion's file must be gone after its
+6 s retention while the copy stays. A fourth flood with packets on checks the packet
+buffer stays at its 4 MiB.
+
 Last, the shipped unit: `packaging/systemd/iohr-capture.service` is started by a real
 systemd running as PID 1 of a new PID namespace inside the VM (the guest's `/etc` and
 `/usr` are throwaway overlays, so users, groups, the binary and the unit are installed
@@ -112,6 +126,9 @@ Results: `dist/capture-e2e/<kernel>.json` and `.log`.
 - Read and write access to `/dev/kvm`. Without it the VMs are too slow to be useful and
   the script stops. Join the `kvm` group (`sudo usermod -aG kvm "$USER"`, then log in
   again), or for the current login only: `sudo setfacl -m u:"$USER":rw /dev/kvm`.
+- `tshark` on this machine (`sudo apt install tshark`, and answer "No" to letting
+  non-root users capture): the guest uses this machine's files, and the phase 2 checks
+  dissect with it. It only ever reads files there.
 - Network access the first time: `vng --run v<version>` downloads Ubuntu mainline kernel
   builds (image and modules) from kernel.ubuntu.com and caches them in
   `~/.cache/virtme-ng`.

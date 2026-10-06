@@ -19,7 +19,7 @@ metric, label, span or log carries anything from capture. A test enforces it
 | Socket | Path (fixed) | Mode | Who may connect | Answers |
 |---|---|---|---|---|
 | aggregates | `/run/iohr-capture/aggregates.sock` (directory 2750, set-group-id) | 0660, group `iohr-capture-read` | checked with `SO_PEERCRED`: root, the companion's own user, the `iohr-agent` user, members of `iohr-capture-read` | counts; the bounded top-K tables too, but never to the agent's user |
-| control | `/run/iohr-capture/control.sock` | 0600 | root only (`SO_PEERCRED` uid 0) | phase 1: `not_available` for everything; phase 2: pcap on request |
+| control | `/run/iohr-capture/control.sock` | 0600 | root only (`SO_PEERCRED` uid 0) | phase 1: `not_available` for everything; phase 2: pcap on request ([design-phase2.md](design-phase2.md)) |
 
 Both are Unix sockets, not network listeners (ADR 0001's "no new listener" holds). The
 parser process (`iohr-capture worker`, started by `run`, with no capability at all)
