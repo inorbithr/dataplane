@@ -68,6 +68,26 @@ pub enum Command {
 pub enum CaptureCommand {
     /// Ask iohr-capture what it counted on this host (its aggregates socket); nothing is sent anywhere.
     Status(CaptureStatusArgs),
+    /// Request timing for one owner and route (numbers only); nothing is sent anywhere.
+    ///
+    /// There is no `capture pcap` or `capture dissect` here on purpose: the agent never
+    /// handles packets. On the host, root runs `iohr-capture pcap` and a person
+    /// `iohr-capture dissect` (docs/capture/install.md).
+    Lookup(CaptureLookupArgs),
+}
+
+/// `capture lookup`.
+#[derive(Debug, Args)]
+pub struct CaptureLookupArgs {
+    /// The aggregates socket (default: `[capture] socket` in the policy, or /run/iohr-capture/aggregates.sock).
+    #[arg(long)]
+    pub socket: Option<PathBuf>,
+    /// The owner key, as `iohr-capture stats --tables` shows it (`cgroup:/…`, `systemd:….service`).
+    #[arg(long)]
+    pub owner: String,
+    /// The route: `METHOD template`, for example `GET /orders/{id}`.
+    #[arg(long)]
+    pub route: String,
 }
 
 /// `capture status`.
@@ -291,6 +311,7 @@ async fn dispatch(cmd: Command, config_path: &Path) -> Result<ExitCode> {
         Command::Policy(PolicyCommand::Check(a)) => policy_check(&a, config_path).await,
         Command::Checks(ChecksCommand::Lint(a)) => checks_lint(&a, config_path).await,
         Command::Capture(CaptureCommand::Status(a)) => capture_status(&a, config_path).await,
+        Command::Capture(CaptureCommand::Lookup(a)) => capture_lookup(&a, config_path).await,
         Command::Run(_) => Ok(ExitCode::SUCCESS),
     }
 }
@@ -379,21 +400,33 @@ async fn wait_for_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-async fn capture_status(args: &CaptureStatusArgs, config_path: &Path) -> Result<ExitCode> {
+/// The aggregates socket: the flag, else the policy's `[capture] socket`, else the default.
+fn capture_socket(flag: Option<&PathBuf>, config_path: &Path) -> PathBuf {
     let from_policy = || {
         let cfg = AgentConfig::load(config_path).ok()?;
         let policy = Policy::load(&cfg.policy).ok()?;
         Some(policy.capture.unwrap_or_default().socket)
     };
-    let socket = args
-        .socket
-        .clone()
+    flag.cloned()
         .or_else(from_policy)
-        .unwrap_or_else(|| PathBuf::from(crate::policy::CAPTURE_SOCKET));
+        .unwrap_or_else(|| PathBuf::from(crate::policy::CAPTURE_SOCKET))
+}
+
+async fn capture_lookup(args: &CaptureLookupArgs, config_path: &Path) -> Result<ExitCode> {
+    let socket = capture_socket(args.socket.as_ref(), config_path);
+    let l = crate::capture::lookup(&socket, &args.owner, &args.route, Duration::from_secs(5))
+        .await
+        .map_err(|e| Error::Config(format!("{e}; is iohr-capture running (version 2 of its socket), and are you in the iohr-capture-read group? (docs/capture/install.md)")))?;
+    out(&serde_json::to_string_pretty(&l).unwrap_or_default());
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn capture_status(args: &CaptureStatusArgs, config_path: &Path) -> Result<ExitCode> {
+    let socket = capture_socket(args.socket.as_ref(), config_path);
     let what = if args.tables { "tables" } else { "counts" };
     let raw = crate::capture::request(&socket, what, Duration::from_secs(5))
         .await
-        .map_err(|e| Error::Config(format!("{e}; is iohr-capture running, and are you in the iohr-agent group? (docs/capture/install.md)")))?;
+        .map_err(|e| Error::Config(format!("{e}; is iohr-capture running, and are you in the iohr-capture-read group? (docs/capture/install.md)")))?;
     let value: serde_json::Value = serde_json::from_slice(&raw)
         .map_err(|e| Error::Config(format!("the companion's answer is not JSON: {e}")))?;
     if let Some(code) = value.get("error").and_then(|v| v.as_str()) {
@@ -438,6 +471,26 @@ async fn capture_status(args: &CaptureStatusArgs, config_path: &Path) -> Result<
     out(&format!(
         "owners     {} sockets, {} owners, flows {} owned / {} unowned",
         c.owners.sockets, c.owners.owners, c.owners.flows_owned, c.owners.flows_unowned
+    ));
+    out(&format!(
+        "timing     {} requests, {} answered (2xx {}, 3xx {}, 4xx {}, 5xx {}), {} unanswered, {} routes and owners, {} connections out of sync",
+        c.timing.requests,
+        c.timing.responses,
+        c.timing.status_classes.c2xx,
+        c.timing.status_classes.c3xx,
+        c.timing.status_classes.c4xx,
+        c.timing.status_classes.c5xx,
+        c.timing.unanswered,
+        c.timing.keys,
+        c.timing.unsynced
+    ));
+    out(&format!(
+        "packets    {}: {} copied, {} rate limited, {} ring buffer full, {} pcap files made on this host",
+        if c.packets.enabled { "on" } else { "off" },
+        c.packets.copied,
+        c.packets.rate_limited,
+        c.packets.ring_buffer_full,
+        c.packets.pcaps_written
     ));
     out(&format!(
         "tcp        {} established, {} listening, {} retransmits, resets {} in / {} out, {} listen overflows",

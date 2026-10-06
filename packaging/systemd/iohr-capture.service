@@ -5,9 +5,11 @@
 # It holds CAP_BPF, CAP_PERFMON and CAP_NET_ADMIN only to load and attach its TC
 # classifiers, then drops them (on kernels before 6.6 it keeps CAP_NET_ADMIN to remove its
 # filters on exit, and before 6.5 CAP_BPF to read its counters). Only then does it parse
-# anything. It never drops a packet, stores nothing and sends nothing; the agent reads its
-# counts from /run/iohr-capture/aggregates.sock (0660, group iohr-capture-read), and
-# /run/iohr-capture/control.sock (0600) is for root (docs/capture/install.md).
+# anything. It never drops a packet and sends nothing anywhere; the agent reads its counts
+# from /run/iohr-capture/aggregates.sock (0660, group iohr-capture-read), and
+# /run/iohr-capture/control.sock (0600) is for root: with IOHR_CAPTURE_PACKETS=true, root
+# asks there for a pcap file (`iohr-capture pcap`), written 0600 under
+# /var/lib/iohr-capture/pcap and deleted after its retention (docs/capture/install.md).
 [Unit]
 Description=InOrbit capture companion (iohr-capture): eBPF traffic counters, counts only
 Documentation=https://github.com/inorbithr/dataplane/blob/main/docs/capture/install.md
@@ -24,11 +26,18 @@ Group=iohr-capture-read
 # /run/iohr-capture: the two sockets. Set-group-id, group-readable, nothing for others.
 RuntimeDirectory=iohr-capture
 RuntimeDirectoryMode=2750
+# /var/lib/iohr-capture/pcap: pcap files made on request (packets on only). On disk, not in
+# /run (tmpfs pages would count against MemoryMax=); the companion's user only.
+StateDirectory=iohr-capture iohr-capture/pcap
+StateDirectoryMode=0700
 EnvironmentFile=/etc/iohr-capture/capture.env
 ExecStartPre=/usr/bin/iohr-capture doctor
 ExecStart=/usr/bin/iohr-capture run
 # Kernels before 6.6 attach with netlink filters, which outlive a killed process; remove
-# them however the service ended. TCX links (6.6+) go away with the process.
+# them however the service ended. TCX links (6.6+) go away with the process. It also
+# deletes the companion's pcap files: once it stops nothing would expire them (copies made
+# with `pcap --out` live elsewhere; /usr/lib/tmpfiles.d/iohr-capture.conf is the net for a
+# host that went down hard).
 ExecStopPost=/usr/bin/iohr-capture cleanup
 Restart=on-failure
 RestartSec=5s
@@ -43,7 +52,9 @@ SecureBits=noroot noroot-locked
 # Maps are charged to RLIMIT_MEMLOCK before Linux 5.11.
 LimitMEMLOCK=infinity
 # Hard memory cap for both processes (the privileged one and the parser); the defaults
-# (4 MiB ring buffer, 16384 flows) use a few tens of MiB.
+# (4 MiB ring buffer, 16384 flows; with packets on an 8 MiB packets ring and 32 MiB of
+# packets in memory) use well under 100 MiB. The largest settings need a drop-in that
+# raises it (docs/capture/install.md).
 MemoryMax=256M
 
 ProtectSystem=strict

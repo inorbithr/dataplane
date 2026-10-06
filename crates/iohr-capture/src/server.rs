@@ -1,10 +1,11 @@
 //! The two local sockets (`docs/capture/design-phase1.md`):
 //!
 //! - **aggregates** (0660, group `iohr-capture-read`): one JSON request line, one JSON
-//!   answer (`counts`, or `tables` for a person, never for the agent's user), bounded in
-//!   size, time and concurrency; peers are checked with `SO_PEERCRED`.
-//! - **control** (0600, root only): reserved for pcap on request (phase 2); every request
-//!   is answered `not_available`.
+//!   answer (`counts`, or `tables` for a person, never for the agent's user; in version 2
+//!   also `lookup`, numbers for one owner and route), bounded in size, time and
+//!   concurrency; peers are checked with `SO_PEERCRED` (`docs/capture/design-phase2.md`).
+//! - **control** (0600, root only by `SO_PEERCRED`): pcap files on request and the packet
+//!   buffer's `status`; `not_available` when packets are off.
 //!
 //! Neither is a network listener. Logs say who asked what and the outcome, never what
 //! the answer held.
@@ -20,7 +21,8 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::engine::{Engine, WIRE_VERSION};
+use crate::engine::{Engine, WIRE_VERSION, WIRE_VERSION_2};
+use crate::pcap;
 
 /// Longest request line.
 pub(crate) const MAX_REQUEST: usize = 1024;
@@ -133,6 +135,13 @@ pub(crate) fn prepare_dir(dir: &Path, owner: Option<u32>, gid: Option<u32>) -> i
     if !dir.exists() {
         fs::create_dir_all(dir)?;
     }
+    if fs::symlink_metadata(dir)?.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is a symbolic link; refusing", dir.display()),
+        ));
+    }
+    pcap::check_dir(dir, owner)?;
     let meta = fs::metadata(dir)?;
     let owner = owner.filter(|u| *u != meta.uid());
     let group = gid.filter(|g| *g != meta.gid());
@@ -265,6 +274,14 @@ async fn aggregates_conn(
         let a = json!({"version": WIRE_VERSION, "error": "forbidden", "message": "this user may not read capture aggregates (join the iohr-capture-read group)"});
         return write(&mut sock, &a).await;
     }
+    if request
+        .as_ref()
+        .is_ok_and(|r| r["request"].as_str() == Some("lookup"))
+        && !LOOKUPS.allow(cred.uid())
+    {
+        let a = json!({"version": WIRE_VERSION_2, "error": "rate_limited", "message": "at most 50 lookups a second"});
+        return write(&mut sock, &a).await;
+    }
     let answer = answer(request.as_ref(), engine, access.is_agent(cred.uid()));
     tracing::debug!(
         uid = cred.uid(),
@@ -275,8 +292,43 @@ async fn aggregates_conn(
     write(&mut sock, &answer).await
 }
 
-/// The answer to one request (pure, for tests). The agent may only ever have `counts`:
-/// the companion enforces that names, paths and addresses never reach it (DAT-10).
+/// Longest owner key in a lookup.
+const MAX_OWNER: usize = 256;
+/// Longest route in a lookup (`METHOD template`).
+const MAX_ROUTE: usize = 300;
+/// Lookups per peer uid per second.
+const LOOKUPS_PER_SEC: u32 = 50;
+
+/// A per-uid budget of lookups per second (bounded: a few uids may ever connect).
+#[derive(Debug, Default)]
+struct Limiter {
+    seen: Mutex<std::collections::HashMap<u32, (std::time::Instant, u32)>>,
+}
+
+impl Limiter {
+    fn allow(&self, uid: u32) -> bool {
+        let mut m = match self.seen.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if m.len() > 1024 {
+            m.clear();
+        }
+        let now = std::time::Instant::now();
+        let e = m.entry(uid).or_insert((now, 0));
+        if now.duration_since(e.0) >= Duration::from_secs(1) {
+            *e = (now, 0);
+        }
+        e.1 += 1;
+        e.1 <= LOOKUPS_PER_SEC
+    }
+}
+
+static LOOKUPS: std::sync::LazyLock<Limiter> = std::sync::LazyLock::new(Limiter::default);
+
+/// The answer to one request (pure, for tests). The agent may only ever have counts:
+/// `counts` and, in version 2, `lookup` (numbers for a key it already holds); the
+/// companion enforces that names, paths and addresses never reach it (DAT-10).
 pub(crate) fn answer(
     request: Result<&Value, &String>,
     engine: &Mutex<Engine>,
@@ -286,19 +338,42 @@ pub(crate) fn answer(
         Ok(v) => v,
         Err(e) => return json!({"version": WIRE_VERSION, "error": "bad_request", "message": e}),
     };
-    if req["version"].as_u64() != Some(u64::from(WIRE_VERSION)) {
-        return json!({"version": WIRE_VERSION, "error": "unsupported_version", "message": "this companion speaks version 1"});
-    }
-    match req["request"].as_str() {
+    let version = match req["version"].as_u64() {
+        Some(1) => WIRE_VERSION,
+        Some(2) => WIRE_VERSION_2,
+        _ => {
+            return json!({"version": WIRE_VERSION_2, "error": "unsupported_version", "supported": [1, 2], "message": "this companion speaks versions 1 and 2"});
+        }
+    };
+    let mut a = match req["request"].as_str() {
         Some("counts") => lock(engine).counts(),
         Some("tables") if peer_is_agent => {
-            json!({"version": WIRE_VERSION, "error": "forbidden", "message": "the agent may read counts only"})
+            json!({"error": "forbidden", "message": "the agent may read counts only"})
         }
         Some("tables") => lock(engine).tables(),
-        _ => {
-            json!({"version": WIRE_VERSION, "error": "unknown_request", "message": "ask for \"counts\" or \"tables\""})
+        Some("lookup") if version == WIRE_VERSION => {
+            json!({"error": "unknown_request", "message": "lookup needs version 2"})
         }
-    }
+        Some("lookup") => {
+            let owner = req["owner"].as_str().unwrap_or_default();
+            let route = req["route"].as_str().unwrap_or_default();
+            if owner.is_empty()
+                || route.is_empty()
+                || owner.len() > MAX_OWNER
+                || route.len() > MAX_ROUTE
+                || !route.contains(' ')
+            {
+                json!({"error": "bad_request", "message": "lookup needs owner (at most 256 bytes) and route (\"METHOD template\", at most 300 bytes)"})
+            } else {
+                lock(engine).lookup(owner, route)
+            }
+        }
+        _ => {
+            json!({"error": "unknown_request", "message": "ask for \"counts\", \"tables\" or (version 2) \"lookup\""})
+        }
+    };
+    a["version"] = version.into();
+    a
 }
 
 fn lock(e: &Mutex<Engine>) -> std::sync::MutexGuard<'_, Engine> {
@@ -353,43 +428,142 @@ async fn write(sock: &mut UnixStream, v: &Value) -> io::Result<()> {
     })?
 }
 
-/// Serves the control socket: root only, and nothing is available in phase 1.
-pub(crate) async fn serve_control(l: UnixListener) {
+/// The control socket's protocol version.
+pub(crate) const CONTROL_VERSION: u32 = 1;
+
+/// Serves the control socket: root only (by `SO_PEERCRED`; the companion's own user is
+/// refused too). `packets` is `None` when layer 3 is off: everything is `not_available`.
+pub(crate) async fn serve_control(l: UnixListener, packets: Option<Arc<Mutex<pcap::State>>>) {
+    // At most a few connections; one request served at a time (a pcap file is written
+    // whole before the next is taken), the others are answered `busy`.
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    let one = Arc::new(tokio::sync::Semaphore::new(1));
     loop {
         let mut sock = accept(&l).await;
         let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else {
             continue;
         };
+        let packets = packets.clone();
+        let one = Arc::clone(&one);
         tokio::spawn(async move {
             let _permit = permit;
             let uid = sock.peer_cred().map(|c| c.uid()).ok();
-            let _ = read_request(&mut sock).await;
-            let (code, message) = if uid == Some(0) {
-                (
-                    "not_available",
-                    "pcap on request arrives in a later version (phase 2)",
-                )
+            let request = read_request(&mut sock).await;
+            let serving = one.try_acquire_owned();
+            let a = if uid != Some(0) {
+                json!({"version": CONTROL_VERSION, "error": "forbidden", "message": "the control socket is for root only"})
+            } else if serving.is_err() {
+                json!({"version": CONTROL_VERSION, "error": "busy", "message": "another control request is being served"})
             } else {
-                ("forbidden", "the control socket is for root only")
+                control_answer(request.as_ref(), packets).await
             };
-            tracing::info!(uid = ?uid, answer = code, "control socket");
-            let a = json!({"version": WIRE_VERSION, "error": code, "message": message});
+            drop(serving);
+            // Who, what, outcome; never the filter or the file's content.
+            tracing::info!(
+                uid = ?uid,
+                request = request.as_ref().ok().and_then(|v| v["request"].as_str()).unwrap_or("?"),
+                answer = a.get("error").and_then(serde_json::Value::as_str).unwrap_or("ok"),
+                packets = a.get("packets").and_then(serde_json::Value::as_u64),
+                "control socket"
+            );
             let _ = write(&mut sock, &a).await;
         });
     }
 }
 
+/// A root peer's control request.
+pub(crate) async fn control_answer(
+    request: Result<&Value, &String>,
+    packets: Option<Arc<Mutex<pcap::State>>>,
+) -> Value {
+    let refuse = |code: &str, message: &str| json!({"version": CONTROL_VERSION, "error": code, "message": message});
+    let req = match request {
+        Ok(v) => v,
+        Err(e) => return refuse("bad_request", e),
+    };
+    if req["version"].as_u64() != Some(u64::from(CONTROL_VERSION)) {
+        let mut a = refuse("unsupported_version", "the control socket speaks version 1");
+        a["supported"] = json!([1]);
+        return a;
+    }
+    let Some(state) = packets else {
+        return refuse(
+            "not_available",
+            "packets are off: start iohr-capture with --packets (IOHR_CAPTURE_PACKETS=true)",
+        );
+    };
+    let lock_state = || match state.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let mut a = match req["request"].as_str() {
+        Some("status") => {
+            let s = lock_state();
+            let mut v = serde_json::to_value(s.info()).unwrap_or_default();
+            v["writing"] = s.files.writing().into();
+            v
+        }
+        Some("pcap") => {
+            let prepared = {
+                let mut s = lock_state();
+                match pcap::request(req, &s.files.settings) {
+                    Err(r) => Err(r),
+                    Ok(r) if r.next => {
+                        let offset = s.offset;
+                        s.files.next(&r, offset).map(Ok)
+                    }
+                    Ok(r) => {
+                        let offset = s.offset;
+                        let pcap::State { buffer, files, .. } = &mut *s;
+                        files.prepare_last(&r, buffer, offset).map(Err)
+                    }
+                }
+            };
+            // A `last` file is written off the lock and off the runtime's thread.
+            let done = match prepared {
+                Err(r) => Err(r),
+                Ok(Ok(answer)) => Ok(answer),
+                Ok(Err(p)) => tokio::task::spawn_blocking(move || p.write())
+                    .await
+                    .unwrap_or_else(|_| Err(pcap::Refused::new("io", "the writer failed"))),
+            };
+            match done {
+                Ok(v) => v,
+                Err(r) => refuse(r.code, &r.message),
+            }
+        }
+        _ => refuse("unknown_request", "ask for \"pcap\" or \"status\""),
+    };
+    a["version"] = CONTROL_VERSION.into();
+    a
+}
+
 /// A client of the aggregates socket (`iohr-capture stats`).
 pub(crate) async fn query(path: &Path, request: &str) -> io::Result<Value> {
+    send(
+        path,
+        &json!({"version": WIRE_VERSION, "request": request}),
+        Duration::from_secs(5),
+    )
+    .await
+}
+
+/// Sends one request (a JSON object) and reads the answer, within `wait`.
+pub(crate) async fn send(path: &Path, request: &Value, wait: Duration) -> io::Result<Value> {
     let mut s = tokio::time::timeout(Duration::from_secs(2), UnixStream::connect(path))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))??;
-    let line = format!("{}\n", json!({"version": WIRE_VERSION, "request": request}));
+    let line = format!("{request}\n");
+    if line.len() > MAX_REQUEST {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "request longer than 1 KiB",
+        ));
+    }
     s.write_all(line.as_bytes()).await?;
     let mut out = Vec::new();
     tokio::time::timeout(
-        Duration::from_secs(5),
+        wait,
         (&mut s).take(MAX_ANSWER as u64 + 2).read_to_end(&mut out),
     )
     .await
@@ -411,9 +585,118 @@ mod tests {
                 max_flows: 16,
                 idle: Duration::from_secs(60),
                 companion_kept: Vec::new(),
+                packets: false,
             },
             &Dropped::for_tests(),
         )))
+    }
+
+    #[derive(Clone)]
+    struct LogBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_control_log_never_carries_the_filter() {
+        let logs = LogBuf(Arc::default());
+        let sink = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || sink.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let dir = std::env::temp_dir().join(format!("iohr-ctl-log-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        prepare_dir(&dir, None, None).unwrap();
+        let bound = bind(&dir.join("a.sock"), &dir.join("c.sock")).unwrap();
+        let c = UnixListener::from_std(bound.control.try_clone().unwrap()).unwrap();
+        tokio::spawn(serve_control(c, None));
+        let v = send(
+            &dir.join("c.sock"),
+            &json!({"version": 1, "request": "pcap", "seconds": 5, "filter": "host 10.66.77.88 and port 31337"}),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert!(v.get("error").is_some());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("control socket"), "not vacuous: {text}");
+        assert!(
+            !text.contains("10.66.77.88") && !text.contains("31337"),
+            "{text}"
+        );
+        drop(bound);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lookups_are_rate_limited_per_uid() {
+        let l = Limiter::default();
+        assert!((0..LOOKUPS_PER_SEC).all(|_| l.allow(7)));
+        assert!(!l.allow(7));
+        assert!(l.allow(8), "another uid has its own budget");
+    }
+
+    #[tokio::test]
+    async fn control_answers_for_root() {
+        // Off: not available.
+        let r = json!({"version": 1, "request": "pcap"});
+        assert_eq!(control_answer(Ok(&r), None).await["error"], "not_available");
+        let dir = std::env::temp_dir().join(format!("iohr-ctl-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        pcap::prepare_dir(&dir, None).unwrap();
+        let state = Arc::new(Mutex::new(pcap::State::new(
+            1 << 20,
+            pcap::Settings {
+                dir: dir.clone(),
+                max_bytes: 1 << 20,
+                dir_max_bytes: 1 << 22,
+                retention: Duration::from_secs(60),
+                linktype: 1,
+                snaplen: 65535,
+                interface: "lo".into(),
+            },
+        )));
+        let ok = control_answer(
+            Ok(&json!({"version": 1, "request": "pcap", "seconds": 10})),
+            Some(Arc::clone(&state)),
+        )
+        .await;
+        assert_eq!(ok["version"], 1);
+        assert_eq!(ok["packets"], 0);
+        assert!(std::path::Path::new(ok["path"].as_str().unwrap()).exists());
+        let st = control_answer(
+            Ok(&json!({"version": 1, "request": "status"})),
+            Some(Arc::clone(&state)),
+        )
+        .await;
+        assert_eq!(st["pcaps_written"], 1);
+        assert_eq!(
+            control_answer(
+                Ok(&json!({"version": 2, "request": "status"})),
+                Some(Arc::clone(&state))
+            )
+            .await["error"],
+            "unsupported_version"
+        );
+        assert_eq!(
+            control_answer(
+                Ok(&json!({"version": 1, "request": "pcap", "seconds": 999})),
+                Some(state)
+            )
+            .await["error"],
+            "bad_request"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -438,14 +721,46 @@ mod tests {
         assert!(ok.get("tables").is_none());
         let t = answer(Ok(&json!({"version": 1, "request": "tables"})), &e, false);
         assert!(t.get("tables").is_some());
-        assert_eq!(
-            answer(Ok(&json!({"version": 2, "request": "counts"})), &e, false)["error"],
-            "unsupported_version"
-        );
+        let v3 = answer(Ok(&json!({"version": 3, "request": "counts"})), &e, false);
+        assert_eq!(v3["error"], "unsupported_version");
+        assert_eq!(v3["supported"], json!([1, 2]));
+        let v2 = answer(Ok(&json!({"version": 2, "request": "counts"})), &e, true);
+        assert_eq!(v2["version"], 2);
+        assert!(v2.get("timing").is_some() && v2.get("error").is_none());
         assert_eq!(
             answer(Ok(&json!({"version": 1, "request": "pcap"})), &e, false)["error"],
             "unknown_request"
         );
+        // Lookup: version 2 only, for the agent too, numbers only, never a list.
+        assert_eq!(
+            answer(
+                Ok(&json!({"version": 1, "request": "lookup", "owner": "o", "route": "GET /"})),
+                &e,
+                true
+            )["error"],
+            "unknown_request"
+        );
+        let l = answer(
+            Ok(
+                &json!({"version": 2, "request": "lookup", "owner": "cgroup:/web", "route": "GET /items/{id}"}),
+            ),
+            &e,
+            true,
+        );
+        assert_eq!(
+            (l["version"].as_u64(), l["found"].as_bool()),
+            (Some(2), Some(false))
+        );
+        assert!(!l.to_string().contains("cgroup:/web") && !l.to_string().contains("/items"));
+        for bad in [
+            json!({"version": 2, "request": "lookup", "owner": "o"}),
+            json!({"version": 2, "request": "lookup", "owner": "o", "route": "nospace"}),
+            json!({"version": 2, "request": "lookup", "owner": "o".repeat(300), "route": "GET /"}),
+        ] {
+            assert_eq!(answer(Ok(&bad), &e, true)["error"], "bad_request", "{bad}");
+        }
+        let agent_v2 = answer(Ok(&json!({"version": 2, "request": "tables"})), &e, true);
+        assert_eq!(agent_v2["error"], "forbidden");
         assert_eq!(
             answer(Err(&"x".to_owned()), &e, false)["error"],
             "bad_request"
@@ -476,10 +791,17 @@ mod tests {
         let c = UnixListener::from_std(bound.control.try_clone().unwrap()).unwrap();
         let e = engine();
         tokio::spawn(serve_aggregates(a, e, access));
-        tokio::spawn(serve_control(c));
+        tokio::spawn(serve_control(c, None));
         let v = query(&agg, "counts").await.unwrap();
         assert_eq!(v["packet_unit"], "skb");
-        let v = query(&ctl, "pcap").await.unwrap();
+        let v = send(
+            &ctl,
+            &json!({"version": 1, "request": "pcap", "seconds": 5}),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        // Not root: refused by SO_PEERCRED although this user owns the socket file.
         let expected = if own == 0 {
             "not_available"
         } else {

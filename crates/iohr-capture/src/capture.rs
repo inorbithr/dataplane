@@ -6,7 +6,8 @@
 //! 1. refuse kernels older than 5.8 or without BTF;
 //! 2. load the programs, write their settings, attach them to ingress and egress (TCX on
 //!    6.6+, netlink filters before, after removing filters a killed run left behind);
-//! 3. take the maps and the ring buffer, prepare the sockets' directory (filesystem work);
+//! 3. take the maps and the ring buffers, prepare the sockets' directory and, with
+//!    packets on, the pcap directory (filesystem work);
 //! 4. drop capabilities while still single-threaded: everything on TCX; on netlink keep
 //!    `CAP_NET_ADMIN` to remove the filters on exit, and before 6.5 also `CAP_BPF`,
 //!    because those kernels check it on every `bpf()` call when unprivileged BPF is
@@ -28,9 +29,10 @@ use aya::{
     },
 };
 use iohr_capture_common::{
-    CLASS_SLOTS, CLASSES_MAP, CONFIG_HEADERS, CONFIG_MAP, CONFIG_PROTOCOLS, COUNTERS_MAP, Config,
-    Counters, EGRESS, EGRESS_PROGRAM, EVENTS_MAP, FLAG_SLOTS, FLAGS_MAP, INGRESS, INGRESS_PROGRAM,
-    PORT_ENTRIES, PORTS_MAP, PortCounters, PortKey, STATS_MAP,
+    CLASS_SLOTS, CLASSES_MAP, CONFIG_HEADERS, CONFIG_MAP, CONFIG_PACKETS, CONFIG_PROTOCOLS,
+    CONFIG_TIMING, COUNTERS_MAP, Config, Counters, EGRESS, EGRESS_PROGRAM, EVENTS_MAP, FLAG_SLOTS,
+    FLAGS_MAP, INGRESS, INGRESS_PROGRAM, MAX_SNAPLEN, PACKETS_MAP, PORT_ENTRIES, PORTS_MAP,
+    PortCounters, PortKey, STATS_MAP,
 };
 use rustix::thread::CapabilitySet;
 use serde::Serialize;
@@ -91,6 +93,23 @@ pub(crate) struct Options {
     pub(crate) control: PathBuf,
     pub(crate) group: String,
     pub(crate) agent_user: String,
+    /// Layer 3, `None` when off.
+    pub(crate) packets: Option<PacketOptions>,
+}
+
+/// Layer 3 settings (`--packets` and friends).
+#[derive(Debug, Clone)]
+pub(crate) struct PacketOptions {
+    pub(crate) snaplen: u32,
+    /// Copies per second per CPU; 0 = no limit.
+    pub(crate) per_sec: u64,
+    pub(crate) burst: u64,
+    pub(crate) ring_kib: u32,
+    pub(crate) buffer_mib: u32,
+    pub(crate) pcap_dir: PathBuf,
+    pub(crate) pcap_max_bytes: u64,
+    pub(crate) pcap_dir_max_bytes: u64,
+    pub(crate) pcap_retention_secs: u64,
 }
 
 /// Totals per direction.
@@ -147,9 +166,15 @@ pub(crate) fn run(opts: &Options) -> Result<Report, Error> {
     if version < kernel::MEMCG_ACCOUNTING {
         raise_memlock();
     }
-    let ring_bytes = ring_bytes(opts.ring_buffer_kib);
+    let events_size = ring_bytes(opts.ring_buffer_kib);
+    // Packets off: the second ring is one page (its programs never reach it).
+    let whole_size = opts
+        .packets
+        .as_ref()
+        .map_or(4096, |p| ring_bytes(p.ring_kib.max(256)));
     let mut ebpf = EbpfLoader::new()
-        .map_max_entries(EVENTS_MAP, ring_bytes)
+        .map_max_entries(EVENTS_MAP, events_size)
+        .map_max_entries(PACKETS_MAP, whole_size)
         .load(EBPF_OBJECT)?;
     {
         let mut config: Array<&mut MapData, Config> = ebpf
@@ -198,6 +223,11 @@ pub(crate) fn run(opts: &Options) -> Result<Report, Error> {
         ports: take(&mut ebpf, PORTS_MAP)?.try_into()?,
     };
     let ring: RingBuf<MapData> = take(&mut ebpf, EVENTS_MAP)?.try_into()?;
+    let packet_ring: Option<RingBuf<MapData>> = if opts.packets.is_some() {
+        Some(take(&mut ebpf, PACKETS_MAP)?.try_into()?)
+    } else {
+        None
+    };
 
     // The sockets' directory gets the read group and the set-group-id bit now, while
     // privileged: the parser process creates its sockets there without any chown.
@@ -217,6 +247,9 @@ pub(crate) fn run(opts: &Options) -> Result<Report, Error> {
         server::prepare_dir(dir, parser.map(|(u, _)| u), access.group_gid)
             .map_err(Error::Socket)?;
     }
+    if let Some(p) = &opts.packets {
+        crate::pcap::prepare_dir(&p.pcap_dir, parser.map(|(u, _)| u)).map_err(Error::Socket)?;
+    }
 
     let keep = keep_after_attach(mode, version);
     let started = std::time::Instant::now();
@@ -234,6 +267,19 @@ pub(crate) fn run(opts: &Options) -> Result<Report, Error> {
             .filter(|(c, _)| keep.contains(*c))
             .map(|(_, n)| (*n).to_owned())
             .collect(),
+        packets: opts.packets.as_ref().map(|p| crate::worker::PacketsConfig {
+            buffer_bytes: p.buffer_mib.clamp(1, 128) as usize * 1024 * 1024,
+            dir: p.pcap_dir.clone(),
+            max_bytes: p.pcap_max_bytes,
+            dir_max_bytes: p.pcap_dir_max_bytes,
+            retention_secs: p.pcap_retention_secs,
+            snaplen: p.snaplen,
+            linktype: if l2_len(&opts.interface) == 14 {
+                1
+            } else {
+                101
+            },
+        }),
     };
     let (counts, remaining) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -243,7 +289,7 @@ pub(crate) fn run(opts: &Options) -> Result<Report, Error> {
             // then this process drops (still one thread: the runtime has no other).
             let child = spawn_parser(&worker, parser)?;
             let (remaining, _) = privileges::drop_all_but(keep)?;
-            let counts = relay(opts, mode, &remaining, &maps, ring, child).await?;
+            let counts = relay(opts, mode, &remaining, &maps, ring, packet_ring, child).await?;
             Ok::<_, Error>((counts, remaining))
         })?;
     let seconds = started.elapsed().as_secs_f64();
@@ -300,13 +346,28 @@ fn kernel_config(opts: &Options, l2_len: u32) -> Config {
     if opts.layers.protocols {
         flags |= CONFIG_PROTOCOLS;
     }
+    if opts.layers.timing {
+        flags |= CONFIG_TIMING;
+    }
+    let (snaplen, pkt_interval_ns, pkt_burst) = match &opts.packets {
+        Some(p) => {
+            flags |= CONFIG_PACKETS;
+            let i = 1_000_000_000u64
+                .checked_div(p.per_sec)
+                .map_or(0, |i| i.max(1));
+            (p.snaplen.clamp(64, MAX_SNAPLEN), i, p.burst.max(1))
+        }
+        None => (0, 0, 1),
+    };
     Config {
         interval_ns,
         burst_ns: interval_ns.saturating_mul(opts.burst.max(1)),
         l2_len,
         first_packets: opts.first_packets,
         flags,
-        reserved: 0,
+        snaplen,
+        pkt_interval_ns,
+        pkt_burst_ns: pkt_interval_ns.saturating_mul(pkt_burst),
     }
 }
 
@@ -381,6 +442,45 @@ fn spawn_parser(
 /// Records handed to the parser per wake-up of the ring buffer before the other events
 /// get a turn.
 const BATCH: usize = 8192;
+/// And at most this many bytes of them (whole packets are up to 64 KiB each).
+const BATCH_BYTES: usize = 1024 * 1024;
+
+type Ring = AsyncFd<RingBuf<MapData>>;
+
+/// Waits until the packets ring has records; never, when packets are off.
+async fn readable(
+    r: &mut Option<Ring>,
+) -> io::Result<tokio::io::unix::AsyncFdReadyMutGuard<'_, RingBuf<MapData>>> {
+    match r {
+        Some(r) => r.readable_mut().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Frames up to [`BATCH`] records of a ready ring into `batch`; true when the ring is
+/// empty (readiness is cleared then).
+fn drain(
+    guard: &mut tokio::io::unix::AsyncFdReadyMutGuard<'_, RingBuf<MapData>>,
+    kind: u8,
+    batch: &mut Vec<u8>,
+) -> bool {
+    batch.clear();
+    for _ in 0..BATCH {
+        if batch.len() >= BATCH_BYTES {
+            return false;
+        }
+        if let Some(item) = guard.get_inner_mut().next() {
+            let _ = crate::worker::frame(kind, &item, batch);
+        } else {
+            // Readiness is cleared only once the ring is empty: the kernel wakes a reader
+            // when the consumer catches up with the producer, so clearing with records
+            // left would wait for a wake-up that never comes.
+            guard.clear_ready();
+            return true;
+        }
+    }
+    false
+}
 
 /// The privileged process's loop: copy ring-buffer records and map readings to the parser
 /// process (never parse them), until the time is up or a signal arrives; then close the
@@ -392,9 +492,10 @@ async fn relay(
     remaining: &Remaining,
     maps: &Maps,
     ring: RingBuf<MapData>,
+    packet_ring: Option<RingBuf<MapData>>,
     mut child: tokio::process::Child,
 ) -> Result<serde_json::Value, Error> {
-    use crate::worker::{FRAME_KERNEL, FRAME_RECORD, frame};
+    use crate::worker::{FRAME_KERNEL, FRAME_PACKET, FRAME_RECORD, frame};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::signal::unix::{SignalKind, signal};
     let mut term = signal(SignalKind::terminate())?;
@@ -408,6 +509,10 @@ async fn relay(
         .take()
         .ok_or_else(|| io::Error::other("no pipe from the parser"))?;
     let mut ring = AsyncFd::with_interest(ring, tokio::io::Interest::READABLE)?;
+    let mut packet_ring = match packet_ring {
+        Some(r) => Some(AsyncFd::with_interest(r, tokio::io::Interest::READABLE)?),
+        None => None,
+    };
     let mut poll = tokio::time::interval(opts.poll);
     let mut last_warn: Option<std::time::Instant> = None;
     tracing::info!(
@@ -434,22 +539,18 @@ async fn relay(
             }
             guard = ring.readable_mut() => {
                 let mut guard = guard?;
-                batch.clear();
-                let mut drained = false;
-                for _ in 0..BATCH {
-                    if let Some(item) = guard.get_inner_mut().next() {
-                        let _ = frame(FRAME_RECORD, &item, &mut batch);
-                    } else {
-                        drained = true;
-                        break;
-                    }
+                let drained = drain(&mut guard, FRAME_RECORD, &mut batch);
+                drop(guard);
+                if let Err(e) = send(&mut to_parser, &batch).await {
+                    break Err(Error::Runtime(e));
                 }
-                // Readiness is cleared only once the ring is empty: the kernel wakes a
-                // reader when the consumer catches up with the producer, so clearing with
-                // records left would wait for a wake-up that never comes.
-                if drained {
-                    guard.clear_ready();
+                if !drained {
+                    tokio::task::yield_now().await;
                 }
+            }
+            guard = readable(&mut packet_ring) => {
+                let mut guard = guard?;
+                let drained = drain(&mut guard, FRAME_PACKET, &mut batch);
                 drop(guard);
                 if let Err(e) = send(&mut to_parser, &batch).await {
                     break Err(Error::Runtime(e));
@@ -668,11 +769,40 @@ mod tests {
             control: "/run/iohr-capture/control.sock".into(),
             group: "iohr-capture-read".into(),
             agent_user: "iohr-agent".into(),
+            packets: None,
         };
         let c = kernel_config(&opts, 14);
         assert_eq!(c.interval_ns, 500_000);
         assert_eq!(c.burst_ns, 250_000_000);
         assert_eq!(c.flags, CONFIG_HEADERS | CONFIG_PROTOCOLS);
+        assert_eq!((c.snaplen, c.pkt_interval_ns), (0, 0));
+        let p = kernel_config(
+            &Options {
+                layers: Layers::parse("headers,protocols,timing").unwrap(),
+                packets: Some(PacketOptions {
+                    snaplen: 100_000,
+                    per_sec: 1000,
+                    burst: 200,
+                    ring_kib: 8192,
+                    buffer_mib: 32,
+                    pcap_dir: "/var/lib/iohr-capture/pcap".into(),
+                    pcap_max_bytes: 1 << 26,
+                    pcap_dir_max_bytes: 1 << 29,
+                    pcap_retention_secs: 3600,
+                }),
+                ..opts.clone()
+            },
+            14,
+        );
+        assert_eq!(
+            p.flags,
+            CONFIG_HEADERS | CONFIG_PROTOCOLS | CONFIG_TIMING | CONFIG_PACKETS
+        );
+        assert_eq!(p.snaplen, MAX_SNAPLEN);
+        assert_eq!(
+            (p.pkt_interval_ns, p.pkt_burst_ns),
+            (1_000_000, 200_000_000)
+        );
         let unlimited = kernel_config(
             &Options {
                 samples_per_sec: 0,

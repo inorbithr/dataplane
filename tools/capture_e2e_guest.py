@@ -29,6 +29,14 @@ For each attach mode the kernel offers (netlink always, TCX from Linux 6.6) it:
    - no drops at this rate; privileges dropped before parsing; nothing left on the
      interface afterwards.
 
+Phase 2 (`phase2`, once per kernel): a server with fixed delays per route (HTTP/1 over
+keep-alive, h2c, gRPC with trailers) in their own cgroups; the version 2 lookup, asked as
+the agent's user, must put every request in the histogram bucket its delay belongs to,
+with the right status classes and gRPC codes. With `--packets`, root asks the control
+socket for pcap files (`last` and `next`), a non-root peer is refused, `dissect` runs the
+host's tshark as an unprivileged user on the copy made for it (and refuses root), and the
+companion's file is deleted after its retention.
+
 Then a flood (UDP to 40000 distinct ports) with a 4 KiB ring buffer and a 512-flow table
 proves drops are counted (ring buffer full, flows evicted) while totals stay exact and
 memory bounded, and a second flood with a 100/s rate limit proves rate-limited copies are
@@ -595,6 +603,354 @@ def rss_kib(pid):
     return -1
 
 
+T_HTTP_PORT = 8088  # in Wireshark's default HTTP ports, so tshark dissects it as HTTP
+T_H2_PORT, T_GRPC_OK_PORT, T_GRPC_FAIL_PORT = 50052, 50053, 50054
+T_CGROUP = "/sys/fs/cgroup/iohr-e2e-timing"
+T_H2_CGROUP = "/sys/fs/cgroup/iohr-e2e-h2"
+N_TIMED = 10
+N_SLOWER = 3
+N_H2_TIMED = 5
+
+# HTTP/1.1 with keep-alive; the route decides the delay.
+TIMING_HTTP = f"""
+import http.server, time
+DELAYS = {{"fast": 0, "mid": 0.035, "slow": 0.150, "slower": 0.700}}
+class H(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def do_GET(self):
+        time.sleep(DELAYS.get(self.path.split("/")[1], 0))
+        self.send_response(200 if not self.path.startswith("/missing") else 404)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"ok")
+    def log_message(self, *a):
+        pass
+http.server.ThreadingHTTPServer(("{CAP_ADDR}", {T_HTTP_PORT}), H).serve_forever()
+"""
+
+# h2c and gRPC: one stream per connection (curl), the port decides delay and answer.
+TIMING_H2 = f"""
+import socket, struct, threading, time
+def frame(kind, flags, stream, payload):
+    return len(payload).to_bytes(3, "big") + bytes([kind, flags]) + struct.pack(">I", stream) + payload
+def lit(name, value):
+    return bytes([0, len(name)]) + name + bytes([len(value)]) + value
+def serve(port, delay, answer):
+    l = socket.socket()
+    l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    l.bind(("{CAP_ADDR}", port))
+    l.listen(64)
+    while True:
+        c, _ = l.accept()
+        threading.Thread(target=conv, args=(c, delay, answer), daemon=True).start()
+def conv(c, delay, answer):
+    c.settimeout(5)
+    try:
+        c.sendall(frame(4, 0, 0, b""))
+        buf = b""
+        ended = False
+        while not ended:
+            chunk = c.recv(4096)
+            if not chunk:
+                return
+            buf += chunk
+            frames = buf[24:]
+            while len(frames) >= 9:
+                n = int.from_bytes(frames[:3], "big")
+                if frames[3] in (0, 1) and frames[4] & 1:
+                    ended = True
+                frames = frames[9 + n:]
+        time.sleep(delay)
+        c.sendall(frame(4, 1, 0, b""))
+        if answer == "h2":
+            c.sendall(frame(1, 5, 1, bytes([0x88])))
+        elif answer == "grpc-ok":
+            c.sendall(frame(1, 4, 1, bytes([0x88])) + frame(0, 0, 1, bytes(5))
+                      + frame(1, 5, 1, lit(b"grpc-status", b"0")))
+        else:
+            c.sendall(frame(1, 5, 1, bytes([0x88]) + lit(b"grpc-status", b"5")))
+        time.sleep(0.2)
+    except OSError:
+        pass
+    finally:
+        c.close()
+for port, delay, answer in (({T_H2_PORT}, 0.150, "h2"), ({T_GRPC_OK_PORT}, 0.120, "grpc-ok"), ({T_GRPC_FAIL_PORT}, 0.700, "grpc-fail")):
+    threading.Thread(target=serve, args=(port, delay, answer), daemon=True).start()
+while True:
+    time.sleep(60)
+"""
+
+# One keep-alive connection per route, from the peer.
+TIMING_CLIENT = f"""
+import http.client
+for route, n in (("fast", {N_TIMED}), ("mid", {N_TIMED}), ("slow", {N_TIMED}), ("slower", {N_SLOWER}), ("missing", 2)):
+    c = http.client.HTTPConnection("{CAP_ADDR}", {T_HTTP_PORT}, timeout=10)
+    for i in range(n):
+        c.request("GET", f"/{{route}}/{{1000 + i}}?user=secret-{{i}}")
+        r = c.getresponse()
+        r.read()
+    c.close()
+"""
+
+
+def bucket_counts(answer):
+    return answer.get("latency_ms", {}).get("counts", [0] * 15)
+
+
+def lookup_as(binary, uid, owner, route):
+    r = subprocess.run(["setpriv", f"--reuid={uid}", f"--regid={uid}", "--clear-groups", "--inh-caps=-all",
+                        "--bounding-set=-all", binary, "lookup", "--socket", f"{SCRATCH}/sock/aggregates.sock",
+                        "--owner", owner, "--route", route], capture_output=True, text=True, timeout=15)
+    try:
+        return json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return {"error": r.stderr[-300:]}
+
+
+def control_as(uid, path, request):
+    """A raw control socket request as another uid: the answer, or the connect error."""
+    code = (f"import socket, json\ns = socket.socket(socket.AF_UNIX)\n"
+            f"try:\n    s.connect({path!r})\nexcept OSError as e:\n    print(json.dumps({{'connect': e.errno}})); raise SystemExit\n"
+            f"s.sendall({json.dumps(request)!r}.encode() + b'\\n')\nd = b''\n"
+            f"while True:\n    c = s.recv(4096)\n    if not c: break\n    d += c\nprint(d.decode())")
+    # Root keeps its capabilities (it reaches the 0600 socket of another user through them).
+    drop = [] if uid == "0" else ["setpriv", f"--reuid={uid}", f"--regid={uid}", "--clear-groups",
+                                  "--inh-caps=-all", "--bounding-set=-all"]
+    r = subprocess.run(drop + ["python3", "-c", code], capture_output=True, text=True, timeout=15)
+    try:
+        return json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return {"raw": r.stdout[-300:] + r.stderr[-300:]}
+
+
+def phase2(binary, version):
+    """Layer 7 timing against known delays, lookup v2, and layer 3 pcap on request."""
+    setup()
+    pcap_dir = f"{SCRATCH}/pcap"
+    shutil.rmtree(pcap_dir, ignore_errors=True)
+    for cg in (T_CGROUP, T_H2_CGROUP):
+        os.makedirs(cg, exist_ok=True)
+    servers = [
+        subprocess.Popen(["sh", "-c", f'echo $$ > {T_CGROUP}/cgroup.procs && exec python3 -c "$0"', TIMING_HTTP]),
+        subprocess.Popen(["sh", "-c", f'echo $$ > {T_H2_CGROUP}/cgroup.procs && exec python3 -c "$0"', TIMING_H2]),
+    ]
+    for _ in range(50):
+        if all(port_open(p) for p in (T_HTTP_PORT, T_H2_PORT, T_GRPC_OK_PORT, T_GRPC_FAIL_PORT)):
+            break
+        time.sleep(0.1)
+    proc, log = start_capture(binary, "auto", ["--packets", "--pcap-dir", pcap_dir, "--pcap-retention-secs", "6"])
+    time.sleep(1.5)  # owners known (two polls) before the first request
+    client = peer(["python3", "-c", TIMING_CLIENT], timeout=120)
+    for i in range(N_H2_TIMED):
+        peer(["curl", "-s", "-m", "5", "--http2-prior-knowledge", f"http://{CAP_ADDR}:{T_H2_PORT}/h2slow/{i + 1}"])
+        for port, method in ((T_GRPC_OK_PORT, "/e2e.Timing/Mid"), (T_GRPC_FAIL_PORT, "/e2e.Timing/Fail")):
+            peer(["curl", "-s", "-m", "5", "--http2-prior-knowledge", "-X", "POST", "-H", "content-type: application/grpc",
+                  "-H", "te: trailers", "--data-binary", "x", f"http://{CAP_ADDR}:{port}{method}"])
+    time.sleep(2.0)
+    agent = "65534"  # nobody is the agent's user here: lookups yes, tables never
+    web, h2 = "cgroup:/iohr-e2e-timing", "cgroup:/iohr-e2e-h2"
+    L = {name: lookup_as(binary, agent, owner, route) for name, owner, route in (
+        ("fast", web, "GET /fast/{id}"), ("mid", web, "GET /mid/{id}"), ("slow", web, "GET /slow/{id}"),
+        ("slower", web, "GET /slower/{id}"), ("missing", web, "GET /missing/{id}"),
+        ("h2slow", h2, "GET /h2slow/{id}"), ("grpc_ok", h2, "POST /e2e.Timing/Mid"),
+        ("grpc_fail", h2, "POST /e2e.Timing/Fail"), ("unknown", web, "GET /never/{id}"),
+        ("other_owner", "cgroup:/nobody-here", "GET /mid/{id}"))}
+    snap, _ = query(binary, tables=True)
+    agent_tables, agent_tables_raw = query(binary, tables=True, user=("65534", "65534", ["--clear-groups"]))
+    # Layer 3: pcap on request.
+    ctl = f"{SCRATCH}/sock/control.sock"
+    # The copy is created as the sudo user (nobody here), so in a directory nobody owns.
+    nobody_dir = f"{SCRATCH}/nobody"
+    os.makedirs(nobody_dir, exist_ok=True)
+    os.chown(nobody_dir, 65534, 65534)
+    out_copy = f"{nobody_dir}/for-nobody.pcapng"
+    if os.path.exists(out_copy):
+        os.unlink(out_copy)
+    env = dict(os.environ, SUDO_UID="65534", SUDO_GID="65534")
+    last = subprocess.run([binary, "pcap", "--control-socket", ctl, "--pcap-dir", pcap_dir, "--seconds", "60",
+                           "--filter", f"tcp and port {T_HTTP_PORT}", "--out", out_copy, "--json"], capture_output=True, text=True, timeout=60, env=env)
+    try:
+        last_answer = json.loads(last.stdout)
+    except json.JSONDecodeError:
+        last_answer = {"raw": last.stderr[-500:]}
+    companion_file = last_answer.get("path", "")
+    file_mode = oct(os.stat(companion_file).st_mode & 0o777) if os.path.exists(companion_file) else None
+    copy_stat = os.stat(out_copy) if os.path.exists(out_copy) else None
+    nobody_env = ["env", "HOME=/tmp", "XDG_CONFIG_HOME=/tmp"]
+    dissected = subprocess.run(["setpriv", "--reuid=65534", "--regid=65534", "--clear-groups", "--inh-caps=-all",
+                                "--bounding-set=-all"] + nobody_env + [binary, "dissect", out_copy],
+                               capture_output=True, text=True, timeout=120)
+    as_root = subprocess.run([binary, "dissect", out_copy], capture_output=True, text=True, timeout=30)
+    tshark_lines = [l for l in dissected.stdout.splitlines() if l.strip()]
+    # `next`: the coming seconds, while a few requests run.
+    nxt = subprocess.Popen([binary, "pcap", "--control-socket", ctl, "--seconds", "3", "--next", "--json"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    time.sleep(0.5)
+    for i in range(3):
+        peer(["curl", "-s", "-o", "/dev/null", f"http://{CAP_ADDR}:{T_HTTP_PORT}/fast/{i}"])
+    nxt_out, nxt_err = nxt.communicate(timeout=60)
+    try:
+        next_answer = json.loads(nxt_out)
+    except json.JSONDecodeError:
+        next_answer = {"raw": nxt_err[-500:]}
+    next_read = subprocess.run(["tshark", "-n", "-r", next_answer.get("path", "/nonexistent")],
+                               capture_output=True, text=True, timeout=60)
+    # Not root: the parser's own user reaches the socket file but is refused by SO_PEERCRED;
+    # another user cannot even connect (0600).
+    as_owner = control_as("65534", ctl, {"version": 1, "request": "pcap", "seconds": 5})
+    as_other = control_as("2", ctl, {"version": 1, "request": "pcap", "seconds": 5})
+    pcap_cli_nonroot = subprocess.run(["setpriv", "--reuid=65534", "--regid=65534", "--clear-groups", "--inh-caps=-all",
+                                       "--bounding-set=-all", binary, "pcap", "--control-socket", ctl],
+                                      capture_output=True, text=True, timeout=15)
+    dir_mode = oct(os.stat(pcap_dir).st_mode & 0o777) if os.path.exists(pcap_dir) else None
+    # Retention: 6 s, swept every poll.
+    deadline = time.time() + 20
+    while time.time() < deadline and os.path.exists(companion_file):
+        time.sleep(0.5)
+    deleted = not os.path.exists(companion_file)
+    status_after = control_as("0", ctl, {"version": 1, "request": "status"})
+    subprocess.run([binary, "pcap", "--control-socket", ctl, "--pcap-dir", pcap_dir, "--seconds", "5"],
+                   capture_output=True, text=True, timeout=30)
+    report = stop_capture(proc, log, "phase2")
+    # When the companion stops, its cleanup removes the pcap files that are left.
+    leftover = [f for f in os.listdir(pcap_dir) if f.startswith("iohr-")] if os.path.isdir(pcap_dir) else []
+    sh(f"{binary} cleanup --interface veth-cap --pcap-dir {pcap_dir}", check=False)
+    after_cleanup = [f for f in os.listdir(pcap_dir) if f.startswith("iohr-")] if os.path.isdir(pcap_dir) else []
+    for p in servers:
+        p.kill()
+        p.wait()
+    sh("ip netns del peer", check=False)
+    sh("ip link del veth-cap", check=False)
+
+    def ok(name, n, bucket=None, status="2xx", below=None):
+        a = L[name]
+        c = bucket_counts(a)
+        good = a.get("found") is True and a.get("requests") == n and a.get("responses") == n \
+            and a.get("status_classes", {}).get(status) == n
+        if bucket is not None:
+            good = good and c[bucket] == n
+        if below is not None:
+            good = good and sum(c[:below + 1]) == n
+        return good
+
+    t = (snap or {}).get("timing", {})
+    checks = {
+        "timing_client_ok": client.returncode == 0,
+        # HTTP/1 over keep-alive: every request in its delay's bucket (bounds 25 50 100 250 500 1000 ms).
+        "http1_fast_under_25ms": ok("fast", N_TIMED, below=5),
+        "http1_mid_25_to_50ms": ok("mid", N_TIMED, bucket=6),
+        "http1_slow_100_to_250ms": ok("slow", N_TIMED, bucket=8),
+        "http1_slower_500_to_1000ms": ok("slower", N_SLOWER, bucket=10),
+        "http1_404_class": ok("missing", 2, status="4xx"),
+        "h2c_150ms_bucket": ok("h2slow", N_H2_TIMED, bucket=8),
+        # 120 ms plus the client's upload of its message (curl sends DATA after HEADERS).
+        "grpc_ok_120ms_and_status_0": ok("grpc_ok", N_H2_TIMED, bucket=8)
+        and L["grpc_ok"].get("grpc_status", {}).get("0") == N_H2_TIMED,
+        "grpc_fail_700ms_and_status_5": ok("grpc_fail", N_H2_TIMED, bucket=10)
+        and L["grpc_fail"].get("grpc_status", {}).get("5") == N_H2_TIMED,
+        "lookup_unknown_route_not_found": L["unknown"].get("found") is False and L["unknown"].get("requests") == 0,
+        "lookup_other_owner_not_found": L["other_owner"].get("found") is False,
+        "lookup_owner_tcp_known": L["mid"].get("owner_tcp", {}).get("found") is True,
+        "lookup_carries_no_names": not any(k in json.dumps(L) for k in ("iohr-e2e", "/mid/", "e2e.Timing", "secret-")),
+        "agent_user_still_gets_no_tables": agent_tables is None and "forbidden" in agent_tables_raw.stderr,
+        "timing_totals_in_counts": t.get("requests", 0) >= 3 * N_TIMED + N_SLOWER + 2 + 3 * N_H2_TIMED
+        and t.get("unsynced") == 0,
+        "no_query_strings_anywhere": "secret-" not in json.dumps(snap),
+        "timing_layer_announced": "timing" in (snap or {}).get("layers", []) and "packets" in (snap or {}).get("layers", []),
+        # Layer 3.
+        "pcap_last_written": last.returncode == 0 and last_answer.get("packets", 0) > 0,
+        "pcap_file_0600": file_mode == "0o600",
+        "pcap_dir_0700": dir_mode == "0o700",
+        "pcap_copy_for_the_person": copy_stat is not None and copy_stat.st_uid == 65534
+        and oct(copy_stat.st_mode & 0o777) == "0o600",
+        "dissect_as_person_reads_it": dissected.returncode == 0 and len(tshark_lines) >= 10
+        and any("HTTP" in l for l in tshark_lines) and any("GET /mid/" in l for l in tshark_lines),
+        "dissect_refuses_root": as_root.returncode == 2,
+        "pcap_next_written": nxt.returncode == 0 and next_read.returncode == 0
+        and len([l for l in next_read.stdout.splitlines() if l.strip()]) > 0,
+        "control_refuses_own_user": as_owner.get("error") == "forbidden",
+        "control_refuses_others": "connect" in as_other or as_other.get("error") == "forbidden",
+        "pcap_cli_refuses_non_root": pcap_cli_nonroot.returncode == 2,
+        "pcap_deleted_after_retention": deleted,
+        "person_copy_kept": os.path.exists(out_copy),
+        "cleanup_removes_pcap_files_on_stop": len(leftover) > 0 and after_cleanup == [],
+        "packets_copied_without_drops": status_after.get("received", 0) > 0
+        and (snap or {}).get("packets", {}).get("ring_buffer_full", 1) == 0,
+    }
+    return {
+        "checks": checks,
+        "lookups": L,
+        "timing": t,
+        "packets": (snap or {}).get("packets"),
+        "pcap_last": last_answer,
+        "pcap_next": next_answer,
+        "tshark_head": tshark_lines[:12],
+        "dissect_stderr": dissected.stderr[-500:],
+        "as_owner": as_owner,
+        "as_other": as_other,
+        "status_after": status_after,
+        "next_read_stderr": next_read.stderr[-500:],
+        "next_stderr": nxt_err[-500:],
+        "attach": report["attach"],
+        "client_stderr": client.stderr[-1000:],
+    }
+
+
+SINK_PORT = 8099
+N_SINK_CONNS = 2500
+SINK = f"""
+import resource, socket, threading
+resource.setrlimit(resource.RLIMIT_NOFILE, (20000, 20000))
+l = socket.socket()
+l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+l.bind(("{CAP_ADDR}", {SINK_PORT}))
+l.listen(4096)
+held = []
+while True:
+    c, _ = l.accept()
+    held.append(c)  # read nothing, answer nothing
+"""
+SINK_CLIENT = f"""
+import resource, socket, time
+resource.setrlimit(resource.RLIMIT_NOFILE, (20000, 20000))
+req = b"GET /flood/1 HTTP/1.1\\r\\nHost: f\\r\\n\\r\\n"
+conns = []
+for i in range({N_SINK_CONNS}):
+    s = socket.create_connection(("{CAP_ADDR}", {SINK_PORT}))
+    for k in range(16):
+        s.sendall(req)
+    conns.append(s)
+    if i % 100 == 99:
+        time.sleep(0.05)
+time.sleep(3)
+"""
+
+
+def timing_flood(binary):
+    """Requests that are never answered on 2500 connections (40000 waiting): the timing
+    budget caps what the parser holds, the rest is counted, memory stays bounded."""
+    setup()
+    sink = subprocess.Popen(["python3", "-c", SINK])
+    for _ in range(50):
+        if port_open(SINK_PORT):
+            break
+        time.sleep(0.1)
+    proc, log = start_capture(binary, "auto", ["--samples-per-sec", "0", "--ring-buffer-kib", "16384"])
+    peer(["python3", "-c", SINK_CLIENT], timeout=180)
+    time.sleep(1.5)
+    parent_rss = rss_kib(proc.pid)
+    snap, raw = query(binary, tables=False)
+    stop_capture(proc, log, "timing flood")
+    sink.kill()
+    sink.wait()
+    sh("ip netns del peer", check=False)
+    sh("ip link del veth-cap", check=False)
+    if snap is None:
+        raise SystemExit(f"no answer during the timing flood: {raw.stderr}")
+    return {"budget": snap["timing"]["budget"], "memory": snap["memory"], "parent_rss_kib": parent_rss,
+            "drops": snap["drops"], "flows": snap["flows"]}
+
+
 def flood(binary, mode, extra):
     """A flood of new UDP flows: totals stay exact, drops are counted, memory bounded, and
     layer 2 keeps working afterwards (5 DNS queries after the flood must be counted)."""
@@ -624,6 +980,7 @@ def flood(binary, mode, extra):
         "memory": snap["memory"],
         "parent_rss_kib": parent_rss,
         "dns_after_flood": snap["protocols"]["dns_queries"],
+        "packets": snap.get("packets"),
         "totals_exact": report["ingress"]["packets"] == delta["rx_packets"],
     }
 
@@ -691,6 +1048,13 @@ def unit_test(binary, version):
     with open("/etc/systemd/system/iohr-e2e.target", "w") as f:
         f.write("[Unit]\nDescription=iohr-capture e2e\nRequires=iohr-capture.service\nAfter=iohr-capture.service\n")
     sh("ip link set lo up", check=False)
+    # The unit's StateDirectory= (pcap files) needs a writable /var/lib; the guest sees the
+    # host's files read-only, so give it a throwaway one.
+    try:
+        os.makedirs("/var/lib/.iohr-e2e-probe", exist_ok=True)
+        os.rmdir("/var/lib/.iohr-e2e-probe")
+    except OSError:
+        sh("mount -t tmpfs -o mode=755 none /var/lib", check=False)
     web = subprocess.Popen(["python3", "-m", "http.server", "18080", "--bind", "127.0.0.1", "--directory", SCRATCH],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     systemd = subprocess.Popen(["unshare", "--pid", "--fork", "--mount-proc", "/usr/lib/systemd/systemd", "--system",
@@ -730,6 +1094,7 @@ def unit_test(binary, version):
     outsider, outsider_err = stats_as(65534, 65534, 65534, False)
     dir_stat = sh(f"{ns} stat -c '%a %G %U' /run/iohr-capture", check=False).stdout.strip()
     sock_stat = sh(f"{ns} stat -c '%a %G' /run/iohr-capture/aggregates.sock", check=False).stdout.strip()
+    pcap_stat = sh(f"{ns} stat -c '%a %U' /var/lib/iohr-capture/pcap", check=False).stdout.strip()
     journal = sh(f"{ns} journalctl -u iohr-capture --no-pager", check=False).stdout
     restarts = sh("dmesg", check=False).stdout.count("iohr-capture.service: Scheduled restart")
     main_pid = sh("pgrep -f '^/usr/bin/iohr-capture run'", check=False).stdout.split()
@@ -764,6 +1129,7 @@ def unit_test(binary, version):
         "no_failure_no_restart": "capture failed" not in journal and restarts == 0,
         "runtime_dir_setgid_read_group": dir_stat == "2750 iohr-capture-read iohr-capture",
         "socket_0660_read_group": sock_stat == "660 iohr-capture-read",
+        "pcap_state_dir_0700": pcap_stat == "700 iohr-capture",
         "reader_gets_tables": top(hosts, "unit.e2e.test") >= 3,
         "agent_gets_counts": agent_counts is not None and "tables" not in agent_counts,
         "agent_gets_no_tables": agent_tables is None and "forbidden" in agent_err,
@@ -778,6 +1144,7 @@ def unit_test(binary, version):
         "checks": checks,
         "dir": dir_stat,
         "socket": sock_stat,
+        "pcap_dir": pcap_stat,
         "http1_requests_on_lo": (reader or {}).get("protocols", {}).get("http1_requests"),
         "companion_kept": (reader or {}).get("privileges", {}).get("companion_kept"),
         "journal_tail": journal[-3000:],
@@ -819,11 +1186,22 @@ def main():
     limited = flood(binary, "auto", ["--samples-per-sec", "100", "--burst", "10"])
     # A large ring and no rate limit: the reader must keep up and never stall.
     unlimited = flood(binary, "auto", ["--samples-per-sec", "0", "--ring-buffer-kib", "16384"])
+    # Whole packets under the flood: the buffer stays at its 4 MiB, older packets go out.
+    packets = flood(binary, "auto", ["--packets", "--packets-per-sec", "0", "--packets-buffer-mib", "4",
+                                     "--pcap-dir", f"{SCRATCH}/pcap-flood"])
+    tflood = timing_flood(binary)
     results["flood"] = {
         "small_ring": small,
         "rate_limited": limited,
         "unlimited": unlimited,
+        "packets": packets,
+        "timing": tflood,
         "checks": {
+            "timing_budget_holds": tflood["budget"]["pending_peak"] <= tflood["budget"]["pending_max"]
+            and tflood["budget"]["refused"] > 0
+            and tflood["memory"]["rss_kib"] < 64 * 1024,
+            "packets_buffer_bounded": packets["packets"]["buffered_bytes"] <= 4 * 1024 * 1024
+            and packets["packets"]["buffer_evicted"] > 0 and packets["totals_exact"],
             "layer2_alive_after_unlimited_flood": unlimited["dns_after_flood"] == 5,
             "reader_caught_up": unlimited["copy"]["records_read"] == unlimited["copy"]["records_copied"],
             "totals_exact_under_flood": small["totals_exact"] and limited["totals_exact"],
@@ -831,12 +1209,14 @@ def main():
             "flows_evicted_counted": small["flows"]["evicted"] > 0 and small["flows"]["active"] <= 512,
             "rate_limited_counted": limited["drops"]["rate_limited"] > 0,
             "memory_bounded": max(f[k] if k == "parent_rss_kib" else f["memory"]["rss_kib"]
-                                  for f in (small, limited, unlimited) for k in ("parent_rss_kib", "memory")) < 64 * 1024,
+                                  for f in (small, limited, unlimited, packets) for k in ("parent_rss_kib", "memory")) < 64 * 1024,
         },
     }
     ok = results["doctor"]["doctor_root_exit_0"] and results["doctor"]["doctor_unprivileged_exit_1"]
     ok = ok and all(all(m["checks"].values()) for m in results["modes"])
     ok = ok and all(results["flood"]["checks"].values())
+    results["phase2"] = phase2(binary, version)
+    ok = ok and all(results["phase2"]["checks"].values())
     results["unit"] = unit_test(binary, version)
     ok = ok and all(results["unit"]["checks"].values())
     results["ok"] = ok

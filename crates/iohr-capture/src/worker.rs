@@ -5,9 +5,10 @@
 //! and does nothing with packet bytes but copy them. It starts this process
 //! (`iohr-capture worker`, internal) with a pipe as standard input and writes framed
 //! ring-buffer records and map readings into it. The worker drops every capability before
-//! anything else, so all parsing, the flow table, `sock_diag`, the cgroup walk and both
-//! sockets run with an empty capability set on every kernel. When the pipe closes it
-//! prints its last `counts` answer (numbers only) on standard output and exits.
+//! anything else, so all parsing, the flow table, `sock_diag`, the cgroup walk, both
+//! sockets, the packet buffer and the pcap files (layer 3) run with an empty capability
+//! set on every kernel. When the pipe closes it prints its last `counts` answer (numbers
+//! only) on standard output and exits.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -19,11 +20,13 @@ use tokio::io::{AsyncRead, AsyncReadExt as _};
 
 use crate::engine::{Engine, KernelReading, Layers, Settings};
 use crate::owners::CgroupIndex;
-use crate::{privileges, procnet, server, sockdiag};
+use crate::{pcap, privileges, procnet, server, sockdiag};
 
 /// Frame kinds on the pipe.
 pub(crate) const FRAME_RECORD: u8 = 1;
 pub(crate) const FRAME_KERNEL: u8 = 2;
+/// A whole packet from the packets ring buffer (layer 3).
+pub(crate) const FRAME_PACKET: u8 = 3;
 /// Largest frame accepted.
 pub(crate) const MAX_FRAME: usize = 1024 * 1024;
 
@@ -80,6 +83,22 @@ pub(crate) struct Config {
     pub(crate) group: String,
     pub(crate) agent_user: String,
     pub(crate) companion_kept: Vec<String>,
+    /// Layer 3: `None` when packets are off.
+    #[serde(default)]
+    pub(crate) packets: Option<PacketsConfig>,
+}
+
+/// Layer 3 settings for the parser.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PacketsConfig {
+    pub(crate) buffer_bytes: usize,
+    pub(crate) dir: PathBuf,
+    pub(crate) max_bytes: u64,
+    pub(crate) dir_max_bytes: u64,
+    pub(crate) retention_secs: u64,
+    pub(crate) snaplen: u32,
+    /// 1 (Ethernet) or 101 (raw IP).
+    pub(crate) linktype: u16,
 }
 
 /// Runs the worker; returns the last `counts` answer.
@@ -116,6 +135,7 @@ pub(crate) fn run(config: &str) -> Result<serde_json::Value, String> {
             max_flows: cfg.max_flows,
             idle: Duration::from_secs(60),
             companion_kept: cfg.companion_kept.clone(),
+            packets: cfg.packets.is_some(),
         },
         &dropped,
     )));
@@ -143,6 +163,13 @@ fn inherited_fds() -> Vec<u32> {
         .collect()
 }
 
+fn lock_packets(p: &Mutex<pcap::State>) -> std::sync::MutexGuard<'_, pcap::State> {
+    match p.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 fn lock(e: &Mutex<Engine>) -> std::sync::MutexGuard<'_, Engine> {
     match e.lock() {
         Ok(g) => g,
@@ -150,6 +177,7 @@ fn lock(e: &Mutex<Engine>) -> std::sync::MutexGuard<'_, Engine> {
     }
 }
 
+#[allow(clippy::too_many_lines)] // the parser's tasks, started and stopped in one place
 async fn serve(cfg: &Config, layers: Layers, engine: &Arc<Mutex<Engine>>) -> Result<(), String> {
     use tokio::signal::unix::{SignalKind, signal};
     // The privileged process decides when to stop: it closes the pipe. A signal to the
@@ -157,6 +185,23 @@ async fn serve(cfg: &Config, layers: Layers, engine: &Arc<Mutex<Engine>>) -> Res
     let mut term = signal(SignalKind::terminate()).map_err(|e| e.to_string())?;
     let mut int = signal(SignalKind::interrupt()).map_err(|e| e.to_string())?;
     let bound = server::bind(&cfg.aggregates, &cfg.control).map_err(|e| format!("sockets: {e}"))?;
+    let packets = cfg.packets.as_ref().map(|p| {
+        let mut state = pcap::State::new(
+            p.buffer_bytes,
+            pcap::Settings {
+                dir: p.dir.clone(),
+                max_bytes: p.max_bytes,
+                dir_max_bytes: p.dir_max_bytes,
+                retention: Duration::from_secs(p.retention_secs),
+                linktype: p.linktype,
+                snaplen: p.snaplen,
+                interface: cfg.interface.clone(),
+            },
+        );
+        // Files a previous run left past their retention go now.
+        state.files.sweep();
+        Arc::new(Mutex::new(state))
+    });
     let own_uid = rustix::process::getuid().as_raw();
     let access = server::Access::lookup(&cfg.agent_user, &cfg.group, own_uid);
     let agg = tokio::net::UnixListener::from_std(
@@ -172,7 +217,7 @@ async fn serve(cfg: &Config, layers: Layers, engine: &Arc<Mutex<Engine>>) -> Res
             Arc::clone(engine),
             Arc::new(access),
         )),
-        tokio::spawn(server::serve_control(ctl)),
+        tokio::spawn(server::serve_control(ctl, packets.clone())),
     ];
     let ignore_signals = tokio::spawn(async move {
         loop {
@@ -184,6 +229,7 @@ async fn serve(cfg: &Config, layers: Layers, engine: &Arc<Mutex<Engine>>) -> Res
     });
     let poller = {
         let engine = Arc::clone(engine);
+        let packets = packets.clone();
         let poll_ms = cfg.poll_ms;
         tokio::spawn(async move {
             let new_index = || {
@@ -218,6 +264,14 @@ async fn serve(cfg: &Config, layers: Layers, engine: &Arc<Mutex<Engine>>) -> Res
                     .await;
                     cgroups = Some(back.unwrap_or_else(|_| new_index()));
                 }
+                if let Some(p) = &packets {
+                    let info = {
+                        let mut st = lock_packets(p);
+                        st.tick();
+                        st.info()
+                    };
+                    lock(&engine).packets = info;
+                }
                 lock(&engine).tick();
             }
         })
@@ -230,6 +284,11 @@ async fn serve(cfg: &Config, layers: Layers, engine: &Arc<Mutex<Engine>>) -> Res
         match read_frame(&mut stdin, &mut buf).await {
             Ok(None) => break Ok(()),
             Ok(Some(FRAME_RECORD)) => lock(engine).ingest(&buf),
+            Ok(Some(FRAME_PACKET)) => {
+                if let (Some(p), Some(packet)) = (&packets, pcap::Packet::parse(&buf)) {
+                    lock_packets(p).push(packet);
+                }
+            }
             Ok(Some(FRAME_KERNEL)) => match serde_json::from_slice::<KernelReading>(&buf) {
                 Ok(r) => lock(engine).kernel(r),
                 Err(e) => tracing::warn!(error = %e, "a map reading did not parse"),

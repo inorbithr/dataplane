@@ -28,6 +28,10 @@ aya.workspace = true
 iohr-capture-common = { path = "../iohr-capture-common", features = ["user"] }
 rustix.workspace = true
 
+[dev-dependencies]
+# The route vectors' checksum (tests/route_vectors.json.sha256).
+sha2.workspace = true
+
 [build-dependencies]
 # Compiles crates/iohr-capture-ebpf (not a workspace member: its own Cargo.lock, nightly
 # and licence) for the BPF target; build.rs reruns when that directory changes.
@@ -44,7 +48,7 @@ name = "iohr-capture"
 maintainer = "InOrbit d.o.o. <security@inorbit.hr>"
 copyright = "2026, InOrbit d.o.o."
 license-file = ["../../LICENSE", "0"]
-extended-description = "The privileged companion of iohr-agent: attaches eBPF TC classifiers to one interface, drops its capabilities, counts packets and bytes per direction. Never drops a packet; stores and sends nothing in this version."
+extended-description = "The privileged companion of iohr-agent: attaches eBPF TC classifiers to one interface, drops its capabilities, counts packets, protocols, owners, TCP health and request timing. Never drops a packet and sends nothing anywhere. Whole packets only when switched on, written to a pcap file only when root asks, deleted after a retention; `iohr-capture dissect` runs the host's own tshark (a separate GPL program, suggested, never bundled)."
 section = "net"
 priority = "optional"
 depends = "adduser"
@@ -55,6 +59,7 @@ systemd-units = { unit-name = "iohr-capture", unit-scripts = "../../packaging/sy
 assets = [
   ["target/release/iohr-capture", "usr/bin/", "755"],
   ["../../packaging/capture.env", "etc/iohr-capture/capture.env", "640"],
+  ["../../packaging/tmpfiles/iohr-capture.conf", "usr/lib/tmpfiles.d/iohr-capture.conf", "644"],
   ["../../docs/capture/install.md", "usr/share/doc/iohr-capture/README.md", "644"],
 ]
 
@@ -63,8 +68,11 @@ name = "iohr-capture"
 license = "Apache-2.0 AND (MIT OR GPL-2.0-only)"
 summary = "InOrbit capture companion: eBPF traffic counters, counts only"
 pre_install_script = "../../packaging/rpm-capture-pre.sh"
+# `iohr-capture dissect` runs the host's own tshark, as the person who asks; never bundled.
+suggests = { wireshark-cli = "*" }
 assets = [
   { source = "target/release/iohr-capture", dest = "/usr/bin/iohr-capture", mode = "755" },
   { source = "../../packaging/systemd/iohr-capture.service", dest = "/usr/lib/systemd/system/iohr-capture.service", mode = "644" },
   { source = "../../packaging/capture.env", dest = "/etc/iohr-capture/capture.env", mode = "640", config = "noreplace", group = "iohr-capture" },
+  { source = "../../packaging/tmpfiles/iohr-capture.conf", dest = "/usr/lib/tmpfiles.d/iohr-capture.conf", mode = "644" },
 ]

@@ -94,8 +94,26 @@ from network administration. So `iohr-capture run` splits in two:
 
 `counts` reports both: `privileges.parser_capabilities` (always empty) and
 `privileges.companion_kept`.
-- **Control**, root only (0600): pcap on request. No platform job can ever start a pcap;
-  a person on the host can.
+- **Control**, root only (0600, and `SO_PEERCRED` uid 0: the companion's own user is
+  refused too): pcap on request (phase 2, [design-phase2.md](../capture/design-phase2.md)).
+  No platform job can ever start a pcap; root on the host can. The parser writes the file
+  (0600, in a 0700 directory of its own user under `StateDirectory=`, size- and
+  time-capped, deleted after a retention) and only returns its path; no socket of the
+  companion can carry a file, and the unit allows no IP traffic.
+
+### Whole packets (phase 2)
+
+Layer 3 is the companion's own switch (`--packets`), off by default and out of the
+agent's reach. A second ring buffer receives each packet up to the snap length after its
+own per-CPU token bucket; reservations must be constant-sized, so a packet goes into the
+smallest of four record sizes (256 B to 64 KiB). The privileged process relays those
+records like the others, without looking inside, bounded per batch by bytes. The parser
+keeps them in memory, bounded by bytes and 300 s, and writes a pcapng file only for a
+root request on the control socket.
+
+The agent never gets packets and has no `pcap` or `dissect` command: it is the process
+that talks to the platform, and keeping payloads out of its reach keeps a session bug from
+being one step away from them.
 
 ### Where `unsafe` is allowed
 
@@ -132,15 +150,19 @@ message (`iohr-capture doctor` shows it before anything is loaded).
 
 ### Dissection: `tshark`, never ours
 
-Phase 2 can hand a pcap file to `tshark` for dissection. `tshark` is GPL and is never
-bundled, linked or started by the companion: `iohr agent capture dissect` runs the host's
-own `tshark`, as the person who asked, on a file that person may read. The deb only
-`Suggests` it.
+Phase 2 hands a pcap file to `tshark` for dissection. `tshark` is GPL and is never
+bundled, linked or started by the companion: `iohr-capture dissect` (a separate command of
+the same binary, run by a person, never by the companion or the agent) runs the host's own
+`tshark`, as the person who asked, with a file that person opened as its standard input,
+and refuses to run as root unless told `--as-root`. The deb only `Suggests` it; the rpm
+suggests `wireshark-cli`. An earlier draft of this ADR named `iohr agent capture
+dissect`; that was dropped so that the agent never touches packets.
 
 ### What capture never does
 
 It never drops, redirects or changes a packet (the classifiers always return
-`TC_ACT_OK`). In phase 0 it stores nothing and sends nothing: `run` prints totals on exit.
+`TC_ACT_OK`). It sends nothing anywhere. It stores nothing but the pcap files root asks for
+(phase 2), which expire.
 
 ## Consequences
 

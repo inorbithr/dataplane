@@ -27,6 +27,8 @@ pub(crate) struct Packet<'a> {
     pub(crate) sport: u16,
     pub(crate) dport: u16,
     pub(crate) tcp_flags: u8,
+    /// TCP sequence number (0 for UDP).
+    pub(crate) seq: u32,
     /// The copied transport payload (a prefix of it).
     pub(crate) payload: &'a [u8],
     /// The payload's full length, as the IP header states it.
@@ -126,15 +128,20 @@ pub(crate) fn parse(record: &[u8]) -> Result<Packet<'_>, Malformed> {
     }
     let sport = be16(data, l4).ok_or(Malformed::Short)?;
     let dport = be16(data, l4 + 2).ok_or(Malformed::Short)?;
-    let (hdr, flags) = if proto == IPPROTO_TCP {
+    let (hdr, flags, seq) = if proto == IPPROTO_TCP {
         let off = usize::from(*data.get(l4 + 12).ok_or(Malformed::Short)? >> 4) * 4;
         let flags = *data.get(l4 + 13).ok_or(Malformed::Short)?;
         if off < 20 {
             return Err(Malformed::Short);
         }
-        (off, flags)
+        let seq = data
+            .get(l4 + 4..l4 + 8)
+            .and_then(|s| s.try_into().ok())
+            .map(u32::from_be_bytes)
+            .ok_or(Malformed::Short)?;
+        (off, flags, seq)
     } else {
-        (8, 0)
+        (8, 0, 0)
     };
     let start = l4 + hdr;
     // The payload is what was copied, never more than the IP header says exists (Ethernet
@@ -156,6 +163,7 @@ pub(crate) fn parse(record: &[u8]) -> Result<Packet<'_>, Malformed> {
         sport,
         dport,
         tcp_flags: flags,
+        seq,
         payload,
         payload_len: l4_len.saturating_sub(hdr),
     })
@@ -174,6 +182,21 @@ pub(crate) mod tests {
         tcp_flags: u8,
         payload: &[u8],
     ) -> Vec<u8> {
+        record_v4_at(direction, proto, src, dst, tcp_flags, 1, 7, payload)
+    }
+
+    /// As [`record_v4`], with a TCP sequence number and a timestamp (ns).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_v4_at(
+        direction: u8,
+        proto: u8,
+        src: ([u8; 4], u16),
+        dst: ([u8; 4], u16),
+        tcp_flags: u8,
+        seq: u32,
+        ts_ns: u64,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let mut pkt = vec![0u8; 14];
         pkt[12] = 0x08;
         let l4_len = if proto == IPPROTO_TCP { 20 } else { 8 } + payload.len();
@@ -186,9 +209,8 @@ pub(crate) mod tests {
         pkt.extend_from_slice(&src.1.to_be_bytes());
         pkt.extend_from_slice(&dst.1.to_be_bytes());
         if proto == IPPROTO_TCP {
-            pkt.extend_from_slice(&[
-                0, 0, 0, 1, 0, 0, 0, 0, 0x50, tcp_flags, 0xff, 0xff, 0, 0, 0, 0,
-            ]);
+            pkt.extend_from_slice(&seq.to_be_bytes());
+            pkt.extend_from_slice(&[0, 0, 0, 0, 0x50, tcp_flags, 0xff, 0xff, 0, 0, 0, 0]);
         } else {
             let ulen = u16::try_from(8 + payload.len()).unwrap_or(u16::MAX);
             pkt.extend_from_slice(&ulen.to_be_bytes());
@@ -197,7 +219,7 @@ pub(crate) mod tests {
         pkt.extend_from_slice(payload);
         pkt.truncate(RECORD_DATA);
         let mut rec = Vec::with_capacity(RECORD_HEADER_BYTES + pkt.len());
-        rec.extend_from_slice(&7u64.to_le_bytes());
+        rec.extend_from_slice(&ts_ns.to_le_bytes());
         rec.extend_from_slice(&u32::try_from(pkt.len()).unwrap_or(0).to_le_bytes());
         rec.extend_from_slice(&u16::try_from(pkt.len()).unwrap_or(0).to_le_bytes());
         rec.push(direction);

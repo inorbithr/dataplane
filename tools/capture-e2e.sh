@@ -65,10 +65,25 @@ if f:
     s, l = f["small_ring"], f["rate_limited"]
     print(f"  flood    4 KiB ring: ring full {s['drops']['ring_buffer_full']}, flows evicted {s['flows']['evicted']}, rss {s['memory']['rss_kib']} KiB;"
           f" 100/s: rate limited {l['drops']['rate_limited']}, rss {l['memory']['rss_kib']} KiB" + (f"  FAILED: {', '.join(bad)}" if bad else ""))
+if f and f.get("timing"):
+    t = f["timing"]
+    print(f"  timing flood  40000 unanswered requests: budget {t['budget']}, parser rss {t['memory']['rss_kib']} KiB, parent rss {t['parent_rss_kib']} KiB")
 if f:
     u = f["unlimited"]
     print(f"           16 MiB ring, no limit: ring full {u['drops']['ring_buffer_full']}, read {u['copy']['records_read']} of {u['copy']['records_copied']} copied,"
           f" dns after flood {u['dns_after_flood']}, parent rss {u['parent_rss_kib']} KiB, parser rss {u['memory']['rss_kib']} KiB")
+p2 = r.get("phase2")
+if p2:
+    bad = [k for k, v in p2["checks"].items() if not v]
+    L = p2["lookups"]
+    def b(name):
+        c = L[name].get("latency_ms", {}).get("counts", [])
+        return ",".join(str(x) for x in c)
+    print(f"  phase 2  timing via lookup v2 (bucket counts, bounds 0.5 1 2.5 5 10 25 50 100 250 500 1000 2500 5000 10000 ms):")
+    for name in ("fast", "mid", "slow", "slower", "h2slow", "grpc_ok", "grpc_fail"):
+        print(f"           {name:9} requests {L[name].get('requests')}, status {L[name].get('status_classes', {})}, grpc {L[name].get('grpc_status', {})}, buckets [{b(name)}]")
+    print(f"           pcap last {p2['pcap_last'].get('packets')} packets / {p2['pcap_last'].get('bytes')} B; tshark lines {len(p2['tshark_head'])}+;"
+          f" packets {p2['packets']}" + (f"  FAILED: {', '.join(bad)}" if bad else ""))
 un = r.get("unit")
 if un:
     bad = [k for k, v in un["checks"].items() if not v]
