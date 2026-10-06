@@ -65,6 +65,15 @@ if f:
     s, l = f["small_ring"], f["rate_limited"]
     print(f"  flood    4 KiB ring: ring full {s['drops']['ring_buffer_full']}, flows evicted {s['flows']['evicted']}, rss {s['memory']['rss_kib']} KiB;"
           f" 100/s: rate limited {l['drops']['rate_limited']}, rss {l['memory']['rss_kib']} KiB" + (f"  FAILED: {', '.join(bad)}" if bad else ""))
+if f:
+    u = f["unlimited"]
+    print(f"           16 MiB ring, no limit: ring full {u['drops']['ring_buffer_full']}, read {u['copy']['records_read']} of {u['copy']['records_copied']} copied,"
+          f" dns after flood {u['dns_after_flood']}, parent rss {u['parent_rss_kib']} KiB, parser rss {u['memory']['rss_kib']} KiB")
+un = r.get("unit")
+if un:
+    bad = [k for k, v in un["checks"].items() if not v]
+    print(f"  unit     real systemd: dir {un['dir']}, socket {un['socket']}, http1 on lo {un['http1_requests_on_lo']},"
+          f" companion kept {un['companion_kept']}" + (f"  FAILED: {', '.join(bad)}" if bad else ""))
 d = r["doctor"]
 print(f"  doctor   root exit 0: {d['doctor_root_exit_0']}, unprivileged exit 1: {d['doctor_unprivileged_exit_1']}")
 PY

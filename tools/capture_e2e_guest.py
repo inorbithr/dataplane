@@ -360,7 +360,7 @@ def start_capture(binary, mode, extra=()):
     proc = subprocess.Popen(
         [binary, "run", "--interface", "veth-cap", "--attach", mode, "--poll-ms", "500",
          "--aggregates-socket", f"{SCRATCH}/sock/aggregates.sock", "--control-socket", f"{SCRATCH}/sock/control.sock",
-         "--socket-group", "nogroup", *extra],
+         "--socket-group", "nogroup", "--agent-user", "nobody", *extra],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -454,6 +454,9 @@ def run_mode(binary, mode, version):
     counts_only, _ = query(binary, tables=False)
     as_group, _ = query(binary, tables=False, user=("65534", "65534", ["--clear-groups"]))
     as_other, other_raw = query(binary, tables=False, user=("2", "2", ["--groups=65534"]))
+    # nobody is the agent's user here: counts yes, tables never (the companion enforces it).
+    agent_tables, agent_tables_raw = query(binary, tables=True, user=("65534", "65534", ["--clear-groups"]))
+    parser = parser_caps(proc.pid)
     ctl = control(f"{SCRATCH}/sock/control.sock")
     agg_mode = oct(os.stat(f"{SCRATCH}/sock/aggregates.sock").st_mode & 0o777)
     ctl_mode = oct(os.stat(f"{SCRATCH}/sock/control.sock").st_mode & 0o777)
@@ -508,7 +511,10 @@ def run_mode(binary, mode, version):
         # bounds and drops at this rate
         "no_copy_drops": snap["drops"]["rate_limited"] == 0 and snap["drops"]["ring_buffer_full"] == 0,
         # privileges and sockets
-        "privileges_dropped_before_parsing": snap["privileges"]["dropped_before_parsing"] is True,
+        "parser_process_has_no_capabilities": snap["privileges"]["parser_capabilities"] == []
+        and parser.get("CapEff") == "0000000000000000" and parser.get("CapPrm") == "0000000000000000",
+        "companion_kept_reported": sorted(snap["privileges"]["companion_kept"]) == sorted(expected_kept(mode, version)),
+        "agent_user_gets_no_tables": agent_tables is None and "forbidden" in agent_tables_raw.stderr,
         "capabilities_kept": sorted(report["capabilities_after_attach"]["kept"]) == sorted(expected_kept(mode, version)),
         "counts_answer_has_no_tables": counts_only is not None and "tables" not in counts_only,
         "socket_modes": agg_mode == "0o660" and ctl_mode == "0o600",
@@ -555,14 +561,50 @@ for i in range(40000):
 """
 
 
+DNS_AFTER = f"""
+import socket
+q = bytes.fromhex("12340100000100000000000005616674657205666c6f6f64076578616d706c650000010001")
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+for i in range(5):
+    u.sendto(q, ("{CAP_ADDR}", 53))
+"""
+
+
+def parser_caps(parent_pid):
+    """CapEff and CapPrm of the parser process (the `worker` child of `run`)."""
+    kids = sh(f"pgrep -P {parent_pid}", check=False).stdout.split()
+    for k in kids:
+        try:
+            status = open(f"/proc/{k}/status").read()
+            if "worker" in open(f"/proc/{k}/cmdline").read():
+                return dict(l.split(":\t", 1) for l in status.splitlines() if l.startswith("Cap"))
+        except OSError:
+            pass
+    return {}
+
+
+def rss_kib(pid):
+    try:
+        for l in open(f"/proc/{pid}/status"):
+            if l.startswith("VmRSS:"):
+                return int(l.split()[1])
+    except OSError:
+        pass
+    return -1
+
+
 def flood(binary, mode, extra):
-    """A flood of new UDP flows: totals stay exact, drops are counted, memory bounded."""
+    """A flood of new UDP flows: totals stay exact, drops are counted, memory bounded, and
+    layer 2 keeps working afterwards (5 DNS queries after the flood must be counted)."""
     setup()
     proc, log = start_capture(binary, mode, extra)
     before = stats()
     peer(["python3", "-c", FLOOD], timeout=120)
     time.sleep(1.5)
+    peer(["python3", "-c", DNS_AFTER])
+    time.sleep(1.5)
     after = stats()
+    parent_rss = rss_kib(proc.pid)
     snap, raw = query(binary, tables=False)
     report = stop_capture(proc, log, "flood")
     sh("ip netns del peer", check=False)
@@ -578,6 +620,8 @@ def flood(binary, mode, extra):
         "flows": snap["flows"],
         "copy": snap["copy"],
         "memory": snap["memory"],
+        "parent_rss_kib": parent_rss,
+        "dns_after_flood": snap["protocols"]["dns_queries"],
         "totals_exact": report["ingress"]["packets"] == delta["rx_packets"],
     }
 
@@ -606,6 +650,111 @@ def stale_cleanup(binary):
         "next_run_removed_stale": removed == 2,
         "nothing_left_after_cleanup_run": not leftovers("netlink"),
     }
+
+
+def free_ids(path, count, start=64900):
+    used = {int(l.split(":")[2]) for l in open(path) if l.count(":") >= 3 and l.split(":")[2].isdigit()}
+    out, n = [], start
+    while len(out) < count:
+        if n not in used:
+            out.append(n)
+        n += 1
+    return out
+
+
+def unit_test(binary):
+    """The shipped unit (packaging/systemd/iohr-capture.service), started by a real systemd:
+    systemd runs as PID 1 of a new PID namespace inside the VM, with the guest's throwaway
+    /etc and /usr. Proves the unit's sandbox (system call filter, RestrictSUIDSGID, the
+    runtime directory, Group=) lets iohr-capture start and serve, and the socket's access
+    rules: a member of iohr-capture-read reads the tables, the agent's user reads counts
+    only, anyone else is kept out by the directory's mode. Runs last: systemd stays up
+    until the VM ends."""
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    g_read, g_cap, g_agent, g_reader = free_ids("/etc/group", 4)
+    u_cap, u_agent, u_reader = free_ids("/etc/passwd", 3, start=g_reader + 1)
+    # The guest's /etc is an overlay; groupadd cannot read the host's gshadow, so append.
+    with open("/etc/group", "a") as f:
+        f.write(f"iohr-capture-read:x:{g_read}:iohr-agent,e2e-reader\niohr-capture:x:{g_cap}:\n"
+                f"iohr-agent:x:{g_agent}:\ne2e-reader:x:{g_reader}:\n")
+    with open("/etc/passwd", "a") as f:
+        f.write(f"iohr-capture:x:{u_cap}:{g_cap}::/nonexistent:/usr/sbin/nologin\n"
+                f"iohr-agent:x:{u_agent}:{g_agent}::/nonexistent:/usr/sbin/nologin\n"
+                f"e2e-reader:x:{u_reader}:{g_reader}::/nonexistent:/usr/sbin/nologin\n")
+    shutil.copy(binary, "/usr/bin/iohr-capture")
+    os.makedirs("/etc/iohr-capture", exist_ok=True)
+    with open("/etc/iohr-capture/capture.env", "w") as f:
+        f.write("IOHR_CAPTURE_INTERFACE=lo\nIOHR_CAPTURE_POLL_MS=500\n")
+    shutil.copy(os.path.join(repo, "packaging/systemd/iohr-capture.service"), "/etc/systemd/system/")
+    with open("/etc/systemd/system/iohr-e2e.target", "w") as f:
+        f.write("[Unit]\nDescription=iohr-capture e2e\nRequires=iohr-capture.service\nAfter=iohr-capture.service\n")
+    sh("ip link set lo up", check=False)
+    web = subprocess.Popen(["python3", "-m", "http.server", "18080", "--bind", "127.0.0.1", "--directory", SCRATCH],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    systemd = subprocess.Popen(["unshare", "--pid", "--fork", "--mount-proc", "/usr/lib/systemd/systemd", "--system",
+                                "--unit=iohr-e2e.target", "--log-target=kmsg"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    pid = ""
+    for _ in range(50):
+        pid = sh(f"pgrep -P {systemd.pid}", check=False).stdout.split()
+        if pid:
+            pid = pid[0]
+            break
+        time.sleep(0.2)
+    ns = f"nsenter -t {pid} -m -p"
+    up = False
+    for _ in range(240):
+        if sh(f"{ns} test -S /run/iohr-capture/aggregates.sock", check=False).returncode == 0:
+            up = True
+            break
+        time.sleep(0.5)
+    time.sleep(1.0)
+    for i in range(3):
+        sh(f"curl -s -o /dev/null -H 'Host: unit.e2e.test' http://127.0.0.1:18080/u/{i}", check=False)
+    time.sleep(2.0)
+
+    def stats_as(uid, gid, groups, tables):
+        cmd = (f"{ns} setpriv --reuid={uid} --regid={gid} --groups={groups} --inh-caps=-all --bounding-set=-all "
+               f"/usr/bin/iohr-capture stats --json" + (" --tables" if tables else ""))
+        r = sh(cmd, check=False)
+        try:
+            return json.loads(r.stdout), r.stderr
+        except json.JSONDecodeError:
+            return None, r.stderr
+
+    reader, _ = stats_as(u_reader, g_reader, g_read, True)
+    agent_counts, _ = stats_as(u_agent, g_agent, g_read, False)
+    agent_tables, agent_err = stats_as(u_agent, g_agent, g_read, True)
+    outsider, outsider_err = stats_as(65534, 65534, 65534, False)
+    dir_stat = sh(f"{ns} stat -c '%a %G %U' /run/iohr-capture", check=False).stdout.strip()
+    sock_stat = sh(f"{ns} stat -c '%a %G' /run/iohr-capture/aggregates.sock", check=False).stdout.strip()
+    journal = sh(f"{ns} journalctl -u iohr-capture --no-pager", check=False).stdout
+    restarts = sh("dmesg", check=False).stdout.count("iohr-capture.service: Scheduled restart")
+    main_pid = sh("pgrep -f '^/usr/bin/iohr-capture run'", check=False).stdout.split()
+    parser = parser_caps(main_pid[0]) if main_pid else {}
+    web.kill()
+    hosts = reader["tables"]["http1"]["hosts"] if reader else []
+    checks = {
+        "unit_started_and_serves": up and reader is not None,
+        "no_failure_no_restart": "capture failed" not in journal and restarts == 0,
+        "runtime_dir_setgid_read_group": dir_stat == "2750 iohr-capture-read iohr-capture",
+        "socket_0660_read_group": sock_stat == "660 iohr-capture-read",
+        "reader_gets_tables": top(hosts, "unit.e2e.test") >= 3,
+        "agent_gets_counts": agent_counts is not None and "tables" not in agent_counts,
+        "agent_gets_no_tables": agent_tables is None and "forbidden" in agent_err,
+        "others_kept_out": outsider is None,
+        "parser_has_no_capabilities": parser.get("CapEff") == "0000000000000000",
+    }
+    return {
+        "checks": checks,
+        "dir": dir_stat,
+        "socket": sock_stat,
+        "http1_requests_on_lo": (reader or {}).get("protocols", {}).get("http1_requests"),
+        "companion_kept": (reader or {}).get("privileges", {}).get("companion_kept"),
+        "journal_tail": journal[-3000:],
+        "outsider_error": outsider_err[-300:],
+    }
+
 
 
 def doctor(binary):
@@ -637,20 +786,28 @@ def main():
         results["modes"].append(run_mode(binary, mode, version))
     small = flood(binary, "auto", ["--ring-buffer-kib", "4", "--max-flows", "512", "--samples-per-sec", "0"])
     limited = flood(binary, "auto", ["--samples-per-sec", "100", "--burst", "10"])
+    # A large ring and no rate limit: the reader must keep up and never stall.
+    unlimited = flood(binary, "auto", ["--samples-per-sec", "0", "--ring-buffer-kib", "16384"])
     results["flood"] = {
         "small_ring": small,
         "rate_limited": limited,
+        "unlimited": unlimited,
         "checks": {
+            "layer2_alive_after_unlimited_flood": unlimited["dns_after_flood"] == 5,
+            "reader_caught_up": unlimited["copy"]["records_read"] == unlimited["copy"]["records_copied"],
             "totals_exact_under_flood": small["totals_exact"] and limited["totals_exact"],
             "ring_buffer_full_counted": small["drops"]["ring_buffer_full"] > 0,
             "flows_evicted_counted": small["flows"]["evicted"] > 0 and small["flows"]["active"] <= 512,
             "rate_limited_counted": limited["drops"]["rate_limited"] > 0,
-            "memory_bounded": max(small["memory"]["rss_kib"], limited["memory"]["rss_kib"]) < 64 * 1024,
+            "memory_bounded": max(f[k] if k == "parent_rss_kib" else f["memory"]["rss_kib"]
+                                  for f in (small, limited, unlimited) for k in ("parent_rss_kib", "memory")) < 64 * 1024,
         },
     }
     ok = results["doctor"]["doctor_root_exit_0"] and results["doctor"]["doctor_unprivileged_exit_1"]
     ok = ok and all(all(m["checks"].values()) for m in results["modes"])
     ok = ok and all(results["flood"]["checks"].values())
+    results["unit"] = unit_test(binary)
+    ok = ok and all(results["unit"]["checks"].values())
     results["ok"] = ok
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
