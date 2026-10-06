@@ -46,8 +46,9 @@ customer, including the ones that never turn capture on.
   `AF_UNIX` only, no IP traffic (`IPAddressDeny=any`), `LimitMEMLOCK=infinity` (maps are
   charged to `RLIMIT_MEMLOCK` before 5.11), and the usual protections
   (`ProtectSystem=strict`, `PrivateDevices`, `MemoryDenyWriteExecute`, and so on).
-  `systemd-analyze security` rates it 1.3 (the agent's unit: 1.4); what it flags is what
-  the companion exists for: BPF, network administration, netlink.
+  `systemd-analyze security` rates it 1.4 with phase 1's runtime directory and
+  supplementary group (the agent's unit: 1.4); what it flags is what the companion exists
+  for: BPF, network administration, netlink.
 
 ### Why the agent stays unprivileged
 
@@ -56,12 +57,15 @@ means a compromise of the agent's session code reaches no kernel privilege, a cu
 never turns capture on runs exactly the agent they approved, and the companion can be
 reviewed on its own: it opens no network connection at all.
 
-### Two local sockets (designed now, built in phase 1)
+### Two local sockets (built in phase 1)
 
 - **Aggregates** for the agent: a Unix socket, mode 0660, group `iohr-agent`. The
-  companion checks the peer with `SO_PEERCRED` against the `iohr-agent` user and answers
-  with counts and bounded top-K tables only. It is not a network listener, so ADR 0001's
-  "no new listener" holds.
+  companion checks the peer with `SO_PEERCRED` (root, itself, the `iohr-agent` user and
+  that group's members) and answers with counts, or for a person the bounded top-K tables
+  too. It is not a network listener, so ADR 0001's "no new listener" holds. The protocol:
+  [design-phase1.md](../capture/design-phase1.md).
+- Both are bound before the drop (filesystem work); nothing from the kernel is parsed
+  before it: the parsing engine can only be built with the proof value the drop returns.
 - **Control**, root only (0600): pcap on request. No platform job can ever start a pcap;
   a person on the host can.
 

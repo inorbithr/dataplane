@@ -26,6 +26,7 @@ checks = true
 load = false
 faults = false
 surfaces = ["http", "tcp", "tls", "grpc_health"]
+capture = false
 
 [ceilings]
 max_concurrent_jobs = 4
@@ -73,9 +74,28 @@ How a target is decided:
 | `load` | `false` | Load generation. Not in this version: always refused. |
 | `faults` | `false` | Faults through the proxy. Not in this version: always refused. |
 | `surfaces` | all | Which check surfaces are accepted: `http`, `tcp`, `tls`, `grpc_health`. |
+| `capture` | `false` | Read the capture companion's counts ([`[capture]`](#capture)) and announce `capture:*`. Needs an agent newer than 0.1.0-alpha.4. |
 
 The agent announces what it accepts (`check:http`, …) in its `hello`, so the console only
 offers what this policy allows.
+
+## `[capture]`
+
+Read only when `[work] capture = true`; without that switch the section is accepted and
+does nothing. **Needs an agent newer than 0.1.0-alpha.4**: older agents reject the
+unknown keys (`capture` in `[work]`, the `[capture]` section) and do not start, so upgrade
+the agent before adding them. A policy without them keeps the hash it had before.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `socket` | `/run/iohr-capture/aggregates.sock` | The companion's aggregates socket (absolute path). |
+| `layers` | `["headers", "protocols", "owners", "tcp"]` | Layers the agent may announce: `capture:<layer>` in the hello, for each one the companion also runs. |
+| `max_snapshot_age_secs` | `30` | 1–3600. An answer whose numbers are older counts as no answer: nothing is announced. |
+
+At each session start the agent asks the socket for counts (1 s timeout). Only the
+`capture:*` strings travel to the platform; the counts stay on the admin page and in
+`iohr agent capture status`. Names, paths and addresses never reach the agent at all
+([install guide](capture/install.md#what-capture-never-does)).
 
 ## `[ceilings]`
 
