@@ -264,7 +264,8 @@ fn parse(ctx: &TcContext, ethertype: u16, l2_len: u32) -> Option<Parsed> {
     } else {
         8
     };
-    if hdr_len < 8 {
+    // A TCP header is at least 20 bytes (data offset 5); less is malformed.
+    if hdr_len < 8 || (p.proto == IPPROTO_TCP && hdr_len < 20) {
         bump(&STATS_MAP, STAT_SHORT);
         return None;
     }

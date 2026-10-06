@@ -181,7 +181,21 @@ fn string(block: &[u8], at: &mut usize) -> Result<String, Error> {
     }
 }
 
-/// Bit-by-bit Huffman decoding against [`CODES`] (inputs are at most [`MAX_STRING`]).
+/// `(bit length, code)` to symbol, built once from [`CODES`].
+fn decode_table() -> &'static std::collections::HashMap<(u8, u32), usize> {
+    static TABLE: std::sync::OnceLock<std::collections::HashMap<(u8, u32), usize>> =
+        std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        CODES
+            .iter()
+            .enumerate()
+            .map(|(sym, &(code, len))| ((len, code), sym))
+            .collect()
+    })
+}
+
+/// Bit-by-bit Huffman decoding with a table lookup per bit (inputs are at most
+/// [`MAX_STRING`] bytes).
 fn huffman_decode(raw: &[u8]) -> Result<String, Error> {
     let mut out = Vec::with_capacity(raw.len() * 8 / 5);
     let mut code: u32 = 0;
@@ -193,7 +207,7 @@ fn huffman_decode(raw: &[u8]) -> Result<String, Error> {
             if len < 5 {
                 continue;
             }
-            if let Some(sym) = CODES.iter().position(|&(c, l)| l == len && c == code) {
+            if let Some(&sym) = decode_table().get(&(len, code)) {
                 if sym == 256 {
                     return Err(Error::Invalid);
                 }

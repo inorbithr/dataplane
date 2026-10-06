@@ -95,7 +95,7 @@ fn ne_u64(b: &[u8], at: usize) -> Option<u64> {
 }
 
 /// Parses the netlink messages in one received buffer into `out`.
-pub(crate) fn parse(buf: &[u8], proto: u8, out: &mut Vec<Socket>) -> Chunk {
+pub(crate) fn parse(buf: &[u8], proto: u8, seq: u32, out: &mut Vec<Socket>) -> Chunk {
     let mut at = 0;
     while at + 16 <= buf.len() {
         let (Some(len), Some(kind)) = (ne_u32(buf, at), ne_u16(buf, at + 4)) else {
@@ -106,6 +106,11 @@ pub(crate) fn parse(buf: &[u8], proto: u8, out: &mut Vec<Socket>) -> Chunk {
             break;
         }
         let body = buf.get(at + 16..at + len).unwrap_or_default();
+        // Only answers to our own request count.
+        if ne_u32(buf, at + 8) != Some(seq) {
+            at += (len + 3) & !3;
+            continue;
+        }
         match kind {
             NLMSG_DONE => return Chunk::Done,
             NLMSG_ERROR => {
@@ -196,7 +201,8 @@ fn tcp_info(d: &[u8]) -> Option<TcpInfo> {
 #[cfg(target_os = "linux")]
 pub(crate) fn dump() -> std::io::Result<Vec<Socket>> {
     use rustix::net::{
-        AddressFamily, RecvFlags, SendFlags, SocketType, netlink, recv, sendto, socket,
+        AddressFamily, RecvFlags, SendFlags, SocketAddrAny, SocketType, netlink, recvfrom, sendto,
+        socket,
         sockopt::{Timeout, set_socket_timeout},
     };
     let fd = socket(
@@ -217,11 +223,17 @@ pub(crate) fn dump() -> std::io::Result<Vec<Socket>> {
                 SendFlags::empty(),
                 &kernel,
             )?;
-            seq += 1;
             // Bounded: a dump ends with NLMSG_DONE; stop anyway after this many buffers.
             for _ in 0..4096 {
-                let (n, _) = recv(&fd, &mut buf[..], RecvFlags::empty())?;
-                match parse(buf.get(..n).unwrap_or_default(), proto, &mut out) {
+                let (n, _, from) = recvfrom(&fd, &mut buf[..], RecvFlags::empty())?;
+                // Only the kernel (port id 0) answers; anything else is dropped.
+                let from_kernel = from
+                    .and_then(|a: SocketAddrAny| netlink::SocketAddrNetlink::try_from(a).ok())
+                    .is_some_and(|a| a.pid() == 0);
+                if !from_kernel {
+                    continue;
+                }
+                match parse(buf.get(..n).unwrap_or_default(), proto, seq, &mut out) {
                     Chunk::More => {}
                     Chunk::Done => break,
                     Chunk::Error(code) => {
@@ -229,6 +241,7 @@ pub(crate) fn dump() -> std::io::Result<Vec<Socket>> {
                     }
                 }
             }
+            seq += 1;
         }
     }
     Ok(out)
@@ -276,7 +289,9 @@ pub(crate) mod tests {
         let mut m = Vec::new();
         m.extend_from_slice(&u32::try_from(16 + body.len()).unwrap().to_ne_bytes());
         m.extend_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
-        m.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        m.extend_from_slice(&[0, 0]); // flags
+        m.extend_from_slice(&1u32.to_ne_bytes()); // seq
+        m.extend_from_slice(&[0, 0, 0, 0]); // pid
         m.extend_from_slice(&body);
         m
     }
@@ -302,9 +317,10 @@ pub(crate) mod tests {
         let mut done = vec![0u8; 20];
         done[..4].copy_from_slice(&20u32.to_ne_bytes());
         done[4..6].copy_from_slice(&NLMSG_DONE.to_ne_bytes());
+        done[8..12].copy_from_slice(&1u32.to_ne_bytes());
         buf.extend(done);
         let mut out = Vec::new();
-        assert_eq!(parse(&buf, 6, &mut out), Chunk::Done);
+        assert_eq!(parse(&buf, 6, 1, &mut out), Chunk::Done);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].state, TCP_LISTEN);
         assert_eq!((out[0].rqueue, out[0].wqueue), (3, 128));
@@ -331,13 +347,16 @@ pub(crate) mod tests {
         );
         for n in 0..m.len() {
             let mut out = Vec::new();
-            let _ = parse(&m[..n], 6, &mut out);
+            let _ = parse(&m[..n], 6, 1, &mut out);
         }
         let mut err = vec![0u8; 20];
         err[..4].copy_from_slice(&20u32.to_ne_bytes());
         err[4..6].copy_from_slice(&NLMSG_ERROR.to_ne_bytes());
+        err[8..12].copy_from_slice(&1u32.to_ne_bytes());
         err[16..20].copy_from_slice(&(-13i32).to_ne_bytes());
-        assert_eq!(parse(&err, 6, &mut Vec::new()), Chunk::Error(-13));
+        assert_eq!(parse(&err, 6, 1, &mut Vec::new()), Chunk::Error(-13));
+        // A message for another request is ignored.
+        assert_eq!(parse(&err, 6, 2, &mut Vec::new()), Chunk::More);
         assert_eq!(request(2, 6, 1).len(), 72);
     }
 }
