@@ -9,7 +9,8 @@ use opentelemetry::metrics::{Counter, Histogram};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument as _;
 
-use crate::checks::{self, CheckDetail, CheckSpec, Endpoint, ErrorClass, Prepared};
+use crate::checks::{self, CheckDetail, CheckSpec, Endpoint, ErrorClass, Prepared, Target};
+use crate::checks_file::DeclaredChecks;
 use crate::enroll::now_rfc3339;
 use crate::policy::{Policy, TargetError};
 use crate::protocol::{Job, JobResult, Refusal, ResultStatus};
@@ -26,6 +27,8 @@ pub struct Executor {
     policy: Arc<Policy>,
     tls: TlsContext,
     secrets: SecretResolver,
+    /// The declared checks: what a transport check sends comes from here, never a job.
+    checks: Option<Arc<DeclaredChecks>>,
     slots: Arc<Semaphore>,
     window: Mutex<VecDeque<Instant>>,
     jobs: Counter<u64>,
@@ -70,6 +73,7 @@ impl Executor {
             policy,
             tls,
             secrets,
+            checks: None,
             slots,
             window: Mutex::new(VecDeque::new()),
             jobs: meter
@@ -82,6 +86,54 @@ impl Executor {
                 .with_description("Job wall time")
                 .build(),
         }
+    }
+
+    /// The declared checks a job may name by its `key`.
+    #[must_use]
+    pub fn with_checks(mut self, checks: Option<Arc<DeclaredChecks>>) -> Self {
+        self.checks = checks;
+        self
+    }
+
+    /// Fills a job's request from the declared check it names, or refuses it: a job never
+    /// carries what a transport sends, and a job whose surface or target differ from the
+    /// entry it names is refused.
+    fn declared(&self, spec: &mut CheckSpec) -> Result<(), String> {
+        let Some(key) = spec.key.clone() else {
+            if spec.surface.needs_declared() {
+                return Err(format!(
+                    "a {} check runs only as a declared check: its request is in checks.toml",
+                    spec.surface.as_str()
+                ));
+            }
+            return Ok(());
+        };
+        let entry = self
+            .checks
+            .as_ref()
+            .and_then(|c| c.entries.iter().find(|e| e.key == key))
+            .ok_or_else(|| format!("no declared check named {key:?} in checks.toml"))?;
+        let same_target = match (&entry.spec.target, &spec.target) {
+            (Target::Url { url: a }, Target::Url { url: b }) => a == b,
+            (
+                Target::HostPort {
+                    host: a, port: p, ..
+                },
+                Target::HostPort {
+                    host: b, port: q, ..
+                },
+            ) => a == b && p == q,
+            _ => false,
+        };
+        if entry.spec.surface != spec.surface || !same_target {
+            return Err(format!(
+                "the job does not match the declared check {key:?}: its surface or target differ from checks.toml"
+            ));
+        }
+        spec.params.clone_from(&entry.spec.params);
+        spec.auth.clone_from(&entry.spec.auth);
+        spec.target.clone_from(&entry.spec.target);
+        Ok(())
     }
 
     /// Capabilities to announce: what this version can do and the policy allows.
@@ -122,7 +174,7 @@ impl Executor {
                 "checks are not enabled by the local policy ([work] checks = false)".into(),
             );
         }
-        let spec: CheckSpec = match serde_json::from_value(job.spec.clone()) {
+        let mut spec: CheckSpec = match serde_json::from_value(job.spec.clone()) {
             Ok(s) => s,
             Err(e) => {
                 return Admission::Refuse(format!(
@@ -136,6 +188,9 @@ impl Executor {
                 spec.surface.as_str()
             ));
         }
+        if let Err(reason) = self.declared(&mut spec) {
+            return Admission::Refuse(reason);
+        }
         let endpoint = match spec.endpoint() {
             Ok(e) => e,
             Err(e) => return Admission::Refuse(format!("invalid target: {e}")),
@@ -143,13 +198,8 @@ impl Executor {
         let secret = match &spec.auth {
             None => None,
             Some(auth) => {
-                if !matches!(
-                    spec.surface,
-                    checks::Surface::Http | checks::Surface::GrpcHealth
-                ) {
-                    return Admission::Refuse(
-                        "auth is only used by http and grpc_health checks".into(),
-                    );
+                if !spec.surface.takes_auth() {
+                    return Admission::Refuse("auth is not used by tcp and tls checks".into());
                 }
                 if !self.policy.secret_allowed(&auth.secret) {
                     return Admission::Refuse(format!(
@@ -341,7 +391,7 @@ impl Executor {
             _ => None,
         };
         let remaining = a.deadline.saturating_sub(started.elapsed());
-        Ok(checks::run(
+        checks::run(
             &self.tls,
             Prepared {
                 spec: &a.spec,
@@ -351,6 +401,6 @@ impl Executor {
                 timeout: remaining,
             },
         )
-        .await)
+        .await
     }
 }

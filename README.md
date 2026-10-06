@@ -42,8 +42,11 @@ Status: pre-release (`0.1.0-alpha`). Before 1.0 only the latest release gets fix
 - **Declares what it watches.** An optional [`checks.toml`](docs/checks.md) lists checks,
   and refusals that must keep happening (`[[refuse]]`); the platform turns them into
   monitors managed by this agent ([RFC 0040.1](https://inorbit.hr/lab/rfc/0040.1-declared-checks-and-self-tests/)).
-- **Checks today:** `http` (status, latency, certificate expiry), `tcp`, `tls`,
-  `grpc_health` (`grpc.health.v1`). Load and faults come later and are refused until then.
+- **Checks today:** `http` (status, latency, certificate expiry; `GET` to `POST` with a
+  small JSON body), `tcp`, `tls`, `grpc_health` (`grpc.health.v1`), and, when the policy
+  lists them, the transport surfaces `grpc`, `sse`, `ws`, `mqtt`, `mcp` and `graphql`
+  ([checks](docs/checks.md#transport-surfaces)). Load and faults come later and are
+  refused until then.
 
 ## What it sends to the platform
 

@@ -1,11 +1,19 @@
 //! Surface checks: does a service answer, how fast, with which status, and when does its
-//! certificate expire. A check never reads more of a response than its status line and
-//! headers (gRPC: the one health message), and never reports a body.
+//! certificate expire. The first four surfaces never read more of a response than its
+//! status line and headers (gRPC: the one health message). The transport surfaces (RFC
+//! 0040.2: `grpc`, `sse`, `ws`, `mqtt`, `mcp`, `graphql`) read a bounded answer to judge
+//! its shape, in memory, and drop it. No surface reports a body, a header value or the
+//! text of an error: a result is timings, a status code, an error class and counts.
 
+mod graphql;
 mod grpc;
 mod http;
+mod mcp;
+mod mqtt;
+mod sse;
 mod tcp;
 mod tls;
+mod ws;
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -15,6 +23,8 @@ use url::Url;
 use zeroize::Zeroizing;
 
 use crate::tls::TlsContext;
+
+pub(crate) use http::{ALLOWED_HEADERS as HTTP_HEADERS, METHODS as HTTP_METHODS};
 
 /// What is checked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -28,11 +38,38 @@ pub enum Surface {
     Tls,
     /// `grpc.health.v1.Health/Check` over HTTP/2.
     GrpcHealth,
+    /// A unary gRPC call by full method name with an empty request; the gRPC status.
+    Grpc,
+    /// A server-sent events stream: opens, delivers N events.
+    Sse,
+    /// One call on a multiplexed WebSocket (`/v1/ws` frames).
+    Ws,
+    /// MQTT 5 over WebSocket: connect, subscribe to a reply topic, one RPC.
+    Mqtt,
+    /// MCP over streamable HTTP: `initialize`, `tools/list`, one read-only `tools/call`.
+    Mcp,
+    /// A GraphQL query over `POST`; no `errors`.
+    Graphql,
 }
 
 impl Surface {
     /// Every surface this version can check.
-    pub const ALL: [Self; 4] = [Self::Http, Self::Tcp, Self::Tls, Self::GrpcHealth];
+    pub const ALL: [Self; 10] = [
+        Self::Http,
+        Self::Tcp,
+        Self::Tls,
+        Self::GrpcHealth,
+        Self::Grpc,
+        Self::Sse,
+        Self::Ws,
+        Self::Mqtt,
+        Self::Mcp,
+        Self::Graphql,
+    ];
+
+    /// The surfaces on when the policy names none. The transport surfaces read an answer
+    /// and are off until `[work] surfaces` lists them.
+    pub const DEFAULT: [Self; 4] = [Self::Http, Self::Tcp, Self::Tls, Self::GrpcHealth];
 
     /// The wire name.
     #[must_use]
@@ -42,8 +79,54 @@ impl Surface {
             Self::Tcp => "tcp",
             Self::Tls => "tls",
             Self::GrpcHealth => "grpc_health",
+            Self::Grpc => "grpc",
+            Self::Sse => "sse",
+            Self::Ws => "ws",
+            Self::Mqtt => "mqtt",
+            Self::Mcp => "mcp",
+            Self::Graphql => "graphql",
         }
     }
+
+    /// Names a URL, never a host and a port.
+    #[must_use]
+    pub fn needs_url(self) -> bool {
+        matches!(
+            self,
+            Self::Http | Self::Sse | Self::Ws | Self::Mqtt | Self::Mcp | Self::Graphql
+        )
+    }
+
+    /// Runs only as a declared check: what it sends (a method, a topic) is in
+    /// `checks.toml`, never in a job.
+    #[must_use]
+    pub fn needs_declared(self) -> bool {
+        matches!(self, Self::Grpc | Self::Ws | Self::Mqtt)
+    }
+
+    /// Sends a credential when the check names one (everything but `tcp` and `tls`).
+    #[must_use]
+    pub fn takes_auth(self) -> bool {
+        !matches!(self, Self::Tcp | Self::Tls)
+    }
+
+    /// Has an HTTP status to expect.
+    #[must_use]
+    pub fn has_status(self) -> bool {
+        matches!(self, Self::Http | Self::Sse | Self::Mcp | Self::Graphql)
+    }
+}
+
+/// Bounds on what a transport check sends and reads.
+pub mod bounds {
+    /// The most bytes of an answer read (then the check fails with `answer`).
+    pub const MAX_ANSWER_BYTES: usize = 1024 * 1024;
+    /// The most WebSocket or MQTT messages read while waiting for the answer.
+    pub const MAX_FRAMES: usize = 32;
+    /// The most server-sent events a check may wait for.
+    pub const MAX_EVENTS: u32 = 20;
+    /// The largest request body, params or variables, as JSON.
+    pub const MAX_REQUEST_BYTES: usize = 8 * 1024;
 }
 
 /// A check job's `spec`.
@@ -65,6 +148,42 @@ pub struct CheckSpec {
     /// HTTP method: `GET` (default) or `HEAD`.
     #[serde(default)]
     pub method: Option<String>,
+    /// The declared check this job runs (its `name` in `checks.toml`).
+    #[serde(default)]
+    pub key: Option<String>,
+    /// What the surface sends beyond its target. Only ever from the local `checks.toml`,
+    /// never from a job.
+    #[serde(skip)]
+    pub params: Params,
+}
+
+/// A transport check's request, from `checks.toml` only. Every field is bounded when the
+/// file is read; none is ever reported.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Params {
+    /// `http`: the method. `ws` and `grpc`: the RPC's full name (`pkg.Service/Method`).
+    pub method: Option<String>,
+    /// `http`: the JSON body. `ws`, `mqtt`: the call's params. `graphql`: the variables.
+    /// `mcp`: the tool's arguments.
+    pub body: Option<serde_json::Value>,
+    /// `http`: request headers from a fixed allow-list (`accept`, `content-type`).
+    pub headers: Vec<(String, String)>,
+    /// `graphql`: the query.
+    pub query: Option<String>,
+    /// `mqtt`: the topic the call is published to.
+    pub topic: Option<String>,
+    /// `sse`: events to receive (default 1; 0 is only the stream opening).
+    pub events: Option<u32>,
+    /// `mcp`: the fewest tools `tools/list` must offer (default 1).
+    pub min_tools: Option<u32>,
+    /// `mcp`: one tool to call.
+    pub tool: Option<String>,
+    /// `mcp`: call a tool that is not annotated read-only.
+    pub allow_side_effects: bool,
+    /// `ws`, `mqtt`: the error code the call must end with (a refusal check).
+    pub expect_error: Option<String>,
+    /// `grpc`: the gRPC status code to expect (default 0, OK).
+    pub expect_code: Option<u32>,
 }
 
 /// A target: a URL, or a host and port.
@@ -97,8 +216,10 @@ pub struct Expect {
     pub max_ms: Option<u64>,
 }
 
-/// A header whose value is a secret reference.
-#[derive(Debug, Clone, Deserialize)]
+/// A header whose value is a secret reference. A job may carry it as the reference alone
+/// (`"auth": "env:TOKEN"`) or as `{header?, scheme?, secret}`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(from = "AuthWire")]
 pub struct AuthSpec {
     /// Header name; default `authorization`.
     #[serde(default)]
@@ -108,6 +229,40 @@ pub struct AuthSpec {
     pub scheme: Option<String>,
     /// The reference (`vault:kv/app#token`, `k8s:ns/name#key`, `env:NAME`, `file:/path`).
     pub secret: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AuthWire {
+    Reference(String),
+    Spec {
+        #[serde(default)]
+        header: Option<String>,
+        #[serde(default)]
+        scheme: Option<String>,
+        secret: String,
+    },
+}
+
+impl From<AuthWire> for AuthSpec {
+    fn from(w: AuthWire) -> Self {
+        match w {
+            AuthWire::Reference(secret) => Self {
+                header: None,
+                scheme: None,
+                secret,
+            },
+            AuthWire::Spec {
+                header,
+                scheme,
+                secret,
+            } => Self {
+                header,
+                scheme,
+                secret,
+            },
+        }
+    }
 }
 
 /// Why a check failed.
@@ -126,6 +281,9 @@ pub enum ErrorClass {
     Status,
     /// The local policy refused it.
     RefusedByPolicy,
+    /// A transport answered, but not in the shape the check expects: a GraphQL `errors`,
+    /// an `error` frame, too few events or tools, an answer past its size bound.
+    Answer,
 }
 
 /// A check's result `detail`: timings, a status code, a class of error. Never a body.
@@ -208,15 +366,15 @@ impl CheckSpec {
                     url: Some(url.clone()),
                 })
             }
-            (Target::HostPort { .. }, Surface::Http) => {
-                Err("an http check needs a URL target".into())
+            (Target::HostPort { .. }, s) if s.needs_url() => {
+                Err(format!("an {} check needs a URL target", s.as_str()))
             }
             (Target::HostPort { host, port, tls }, s) => Ok(Endpoint {
                 host: host.clone(),
                 port: *port,
                 tls: match s {
                     Surface::Tls => true,
-                    Surface::GrpcHealth => tls.unwrap_or(true),
+                    Surface::GrpcHealth | Surface::Grpc => tls.unwrap_or(true),
                     _ => false,
                 },
                 url: None,
@@ -241,14 +399,56 @@ pub struct Prepared<'a> {
 }
 
 /// Runs a check. The caller enforces the overall deadline as well.
-pub async fn run(tls: &TlsContext, p: Prepared<'_>) -> CheckDetail {
+///
+/// # Errors
+/// A refusal decided only once the target answered (an MCP tool that is not read-only);
+/// the reason is the agent's own words, never the target's.
+pub async fn run(tls: &TlsContext, p: Prepared<'_>) -> Result<CheckDetail, String> {
     let detail = match p.spec.surface {
         Surface::Http => http::check(tls, &p).await,
         Surface::Tcp => tcp::check(p.addr, p.timeout).await,
         Surface::Tls => tls::check(tls, &p.endpoint.host, p.addr, p.timeout).await,
         Surface::GrpcHealth => grpc::check(tls, &p).await,
+        Surface::Grpc => grpc::unary(tls, &p).await,
+        Surface::Sse => sse::check(tls, &p).await,
+        Surface::Ws => ws::check(tls, &p).await,
+        Surface::Mqtt => mqtt::check(tls, &p).await,
+        Surface::Mcp => mcp::check(tls, &p).await?,
+        Surface::Graphql => graphql::check(tls, &p).await,
     };
-    detail.apply_max_ms(&p.spec.expect)
+    Ok(detail.apply_max_ms(&p.spec.expect))
+}
+
+/// Whether an HTTP status meets `expect.status`; without one, any 2xx.
+fn status_ok(expect: &Expect, status: u16) -> bool {
+    expect
+        .status
+        .map_or((200..300).contains(&status), |want| want == status)
+}
+
+/// A finished check: ok, or failed with `class`, with the status seen.
+fn judged(started: Instant, status: Option<u16>, outcome: Result<(), ErrorClass>) -> CheckDetail {
+    CheckDetail {
+        ok: outcome.is_ok(),
+        latency_ms: elapsed_ms(started),
+        status_code: status,
+        error_class: outcome.err(),
+        tls_expires_at: None,
+    }
+}
+
+/// The `authorization`-like header and its value, marked sensitive.
+fn auth_header(
+    p: &Prepared<'_>,
+) -> Result<Option<(::http::HeaderName, ::http::HeaderValue)>, ErrorClass> {
+    let Some((name, value)) = &p.auth else {
+        return Ok(None);
+    };
+    let name = ::http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| ErrorClass::Connect)?;
+    let mut value =
+        ::http::HeaderValue::from_str(value.as_str()).map_err(|_| ErrorClass::Connect)?;
+    value.set_sensitive(true);
+    Ok(Some((name, value)))
 }
 
 fn elapsed_ms(started: Instant) -> u64 {
@@ -266,6 +466,52 @@ mod tests {
 
     fn spec(v: serde_json::Value) -> CheckSpec {
         serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn auth_is_a_reference_or_a_table_and_params_never_come_from_a_job() {
+        let s = spec(
+            serde_json::json!({"surface": "graphql", "target": {"url": "https://a.example.com/graphql"},
+            "auth": "env:TOKEN", "key": "gql", "params": {"query": "{ me { email } }"}}),
+        );
+        assert_eq!(s.auth.unwrap().secret, "env:TOKEN");
+        assert_eq!(s.key.as_deref(), Some("gql"));
+        assert_eq!(
+            s.params,
+            Params::default(),
+            "params are read from checks.toml only"
+        );
+        let s = spec(
+            serde_json::json!({"surface": "http", "target": {"url": "https://a.example.com/"},
+            "auth": {"scheme": "Bearer", "secret": "env:TOKEN"}}),
+        );
+        assert_eq!(s.auth.unwrap().scheme.as_deref(), Some("Bearer"));
+    }
+
+    #[test]
+    fn transport_surfaces_are_off_by_default_and_name_urls() {
+        for s in Surface::ALL {
+            assert_eq!(
+                Surface::DEFAULT.contains(&s),
+                !matches!(
+                    s,
+                    Surface::Grpc
+                        | Surface::Sse
+                        | Surface::Ws
+                        | Surface::Mqtt
+                        | Surface::Mcp
+                        | Surface::Graphql
+                )
+            );
+        }
+        let s = spec(serde_json::json!({"surface": "ws", "target": {"host": "g", "port": 443}}));
+        assert!(s.endpoint().is_err());
+        let s = spec(serde_json::json!({"surface": "grpc", "target": {"host": "g", "port": 443}}));
+        assert!(s.endpoint().unwrap().tls, "gRPC defaults to TLS");
+        let s = spec(
+            serde_json::json!({"surface": "mqtt", "target": {"url": "https://a.example.com/v1/mqtt"}}),
+        );
+        assert_eq!(s.endpoint().unwrap().port, 443);
     }
 
     #[test]

@@ -952,6 +952,8 @@ deny = {deny}
 checks = true
 load = false
 faults = false
+# The transport surfaces read a bounded answer and are off unless listed here:
+# "grpc", "sse", "ws", "mqtt", "mcp", "graphql".
 surfaces = ["http", "tcp", "tls", "grpc_health"]
 
 [ceilings]

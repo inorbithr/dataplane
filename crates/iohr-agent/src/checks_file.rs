@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use url::Url;
 
-use crate::checks::{AuthSpec, CheckSpec, Expect, Surface, Target};
+use crate::checks::{AuthSpec, CheckSpec, Expect, Params, Surface, Target, bounds};
 use crate::error::{Error, Result};
 use crate::policy::{NameRule, Policy, normalize_host};
 
@@ -41,7 +41,23 @@ pub mod limits {
     pub const MAX_SERVICE: usize = 256;
     /// Largest canonical form; keeps the hello well under the platform's 64 KiB frame.
     pub const MAX_CANONICAL_BYTES: usize = 48 * 1024;
+    /// Most tags on one check (the platform's limit).
+    pub const MAX_TAGS: usize = 10;
+    /// Longest GraphQL query, RPC method, MQTT topic or MCP tool name.
+    pub const MAX_QUERY: usize = 8 * 1024;
+    /// Longest method, topic or tool name.
+    pub const MAX_NAME_FIELD: usize = 256;
 }
+
+/// The categories a check may name (the platform's fixed list).
+pub const CATEGORIES: [&str; 6] = [
+    "availability",
+    "transport",
+    "contract",
+    "security",
+    "performance",
+    "synthetic",
+];
 
 /// `check` or `refuse`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +121,10 @@ pub struct DeclaredCheck {
     pub fail_after: u8,
     /// The RFC this check proves (`NNNN` or `NNNN.N`).
     pub rfc: Option<String>,
+    /// One of [`CATEGORIES`].
+    pub category: Option<String>,
+    /// Up to [`limits::MAX_TAGS`] labels, `key = "value"`.
+    pub tags: BTreeMap<String, String>,
 }
 
 impl DeclaredCheck {
@@ -158,6 +178,14 @@ impl DeclaredCheck {
         if let Some(r) = &self.rfc {
             m.insert("rfc", json!(r));
         }
+        if let Some(c) = &self.category {
+            m.insert("category", json!(c));
+        }
+        if !self.tags.is_empty() {
+            m.insert("tags", json!(self.tags));
+        }
+        // What a transport sends (a query, a method, a tool) stays here: the platform's
+        // job names the check's key and the agent reads the rest from this file.
         Value::Object(m.into_iter().map(|(k, v)| (k.to_owned(), v)).collect())
     }
 }
@@ -300,6 +328,55 @@ struct FileEntry {
     auth: Option<String>,
     #[serde(default)]
     rfc: Option<String>,
+    #[serde(default)]
+    auth_scheme: Option<String>,
+    #[serde(default)]
+    category: Option<String>,
+    #[serde(default)]
+    tags: BTreeMap<String, String>,
+    // The transport surfaces' requests (RFC 0040.2); each is for the surfaces named.
+    /// http: the method; ws, grpc: the RPC's full name.
+    #[serde(default)]
+    method: Option<String>,
+    /// http: a JSON body.
+    #[serde(default)]
+    body: Option<toml::Value>,
+    /// http: `accept` and `content-type` only.
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    /// graphql.
+    #[serde(default)]
+    query: Option<String>,
+    /// graphql.
+    #[serde(default)]
+    variables: Option<toml::Table>,
+    /// mqtt.
+    #[serde(default)]
+    topic: Option<String>,
+    /// ws, mqtt: the call's request message.
+    #[serde(default)]
+    params: Option<toml::Table>,
+    /// sse.
+    #[serde(default)]
+    events: Option<u32>,
+    /// mcp.
+    #[serde(default)]
+    min_tools: Option<u32>,
+    /// mcp.
+    #[serde(default)]
+    tool: Option<String>,
+    /// mcp.
+    #[serde(default)]
+    args: Option<toml::Table>,
+    /// mcp.
+    #[serde(default)]
+    allow_side_effects: Option<bool>,
+    /// ws, mqtt.
+    #[serde(default)]
+    expect_error: Option<String>,
+    /// grpc.
+    #[serde(default)]
+    expect_code: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -342,11 +419,13 @@ impl FileExpect {
     }
 }
 
+#[allow(clippy::too_many_lines)] // one rule per field, read top to bottom
 fn entry(kind: Kind, table: toml::Table) -> std::result::Result<DeclaredCheck, String> {
-    let e: FileEntry = toml::Value::Table(table)
+    let mut e: FileEntry = toml::Value::Table(table)
         .try_into()
         .map_err(|e: toml::de::Error| e.message().to_owned())?;
     check_name(&e.name)?;
+    let input = e.params_input();
     let every_secs = parse_every(&e.every)?;
     let refuse_by = match (kind, e.by.as_deref(), &e.expect) {
         (Kind::Check, None, _) => None,
@@ -394,16 +473,24 @@ fn entry(kind: Kind, table: toml::Table) -> std::result::Result<DeclaredCheck, S
             ));
         }
     }
+    let scheme = match e.auth_scheme {
+        None => None,
+        Some(_) if e.auth.is_none() => return Err("auth_scheme needs auth".into()),
+        Some(s) if (1..=32).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric()) => {
+            Some(s)
+        }
+        Some(_) => return Err("auth_scheme must be 1 to 32 letters or digits (\"Bearer\")".into()),
+    };
     let auth = match e.auth {
         None => None,
         Some(r) => {
             check_reference(&r)?;
-            if !matches!(surface, Surface::Http | Surface::GrpcHealth) {
-                return Err("auth is for http and grpc_health checks".into());
+            if !surface.takes_auth() {
+                return Err("auth is not used by tcp and tls checks".into());
             }
             Some(AuthSpec {
                 header: None,
-                scheme: None,
+                scheme,
                 secret: r,
             })
         }
@@ -411,6 +498,13 @@ fn entry(kind: Kind, table: toml::Table) -> std::result::Result<DeclaredCheck, S
     if let Some(r) = &e.rfc {
         check_rfc(r)?;
     }
+    if let Some(c) = &e.category
+        && !CATEGORIES.contains(&c.as_str())
+    {
+        return Err(format!("category must be one of {}", CATEGORIES.join(", ")));
+    }
+    check_tags(&e.tags)?;
+    let params = params(surface, &input)?;
     let spec = CheckSpec {
         surface,
         target,
@@ -421,6 +515,8 @@ fn entry(kind: Kind, table: toml::Table) -> std::result::Result<DeclaredCheck, S
         auth,
         service: e.service,
         method: None,
+        key: None,
+        params,
     };
     spec.endpoint()?;
     Ok(DeclaredCheck {
@@ -432,7 +528,239 @@ fn entry(kind: Kind, table: toml::Table) -> std::result::Result<DeclaredCheck, S
         every_secs,
         fail_after,
         rfc: e.rfc,
+        category: e.category,
+        tags: e.tags,
     })
+}
+
+/// The request fields of an entry, before they are checked against its surface.
+struct ParamsInput {
+    method: Option<String>,
+    body: Option<toml::Value>,
+    headers: BTreeMap<String, String>,
+    query: Option<String>,
+    variables: Option<toml::Table>,
+    topic: Option<String>,
+    params: Option<toml::Table>,
+    events: Option<u32>,
+    min_tools: Option<u32>,
+    tool: Option<String>,
+    args: Option<toml::Table>,
+    allow_side_effects: Option<bool>,
+    expect_error: Option<String>,
+    expect_code: Option<u32>,
+}
+
+impl FileEntry {
+    fn params_input(&mut self) -> ParamsInput {
+        ParamsInput {
+            method: self.method.take(),
+            body: self.body.take(),
+            headers: std::mem::take(&mut self.headers),
+            query: self.query.take(),
+            variables: self.variables.take(),
+            topic: self.topic.take(),
+            params: self.params.take(),
+            events: self.events.take(),
+            min_tools: self.min_tools.take(),
+            tool: self.tool.take(),
+            args: self.args.take(),
+            allow_side_effects: self.allow_side_effects.take(),
+            expect_error: self.expect_error.take(),
+            expect_code: self.expect_code.take(),
+        }
+    }
+}
+
+/// Checks each request field against the surfaces it is for and its bounds.
+#[allow(clippy::too_many_lines)] // one rule per field, read top to bottom
+fn params(surface: Surface, i: &ParamsInput) -> std::result::Result<Params, String> {
+    use Surface as S;
+    let only = |field: &str, present: bool, for_: &[Surface]| {
+        if present && !for_.contains(&surface) {
+            let names: Vec<&str> = for_.iter().map(|s| s.as_str()).collect();
+            Err(format!("{field} is for {} checks", names.join(" and ")))
+        } else {
+            Ok(())
+        }
+    };
+    only("method", i.method.is_some(), &[S::Http, S::Ws, S::Grpc])?;
+    only("body", i.body.is_some(), &[S::Http])?;
+    only("headers", !i.headers.is_empty(), &[S::Http])?;
+    only("query", i.query.is_some(), &[S::Graphql])?;
+    only("variables", i.variables.is_some(), &[S::Graphql])?;
+    only("topic", i.topic.is_some(), &[S::Mqtt])?;
+    only("params", i.params.is_some(), &[S::Ws, S::Mqtt])?;
+    only("events", i.events.is_some(), &[S::Sse])?;
+    only("min_tools", i.min_tools.is_some(), &[S::Mcp])?;
+    only("tool", i.tool.is_some(), &[S::Mcp])?;
+    only("args", i.args.is_some(), &[S::Mcp])?;
+    only(
+        "allow_side_effects",
+        i.allow_side_effects.is_some(),
+        &[S::Mcp],
+    )?;
+    only("expect_error", i.expect_error.is_some(), &[S::Ws, S::Mqtt])?;
+    only("expect_code", i.expect_code.is_some(), &[S::Grpc])?;
+    let json =
+        |field: &str, v: Option<toml::Value>| -> std::result::Result<Option<Value>, String> {
+            let Some(v) = v else { return Ok(None) };
+            let v = serde_json::to_value(v).map_err(|e| format!("{field}: {e}"))?;
+            if serde_json::to_vec(&v).map_or(usize::MAX, |b| b.len()) > bounds::MAX_REQUEST_BYTES {
+                return Err(format!(
+                    "{field} must be at most {} bytes as JSON",
+                    bounds::MAX_REQUEST_BYTES
+                ));
+            }
+            Ok(Some(v))
+        };
+    let method = match (&i.method, surface) {
+        (None, S::Ws | S::Grpc) => {
+            return Err(format!(
+                "a {} check names the RPC in method (\"pkg.Service/Method\")",
+                surface.as_str()
+            ));
+        }
+        (None, _) => None,
+        (Some(m), S::Http) => {
+            let m = m.to_ascii_uppercase();
+            if !crate::checks::HTTP_METHODS.contains(&m.as_str()) {
+                return Err(format!(
+                    "method must be one of {}",
+                    crate::checks::HTTP_METHODS.join(", ")
+                ));
+            }
+            Some(m)
+        }
+        (Some(m), _) => {
+            let ok = m.len() <= limits::MAX_NAME_FIELD
+                && m.split_once('/').is_some_and(|(svc, name)| {
+                    !svc.is_empty()
+                        && !name.is_empty()
+                        && svc
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+                        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                });
+            if !ok {
+                return Err("method must be an RPC's full name, pkg.Service/Method".into());
+            }
+            Some(m.clone())
+        }
+    };
+    let mut headers = Vec::new();
+    for (k, v) in &i.headers {
+        let k = k.to_ascii_lowercase();
+        if !crate::checks::HTTP_HEADERS.contains(&k.as_str()) {
+            return Err(format!(
+                "headers may set only {}",
+                crate::checks::HTTP_HEADERS.join(" and ")
+            ));
+        }
+        if v.is_empty() || v.len() > 256 || !v.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+            return Err(format!("headers.{k} must be 1 to 256 printable characters"));
+        }
+        headers.push((k, v.clone()));
+    }
+    if surface == S::Mqtt && i.topic.is_none() {
+        return Err("an mqtt check names the topic it publishes the call to".into());
+    }
+    if let Some(t) = &i.topic
+        && (t.is_empty()
+            || t.len() > limits::MAX_NAME_FIELD
+            || t.contains(['+', '#', '\0'])
+            || t.starts_with('$')
+            || t.chars().any(char::is_control))
+    {
+        return Err("topic must be a topic name, no wildcards, at most 256 characters".into());
+    }
+    if let Some(q) = &i.query
+        && (q.trim().is_empty() || q.len() > limits::MAX_QUERY)
+    {
+        return Err(format!("query must be 1 to {} bytes", limits::MAX_QUERY));
+    }
+    if let Some(n) = i.events
+        && n > bounds::MAX_EVENTS
+    {
+        return Err(format!("events must be 0 to {}", bounds::MAX_EVENTS));
+    }
+    if let Some(n) = i.min_tools
+        && n > 1000
+    {
+        return Err("min_tools must be 0 to 1000".into());
+    }
+    if let Some(t) = &i.tool
+        && (t.is_empty()
+            || t.len() > 128
+            || !t
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')))
+    {
+        return Err("tool must be 1 to 128 of A-Z, a-z, 0-9, _, - and .".into());
+    }
+    if i.args.is_some() && i.tool.is_none() {
+        return Err("args needs tool".into());
+    }
+    if let Some(c) = &i.expect_error
+        && (c.is_empty() || c.len() > 32 || !c.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'))
+    {
+        return Err("expect_error must be an error code, 1 to 32 of a-z and _".into());
+    }
+    if let Some(c) = i.expect_code
+        && c > 16
+    {
+        return Err("expect_code must be a gRPC status code, 0 to 16".into());
+    }
+    let body = match surface {
+        S::Http => json("body", i.body.clone())?,
+        S::Ws | S::Mqtt => json("params", i.params.clone().map(toml::Value::Table))?,
+        S::Graphql => json("variables", i.variables.clone().map(toml::Value::Table))?,
+        S::Mcp => json("args", i.args.clone().map(toml::Value::Table))?,
+        _ => None,
+    };
+    Ok(Params {
+        method,
+        body,
+        headers,
+        query: i.query.clone(),
+        topic: i.topic.clone(),
+        events: i.events,
+        min_tools: i.min_tools,
+        tool: i.tool.clone(),
+        allow_side_effects: i.allow_side_effects.unwrap_or(false),
+        expect_error: i.expect_error.clone(),
+        expect_code: i.expect_code,
+    })
+}
+
+/// Tags as the platform takes them: at most ten, `^[a-z][a-z0-9_.-]{0,31}$` keys and
+/// `^[A-Za-z0-9_.:/-]{1,64}$` values. No customer data belongs in a tag.
+fn check_tags(tags: &BTreeMap<String, String>) -> std::result::Result<(), String> {
+    if tags.len() > limits::MAX_TAGS {
+        return Err(format!("at most {} tags", limits::MAX_TAGS));
+    }
+    for (k, v) in tags {
+        let key_ok = (1..=32).contains(&k.len())
+            && k.as_bytes()[0].is_ascii_lowercase()
+            && k.bytes().all(|b| {
+                b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'.' | b'-')
+            });
+        if !key_ok {
+            return Err(format!(
+                "tag {k:?}: a key is a-z first, then up to 31 of a-z, 0-9, _, . and -"
+            ));
+        }
+        let value_ok = (1..=64).contains(&v.len())
+            && v.bytes().all(|b| {
+                b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'/' | b'-')
+            });
+        if !value_ok {
+            return Err(format!(
+                "tag {k:?}: a value is 1 to 64 of A-Z, a-z, 0-9, _, ., :, / and -"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn check_expect(x: &FileExpect, surface: Surface) -> std::result::Result<(), String> {
@@ -457,8 +785,8 @@ fn check_expect(x: &FileExpect, surface: Surface) -> std::result::Result<(), Str
             return Err("expect.valid_for_days is for tls and http checks".into());
         }
     }
-    if x.status.is_some() && !matches!(surface, Surface::Http) {
-        return Err("expect.status is for http checks".into());
+    if x.status.is_some() && !surface.has_status() {
+        return Err("expect.status is for http, sse, mcp and graphql checks".into());
     }
     Ok(())
 }
@@ -971,6 +1299,197 @@ allow = ["env:CHECK_*"]
             );
             s
         })
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // one case per rule
+    fn transport_requests_are_bounded_and_stay_local() {
+        let entry = |surface: &str, target: &str, extra: &str| {
+            format!(
+                "[[check]]\nname = \"t\"\nsurface = \"{surface}\"\ntarget = \"{target}\"\nevery = \"15m\"\n{extra}"
+            )
+        };
+        let c = one(&entry(
+            "graphql",
+            "https://api.example.com/graphql",
+            "query = \"{ me { id } }\"\nvariables = { a = 1 }\nauth = \"env:CHECK_T\"\nauth_scheme = \"Bearer\"\ncategory = \"transport\"\ntags = { transport = \"graphql\", env = \"prod:eu-1\" }\n",
+        ))
+        .unwrap();
+        assert_eq!(c.spec.params.query.as_deref(), Some("{ me { id } }"));
+        assert_eq!(c.spec.params.body, Some(json!({"a": 1})));
+        assert_eq!(
+            c.spec.auth.as_ref().unwrap().scheme.as_deref(),
+            Some("Bearer")
+        );
+        let wire = c.to_wire();
+        assert_eq!(wire["category"], "transport");
+        assert_eq!(
+            wire["tags"],
+            json!({"env": "prod:eu-1", "transport": "graphql"})
+        );
+        assert_eq!(wire["auth"], "env:CHECK_T");
+        let text = wire.to_string();
+        assert!(
+            !text.contains("me { id }") && !text.contains("Bearer"),
+            "{text}"
+        );
+        let c = one(&entry(
+            "http",
+            "https://api.example.com/v1/x",
+            "method = \"post\"\nbody = { a = [1, 2] }\nheaders = { Accept = \"application/json\" }\n",
+        ))
+        .unwrap();
+        assert_eq!(c.spec.params.method.as_deref(), Some("POST"));
+        assert_eq!(
+            c.spec.params.headers,
+            vec![("accept".to_owned(), "application/json".to_owned())]
+        );
+        let c = one(&entry(
+            "grpc",
+            "api.example.com:443",
+            "method = \"iohr.ledger.v1.LedgerService/Ping\"\nexpect_code = 16\n",
+        ))
+        .unwrap();
+        assert_eq!(c.spec.params.expect_code, Some(16));
+        let big = "x".repeat(bounds::MAX_REQUEST_BYTES);
+        for (bad, why) in [
+            (
+                entry("ws", "https://a.example.com/v1/ws", ""),
+                "ws needs method",
+            ),
+            (
+                entry("grpc", "a.example.com:443", "method = \"Ping\"\n"),
+                "grpc method shape",
+            ),
+            (
+                entry("mqtt", "https://a.example.com/v1/mqtt", ""),
+                "mqtt needs topic",
+            ),
+            (
+                entry(
+                    "mqtt",
+                    "https://a.example.com/v1/mqtt",
+                    "topic = \"events/#\"\n",
+                ),
+                "wildcard topic",
+            ),
+            (
+                entry("sse", "https://a.example.com/s", "events = 21\n"),
+                "too many events",
+            ),
+            (
+                entry("sse", "https://a.example.com/s", "query = \"{ a }\"\n"),
+                "query on sse",
+            ),
+            (
+                entry("mcp", "https://a.example.com/mcp", "args = { a = 1 }\n"),
+                "args without tool",
+            ),
+            (
+                entry("mcp", "https://a.example.com/mcp", "tool = \"a b\"\n"),
+                "tool name",
+            ),
+            (
+                entry(
+                    "ws",
+                    "https://a.example.com/v1/ws",
+                    "method = \"a.B/C\"\nexpect_error = \"Forbidden!\"\n",
+                ),
+                "expect_error",
+            ),
+            (
+                entry(
+                    "grpc",
+                    "a.example.com:443",
+                    "method = \"a.B/C\"\nexpect_code = 17\n",
+                ),
+                "expect_code",
+            ),
+            (
+                entry("http", "https://a.example.com/", "method = \"TRACE\"\n"),
+                "http method",
+            ),
+            (
+                entry(
+                    "http",
+                    "https://a.example.com/",
+                    "headers = { authorization = \"x\" }\n",
+                ),
+                "header allow-list",
+            ),
+            (
+                entry(
+                    "http",
+                    "https://a.example.com/",
+                    &format!("body = {{ a = \"{big}\" }}\n"),
+                ),
+                "body size",
+            ),
+            (
+                entry("ws", "a.example.com:443", "method = \"a.B/C\"\n"),
+                "ws url",
+            ),
+            (
+                entry("tcp", "a.example.com:5432", "auth = \"env:X\"\n"),
+                "auth on tcp",
+            ),
+            (
+                entry(
+                    "graphql",
+                    "https://a.example.com/",
+                    "auth_scheme = \"Bearer\"\n",
+                ),
+                "scheme without auth",
+            ),
+            (
+                entry(
+                    "graphql",
+                    "https://a.example.com/",
+                    "expect = { status = 200 }\ncategory = \"misc\"\n",
+                ),
+                "category",
+            ),
+            (
+                entry(
+                    "graphql",
+                    "https://a.example.com/",
+                    "tags = { Env = \"x\" }\n",
+                ),
+                "tag key",
+            ),
+            (
+                entry(
+                    "graphql",
+                    "https://a.example.com/",
+                    "tags = { env = \"a b\" }\n",
+                ),
+                "tag value",
+            ),
+            (
+                entry(
+                    "graphql",
+                    "https://a.example.com/",
+                    &format!(
+                        "tags = {{ {} }}\n",
+                        (0..11)
+                            .map(|i| format!("k{i} = \"v\""))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                ),
+                "eleven tags",
+            ),
+            (
+                entry(
+                    "mqtt",
+                    "https://a.example.com/v1/mqtt",
+                    "topic = \"rpc/a/B\"\nexpect = { status = 200 }\n",
+                ),
+                "status on mqtt",
+            ),
+        ] {
+            assert!(one(&bad).is_err(), "{why} accepted");
+        }
     }
 
     #[test]
