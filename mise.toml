@@ -75,6 +75,11 @@ pin=$(grep '^channel' crates/iohr-capture-ebpf/rust-toolchain.toml | cut -d'"' -
 grep -q "version = .$pin.," mise.toml || { echo "rust-toolchain.toml names $pin; mise.toml pins another nightly" >&2; exit 1; }
 """
 
+[tasks."capture:e2e"]
+shell = "bash -e -o pipefail -c"
+description = "iohr-capture in throwaway VMs (virtme-ng + QEMU/KVM) on kernels 5.15, 6.6, 6.12; never on this host"
+run = "tools/capture-e2e.sh"
+
 [tasks.fmt]
 run = "cargo fmt --all"
 

@@ -1,5 +1,7 @@
 [default.extend-words]
 hr = "hr"
+# setpriv --inh-caps (tools/capture_e2e_guest.py)
+inh = "inh"
 
 [files]
 extend-exclude = ["LICENSE", "CODE_OF_CONDUCT.md", "crates/iohr-agent/tests/fixtures/*", "*.svg"]
