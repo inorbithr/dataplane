@@ -318,7 +318,10 @@ sudo systemctl restart iohr-capture
 ```
 
 The companion then keeps the latest packets in memory (`IOHR_CAPTURE_PACKETS_BUFFER_MIB`,
-32 by default, never older than 300 s). Nothing is written until root asks:
+32 by default, never older than 300 s). With GRO and TSO one copy can be 64 KiB, so on a
+busy interface that is seconds of traffic, not minutes: `packets.buffer_evicted` in `stats`
+says how much went, and `--next` captures what is coming instead. Nothing is written until
+root asks:
 
 ```sh
 # The last 30 s from memory, only HTTPS, with a copy you own for dissection:
@@ -335,9 +338,16 @@ sudo iohr-capture pcap --next --seconds 60 --filter 'host 10.0.0.7 and not port 
   0600, in a 0700 directory of the companion's user (the unit's `StateDirectory=`). At most
   `IOHR_CAPTURE_PCAP_MAX_BYTES` (64 MiB) per file and `IOHR_CAPTURE_PCAP_DIR_MAX_BYTES`
   (512 MiB) in all (`no_space` past it), deleted `IOHR_CAPTURE_PCAP_RETENTION_SECS` (3600)
-  after it was written. `sudo apt purge iohr-capture` removes the directory.
-- **`--out FILE`** makes a copy for you: the file must not exist, it is created 0600 and
-  owned by the user who ran `sudo`. That copy is yours; the companion does not delete it.
+  after it was written, and all of them when the service stops (its `ExecStopPost`).
+  `/usr/lib/tmpfiles.d/iohr-capture.conf` removes files older than 1 h after a hard
+  crash; keep its age in step if you change the retention. A request never takes the
+  file system below 64 MiB free. `sudo apt purge iohr-capture` removes the directory.
+- **`--out FILE`** makes a copy for you: the file must not exist, and it is created 0600
+  *as* the user who ran `sudo` (root becomes that user first), so it can only land where
+  you could write yourself. Root copies only the companion's own regular file from the
+  pcap directory (`--pcap-dir`, `IOHR_CAPTURE_PCAP_DIR`), never a link or anything the
+  companion's answer points elsewhere. That copy is yours; the companion does not delete
+  it, also not when it stops.
 - pcapng with nanosecond timestamps and each packet's direction (inbound, outbound).
   Packets over the copy rate are missing from the file and counted in
   `packets.rate_limited`; `--max-bytes` cuts a file (`truncated: true`).

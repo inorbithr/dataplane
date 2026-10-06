@@ -27,6 +27,10 @@ agent's policy: an agent can never turn it on.
 | `IOHR_CAPTURE_PACKETS_RING_KIB` | 8192 | 256-32768 | the second ring buffer |
 | `IOHR_CAPTURE_PACKETS_BUFFER_MIB` | 32 | 1-128 | packets kept in the parser's memory (oldest out first; nothing older than 300 s) |
 
+The buffer is bounded by bytes first. With GRO and TSO one copy is up to 64 KiB, so on a
+busy interface 32 MiB holds seconds of traffic, not 300; the copy rate cap
+(`IOHR_CAPTURE_PACKETS_PER_SEC`) and `buffer_evicted` say how much was kept.
+
 In the kernel a second ring buffer (`IOHR_PACKETS`) gets a copy of every packet on the
 interface, ingress and egress, up to the snap length, after its own per-CPU token bucket.
 A ring-buffer reservation has to be a constant size, so a packet goes into the smallest
@@ -83,18 +87,42 @@ aggregates socket.
   nanosecond timestamps, and the direction of each packet in `epb_flags`.
 - Retention: a file is deleted `IOHR_CAPTURE_PCAP_RETENTION_SECS` after it was written
   (default 3600, range 1-86400). The parser sweeps the directory at start and every poll,
-  and deletes only files named like its own.
+  and deletes only files named like its own. When the companion stops, nothing would
+  expire them, so `iohr-capture cleanup` (the unit's `ExecStopPost`) deletes them all;
+  `/usr/lib/tmpfiles.d/iohr-capture.conf` (`e … 1h`) is the net for a host that went down
+  hard.
+- Room: a request gets at most what is left under `IOHR_CAPTURE_PCAP_DIR_MAX_BYTES`
+  (clamped to one largest file and 64 GiB) after the files there and what a running
+  `next` file may still grow to, and never more than the file system's free space less
+  64 MiB (`statvfs`).
+- The directories: an existing sockets or pcap directory is used only if it belongs to
+  root or the parser's user and its parent is not writable by others (unless sticky).
+- Writing: a `last` file is written off the lock and off the parser's event loop. A
+  `next` file is appended in the loop that reads the pipe (buffered, to the page cache);
+  moving it to its own writer thread is a follow-up.
 - The pcap file is never sent anywhere: no socket of the companion can carry it, and the
   unit allows no IP traffic (`IPAddressDeny=any`).
 
 ### `iohr-capture pcap` and `iohr-capture dissect`
 
 - `sudo iohr-capture pcap --seconds 30 --filter 'tcp and port 443' [--next] [--max-bytes N] [--out FILE]`
-  talks to the control socket. With `--out`, root copies the file to `FILE`, which must not
-  exist, mode 0600, owned by the person who ran `sudo` (`SUDO_UID`), so that person can
-  dissect it without root. The copy is theirs to delete; the companion's own copy expires.
-- `iohr-capture dissect FILE [-- tshark options]` runs the host's own `tshark -n -r FILE`
-  as the invoking user, with standard input closed, and prints tshark's output. It refuses
+  talks to the control socket. With `--out`, root copies the file for the person who ran
+  `sudo`, who can then dissect it without root. The copy is theirs to delete; the
+  companion's own copy expires. The parser that names the file is the least trusted part
+  of the companion, so the command trusts nothing in its answer:
+  - the path must be `<pcap dir>/<name>`, for the directory the command resolves itself
+    (`--pcap-dir`, `IOHR_CAPTURE_PCAP_DIR`), with a name of the companion's own form;
+  - the directory is opened `O_DIRECTORY|O_NOFOLLOW` and the file with `openat`,
+    `O_NOFOLLOW|O_NONBLOCK`, so a symbolic link fails and a FIFO cannot block;
+  - `fstat` of the open file: a regular file, one link, owned by the directory's owner
+    (never root), within the size cap;
+  - only then root becomes the person (`setgroups`, `setresgid`, `setresuid` to
+    `SUDO_UID`/`SUDO_GID`) and creates `FILE` as them, 0600, never over an existing file,
+    so the copy can only land where that person could write; a partial copy is removed.
+- `iohr-capture dissect FILE [-- tshark options]` runs the host's own `tshark -n -r -`
+  as the invoking user, with the file it opened as tshark's standard input, and prints
+  tshark's output. Only absolute `PATH` entries are searched. With `--as-root` the
+  environment is cleared but for `PATH` and `LANG` (`HOME=/root`). It refuses
   to run as root unless `--as-root` is given (dissectors parse untrusted bytes; Wireshark's
   own advice is to never run them as root). With no `tshark` on `PATH` it says how to
   install it (`apt install tshark`, `dnf install wireshark-cli`). `tshark` is GPL. It is
@@ -161,6 +189,13 @@ Keyed by (method, route template, owner):
 The owner is layer 4's owner key (`cgroup:/…`, `systemd:….service`, `container:…`,
 `kubernetes:pod …`), or `unowned`. At most 2048 keys. A new key beyond that is counted
 in `timing.keys_dropped`, and its requests in `timing.untracked`.
+
+**Memory.** Every tracker together may hold at most 32768 waiting requests (HTTP/1
+queues and HTTP/2 streams) and 8 MiB of header block bytes, charged after each segment;
+header bytes are kept only as they arrive. With the budget spent, a new request is dropped
+and counted (`timing.budget.refused`) and no header block is kept, so spoofed traffic on
+many flows fills the budget, never the parser's memory. Per flow the bounds stay 16
+waiting HTTP/1 requests, 64 HTTP/2 streams and 4 KiB per header block.
 
 `counts` carries totals only (requests, responses, unanswered, unsynced, keys, the
 histogram summed over keys). `tables` carries the 50 busiest keys, with their names, for
@@ -229,6 +264,23 @@ example `GET /orders/{id}`.
   - A peer may make at most 50 lookups a second (beyond that, `rate_limited`). Guessing
     route names one by one stays slow, and RFC 0070's join needs a lookup per span batch,
     not per request.
+  - **No allowlist of owners and routes for the agent (decided).** A lookup is an oracle:
+    asked for a key, it says whether that key saw traffic. We considered answering the
+    agent's user only for owners and routes its local policy lists, and chose not to:
+    - the keys the agent asks for come from spans of the company's own programs on this
+      host (RFC 0070), which already carry those routes, so the oracle tells the agent
+      little it does not hold;
+    - the answers are numbers and stay on the host: RFC 0070 keeps capture-joined
+      attributes host-only, and the agent forwards none of them;
+    - an allowlist would be a second, company-maintained list of routes in the companion's
+      configuration that must track every deploy, and a stale list silently breaks the
+      join;
+    - guessing is bounded: 50 lookups a second, templates only (ids already replaced),
+      never a list.
+
+    Revisit if the agent ever forwards lookup results off the host, or if a deployment
+    must keep route names from the agent's user: then the allowlist goes into the
+    companion's own configuration, not the agent's policy.
 - **Negotiation.**
   - A client sends the highest version it speaks.
   - The companion answers in the version it was asked, if it speaks it. Otherwise it

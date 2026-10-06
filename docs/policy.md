@@ -89,7 +89,7 @@ the agent before adding them. A policy without them keeps the hash it had before
 | Key | Default | Meaning |
 |---|---|---|
 | `socket` | `/run/iohr-capture/aggregates.sock` | The companion's aggregates socket (absolute path). |
-| `layers` | `["headers", "protocols", "owners", "tcp", "packets", "timing"]` | Layers the agent may announce: `capture:<layer>` in the hello, for each one the companion also runs. `packets` also needs the companion's root-only control socket to exist; it says the host can make pcap files for root, never that the agent can (the agent never gets packets). `packets` and `timing` need an agent with capture phase 2; a `[capture]` section without `layers` gets a new policy hash with that agent, because the default list grew. |
+| `layers` | `["headers", "protocols", "owners", "tcp", "packets", "timing"]` | Layers the agent may announce: `capture:<layer>` in the hello, for each one the companion also runs. `packets` also needs the companion's root-only control socket to exist; it says the host can make pcap files for root, never that the agent can (the agent never gets packets). `packets` and `timing` need an agent with capture phase 2: phase 1 agents reject a policy that names them and do not start, so upgrade the agents first, then the policies; a `[capture]` section without `layers` gets a new policy hash with that agent, because the default list grew. |
 | `max_snapshot_age_secs` | `30` | 1–3600. An answer whose numbers are older counts as no answer: nothing is announced. |
 
 At each session start the agent asks the socket for counts (1 s timeout). Only the
