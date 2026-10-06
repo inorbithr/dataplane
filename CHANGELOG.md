@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.1.0-alpha.5](https://github.com/inorbithr/dataplane/compare/v0.1.0-alpha.4...v0.1.0-alpha.5) (2026-10-06)
+
+
+### Features
+
+* **capture:** iohr-capture phase 0, eBPF toolchain spike with VM tests ([#13](https://github.com/inorbithr/dataplane/issues/13)) ([09dd821](https://github.com/inorbithr/dataplane/commit/09dd821485e00e79e36f690fbeb7cb53ec85f84f))
+* **capture:** phase 1, headers, protocols, owners and TCP health, with the agent's capture policy ([#14](https://github.com/inorbithr/dataplane/issues/14)) ([7fd5241](https://github.com/inorbithr/dataplane/commit/7fd52410a69182c2d14d5f7ec4fddffa9851eca2))
+* **capture:** phase 2, whole packets with pcap on request, request timing per route, lookup v2 ([#17](https://github.com/inorbithr/dataplane/issues/17)) ([874321b](https://github.com/inorbithr/dataplane/commit/874321bcd6246bd562b30eb14641d3727421e6c2))
+
+
+### Documentation
+
+* the repository's logo and social preview ([#16](https://github.com/inorbithr/dataplane/issues/16)) ([5d327a8](https://github.com/inorbithr/dataplane/commit/5d327a8efb3fd392251f075eab92f5c37c3f3029))
+
+
+### Dependencies
+
+* **deps:** move every crate to its latest release, majors included ([#10](https://github.com/inorbithr/dataplane/issues/10)) ([7807768](https://github.com/inorbithr/dataplane/commit/780776855b4a5cfada0d17874756d5f82d5dbad9))
+
 ## [0.1.0-alpha.4](https://github.com/inorbithr/dataplane/compare/v0.1.0-alpha.3...v0.1.0-alpha.4) (2026-10-03)
 
 
