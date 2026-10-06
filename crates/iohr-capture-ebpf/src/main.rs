@@ -14,7 +14,12 @@
 //!
 //!    every copy passes a per-CPU token bucket first (`Config::interval_ns`/`burst_ns`);
 //!    a copy over the rate, or one the ring buffer has no room for, is counted, never
-//!    queued.
+//!    queued. With `CONFIG_TIMING` (layer 7) every TCP packet with payload has its
+//!    payload prefix copied, not only a flow's first ones;
+//! 4. with `CONFIG_PACKETS` (layer 3, phase 2), copy the whole packet, up to
+//!    `Config::snaplen` bytes, to a second ring buffer, after a second token bucket
+//!    (`pkt_interval_ns`/`pkt_burst_ns`). A reservation must be a constant size, so each
+//!    packet goes into the smallest record of `PACKET_TIERS` that holds it.
 #![no_std]
 #![no_main]
 // Small helpers are inlined on purpose: one flat program per hook keeps the verifier's
@@ -30,10 +35,12 @@ use aya_ebpf::{
 };
 use iohr_capture_common::{
     CLASS_ICMP4, CLASS_ICMP6, CLASS_NON_IP, CLASS_OTHER4, CLASS_OTHER6, CLASS_SLOTS, CLASS_TCP4,
-    CLASS_TCP6, CLASS_UDP4, CLASS_UDP6, CONFIG_HEADERS, CONFIG_PROTOCOLS, Config, Counters,
-    DEFAULT_RING_BYTES, DIRECTIONS, EGRESS, FLAG_FIN, FLAG_RST, FLAG_SLOTS, FLAG_SYN, FLAG_SYN_ACK,
-    FLOW_ENTRIES, FlowKey, HEADER_BYTES, INGRESS, KIND_LIFECYCLE, KIND_PAYLOAD, PAYLOAD_BYTES,
-    PORT_ENTRIES, PortCounters, PortKey, RECORD_DATA, Record, STAT_COPIED, STAT_PAYLOAD,
+    CLASS_TCP6, CLASS_UDP4, CLASS_UDP6, CONFIG_HEADERS, CONFIG_PACKETS, CONFIG_PROTOCOLS,
+    CONFIG_TIMING, Config, Counters, DEFAULT_PACKETS_RING_BYTES, DEFAULT_RING_BYTES, DIRECTIONS,
+    EGRESS, FLAG_FIN, FLAG_RST, FLAG_SLOTS, FLAG_SYN, FLAG_SYN_ACK, FLOW_ENTRIES, FlowKey,
+    HEADER_BYTES, INGRESS, KIND_LIFECYCLE, KIND_PAYLOAD, PACKET_TIERS, PAYLOAD_BYTES, PORT_ENTRIES,
+    PacketRecord, PortCounters, PortKey, RECORD_DATA, Record, STAT_COPIED, STAT_PAYLOAD,
+    STAT_PKT_BYTES, STAT_PKT_COPIED, STAT_PKT_RATE_LIMITED, STAT_PKT_RINGBUF_FULL,
     STAT_RATE_LIMITED, STAT_RINGBUF_FULL, STAT_SHORT, STATS,
 };
 
@@ -50,13 +57,19 @@ static PORTS: LruPerCpuHashMap<PortKey, PortCounters> =
 static FLOWS: LruHashMap<FlowKey, u32> = LruHashMap::with_max_entries(FLOW_ENTRIES, 0);
 #[map(name = "IOHR_STATS")]
 static STATS_MAP: PerCpuArray<u64> = PerCpuArray::with_max_entries(STATS, 0);
-/// The token bucket's "theoretical arrival time" per CPU (GCRA).
+/// The token buckets' "theoretical arrival time" per CPU (GCRA): slot 0 for the copies of
+/// layers 1, 2 and 7, slot 1 for whole packets (layer 3).
 #[map(name = "IOHR_BUCKET")]
-static BUCKET: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+static BUCKET: PerCpuArray<u64> = PerCpuArray::with_max_entries(2, 0);
+const BUCKET_COPIES: u32 = 0;
+const BUCKET_PACKETS: u32 = 1;
 #[map(name = "IOHR_CONFIG")]
 static CONFIG: Array<Config> = Array::with_max_entries(1, 0);
 #[map(name = "IOHR_EVENTS")]
 static EVENTS: RingBuf = RingBuf::with_byte_size(DEFAULT_RING_BYTES, 0);
+/// Layer 3: whole packets. User space sets its size (a page when packets are off).
+#[map(name = "IOHR_PACKETS")]
+static PACKETS: RingBuf = RingBuf::with_byte_size(DEFAULT_PACKETS_RING_BYTES, 0);
 
 const ETH_P_IP: u16 = 0x0800;
 const ETH_P_IPV6: u16 = 0x86dd;
@@ -116,6 +129,9 @@ fn handle(ctx: &TcContext, direction: u32) {
     add_counters(&COUNTERS, direction, len);
     let Some(cfg) = CONFIG.get(0) else { return };
     let ethertype = u16::from_be(ctx.skb.protocol() as u16);
+    if cfg.flags & CONFIG_PACKETS != 0 {
+        copy_packet(ctx, direction, ethertype, cfg);
+    }
     let Some(p) = parse(ctx, ethertype, cfg.l2_len) else {
         add_counters(&CLASSES, direction * CLASS_SLOTS + CLASS_NON_IP, len);
         return;
@@ -146,14 +162,17 @@ fn handle(ctx: &TcContext, direction: u32) {
             lifecycle = true;
         }
     }
+    // Layer 7 needs every request and response start of a TCP flow, not only its first
+    // packets; the token bucket below bounds it like every other copy.
+    let every = cfg.flags & CONFIG_TIMING != 0 && p.proto == IPPROTO_TCP;
     let payload = p.payload_len > 0
         && cfg.flags & CONFIG_PROTOCOLS != 0
-        && first_packets(&p, direction, cfg.first_packets);
+        && (every || first_packets(&p, direction, cfg.first_packets));
     let headers = lifecycle && cfg.flags & CONFIG_HEADERS != 0;
     if !payload && !headers {
         return;
     }
-    if !take_token(cfg) {
+    if !take_token(BUCKET_COPIES, cfg.interval_ns, cfg.burst_ns) {
         bump(&STATS_MAP, STAT_RATE_LIMITED);
         return;
     }
@@ -355,13 +374,13 @@ fn first_packets(p: &Parsed, direction: u32, limit: u32) -> bool {
     }
 }
 
-/// GCRA token bucket per CPU: true when a copy may go out now.
+/// GCRA token bucket per CPU (`slot` of the bucket map): true when a copy may go out now.
 #[inline(always)]
-fn take_token(cfg: &Config) -> bool {
-    if cfg.interval_ns == 0 {
+fn take_token(slot: u32, interval_ns: u64, burst_ns: u64) -> bool {
+    if interval_ns == 0 {
         return true;
     }
-    let Some(tat) = BUCKET.get_ptr_mut(0) else {
+    let Some(tat) = BUCKET.get_ptr_mut(slot) else {
         return false;
     };
     // SAFETY: a helper without arguments.
@@ -372,10 +391,10 @@ fn take_token(cfg: &Config) -> bool {
         if t < now {
             t = now;
         }
-        if t - now > cfg.burst_ns {
+        if t - now > burst_ns {
             return false;
         }
-        *tat = t + cfg.interval_ns;
+        *tat = t + interval_ns;
     }
     true
 }
@@ -436,6 +455,88 @@ fn copy(ctx: &TcContext, direction: u32, ethertype: u16, l2_len: u32, want: u32,
     }
 }
 
+/// Layer 3: the whole packet, up to `snaplen` bytes, into the packets ring buffer.
+#[inline(always)]
+#[allow(clippy::cast_possible_truncation)] // the tiers are constants far below u32::MAX
+fn copy_packet(ctx: &TcContext, direction: u32, ethertype: u16, cfg: &Config) {
+    if !take_token(BUCKET_PACKETS, cfg.pkt_interval_ns, cfg.pkt_burst_ns) {
+        bump(&STATS_MAP, STAT_PKT_RATE_LIMITED);
+        return;
+    }
+    let skb_len = ctx.len();
+    let n = if cfg.snaplen < skb_len {
+        cfg.snaplen
+    } else {
+        skb_len
+    };
+    if n <= PACKET_TIERS[0] as u32 {
+        copy_tier::<{ PACKET_TIERS[0] }>(ctx, direction, ethertype, cfg.l2_len, n);
+    } else if n <= PACKET_TIERS[1] as u32 {
+        copy_tier::<{ PACKET_TIERS[1] }>(ctx, direction, ethertype, cfg.l2_len, n);
+    } else if n <= PACKET_TIERS[2] as u32 {
+        copy_tier::<{ PACKET_TIERS[2] }>(ctx, direction, ethertype, cfg.l2_len, n);
+    } else {
+        copy_tier::<{ PACKET_TIERS[3] }>(ctx, direction, ethertype, cfg.l2_len, n);
+    }
+}
+
+/// One record of tier size `N` (a power of two or not; `n` is at most `N` for the tier
+/// the caller picked, and at most 65535 for the last one).
+#[inline(always)]
+#[allow(clippy::cast_possible_truncation)]
+fn copy_tier<const N: usize>(ctx: &TcContext, direction: u32, ethertype: u16, l2_len: u32, n: u32) {
+    let Some(mut entry) = PACKETS.reserve::<PacketRecord<N>>(0) else {
+        bump(&STATS_MAP, STAT_PKT_RINGBUF_FULL);
+        return;
+    };
+    let record = entry.as_mut_ptr();
+    let mask = (N.next_power_of_two() - 1) as u32;
+    // The caller's tier check makes the mask below look redundant to LLVM, which then drops
+    // it, and the verifier (which does not see that check on the same register) rejects
+    // the load as unbounded. Hiding `n` from the optimizer keeps both bounds in the code.
+    let n = core::hint::black_box(n);
+    // SAFETY: `record` points at a reserved ring-buffer slot of
+    // `size_of::<PacketRecord<N>>()` bytes that only this program writes until it is
+    // submitted or discarded. The load writes `len` bytes, 1 <= len <= N, into the data
+    // array of N bytes: masking and adding one gives the verifier a minimum of 1 and a
+    // maximum of the next power of two; the comparison caps it at N. For 1 <= n <= N it
+    // equals `n`.
+    let (loaded, len) = unsafe {
+        let len = (n.wrapping_sub(1) & mask) + 1;
+        if len > N as u32 {
+            (-1, 0)
+        } else {
+            (
+                bpf_skb_load_bytes(
+                    ctx.skb.skb.cast(),
+                    0,
+                    core::ptr::addr_of_mut!((*record).data).cast(),
+                    len,
+                ),
+                len,
+            )
+        }
+    };
+    if loaded != 0 {
+        entry.discard(0);
+        bump(&STATS_MAP, STAT_SHORT);
+        return;
+    }
+    // SAFETY: as above; the header fields are plain integers.
+    unsafe {
+        (*record).header.ts_ns = bpf_ktime_get_ns();
+        (*record).header.skb_len = ctx.len();
+        (*record).header.cap_len = len;
+        (*record).header.ethertype = ethertype;
+        (*record).header.direction = direction as u8;
+        (*record).header.l2_len = l2_len as u8;
+        (*record).header.reserved = [0; 4];
+    }
+    entry.submit(0);
+    bump(&STATS_MAP, STAT_PKT_COPIED);
+    add(&STATS_MAP, STAT_PKT_BYTES, u64::from(len));
+}
+
 #[inline(always)]
 fn add_counters(map: &PerCpuArray<Counters>, index: u32, len: u32) {
     if let Some(slot) = map.get_ptr_mut(index) {
@@ -451,10 +552,15 @@ fn add_counters(map: &PerCpuArray<Counters>, index: u32, len: u32) {
 
 #[inline(always)]
 fn bump(map: &PerCpuArray<u64>, index: u32) {
+    add(map, index, 1);
+}
+
+#[inline(always)]
+fn add(map: &PerCpuArray<u64>, index: u32, n: u64) {
     if let Some(slot) = map.get_ptr_mut(index) {
         // SAFETY: as in `add_counters`.
         unsafe {
-            *slot = (*slot).wrapping_add(1);
+            *slot = (*slot).wrapping_add(n);
         }
     }
 }

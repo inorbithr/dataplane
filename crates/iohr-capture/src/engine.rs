@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use iohr_capture_common::{CLASS_NAMES, FLAG_NAMES};
+use iohr_capture_common::{CLASS_NAMES, FLAG_NAMES, STATS_USED};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -22,10 +22,16 @@ use crate::packet::{self, IPPROTO_TCP, IPPROTO_UDP, TCP_ACK, TCP_FIN, TCP_RST, T
 use crate::privileges::Dropped;
 use crate::proto::{Detect, Event, dns, http1, http2, postgres, redis, tls};
 use crate::sockdiag::{self, Socket};
+use crate::timing::{self, Outcome};
 use crate::topk::TopK;
 
-/// Protocol version of the socket answers (`docs/capture/design-phase1.md`).
+/// Protocol version of the socket answers to `counts` and `tables` asked in version 1
+/// (`docs/capture/design-phase1.md`).
 pub(crate) const WIRE_VERSION: u32 = 1;
+/// The newest version of the aggregates socket (`docs/capture/design-phase2.md`).
+pub(crate) const WIRE_VERSION_2: u32 = 2;
+/// Owner key of flows no owner was found for (layer 7 and the lookup).
+pub(crate) const UNOWNED: &str = "unowned";
 /// Rows of each top-K table kept in memory.
 const TOPK_CAPACITY: usize = 64;
 /// Rows of each table shown.
@@ -36,6 +42,8 @@ const MAX_OWNERS: usize = 512;
 const RECENTLY_CLOSED: usize = 4096;
 /// Most per-port TCP rows kept.
 const MAX_TCP_PORTS: usize = 256;
+/// Timing rows shown in `tables`.
+const TIMING_SHOWN: usize = 50;
 
 /// The layers this companion runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +53,8 @@ pub(crate) struct Layers {
     pub(crate) protocols: bool,
     pub(crate) owners: bool,
     pub(crate) tcp: bool,
+    /// Layer 7: request timing (needs `protocols`).
+    pub(crate) timing: bool,
 }
 
 impl Layers {
@@ -54,6 +64,7 @@ impl Layers {
             (self.protocols, "protocols"),
             (self.owners, "owners"),
             (self.tcp, "tcp"),
+            (self.timing, "timing"),
         ]
         .into_iter()
         .filter(|(on, _)| *on)
@@ -61,13 +72,14 @@ impl Layers {
         .collect()
     }
 
-    /// Parses `headers,protocols,owners,tcp`.
+    /// Parses `headers,protocols,owners,tcp,timing`.
     pub(crate) fn parse(s: &str) -> Result<Self, String> {
         let mut l = Self {
             headers: false,
             protocols: false,
             owners: false,
             tcp: false,
+            timing: false,
         };
         for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
             match part {
@@ -75,12 +87,16 @@ impl Layers {
                 "protocols" => l.protocols = true,
                 "owners" => l.owners = true,
                 "tcp" => l.tcp = true,
+                "timing" => l.timing = true,
                 other => {
                     return Err(format!(
-                        "unknown layer {other:?} (phase 1 has headers, protocols, owners, tcp)"
+                        "unknown layer {other:?} (headers, protocols, owners, tcp, timing; packets have their own switch, --packets)"
                     ));
                 }
             }
+        }
+        if l.timing && !l.protocols {
+            return Err("the timing layer needs the protocols layer".into());
         }
         Ok(l)
     }
@@ -95,6 +111,8 @@ pub(crate) struct Settings {
     pub(crate) idle: Duration,
     /// Capabilities the privileged process kept (it never parses).
     pub(crate) companion_kept: Vec<String>,
+    /// Layer 3 is on (`--packets`) and its control socket is bound.
+    pub(crate) packets: bool,
 }
 
 /// One row of the kernel's per-port map, summed over CPUs.
@@ -119,8 +137,9 @@ pub(crate) struct KernelReading {
     pub(crate) classes: [[(u64, u64); 9]; 2],
     /// `[direction][flag]`.
     pub(crate) flags: [[u64; 4]; 2],
-    /// Copied, with payload, rate limited, ring buffer full, short.
-    pub(crate) stats: [u64; 5],
+    /// Copied, with payload, rate limited, ring buffer full, short; then layer 3: packets
+    /// copied, bytes copied, rate limited, ring buffer full.
+    pub(crate) stats: [u64; STATS_USED],
     pub(crate) ports: Vec<PortRow>,
 }
 
@@ -299,6 +318,29 @@ struct OwnerRow {
     flows: u64,
 }
 
+/// TCP health per owner (for the lookup): retransmits and resets since start, the RTT of
+/// its established sockets at the last sample.
+#[derive(Debug, Default, Clone)]
+struct OwnerTcp {
+    retransmits: u64,
+    resets: u64,
+    rtt_buckets: [u64; 5],
+}
+
+/// Layer 3 numbers the parser keeps outside the engine (the packet buffer and the pcap
+/// files), refreshed every poll.
+#[derive(Debug, Default, Clone, Copy, Serialize)]
+pub(crate) struct PacketsInfo {
+    pub(crate) buffered_packets: u64,
+    pub(crate) buffered_bytes: u64,
+    pub(crate) buffer_evicted: u64,
+    pub(crate) received: u64,
+    pub(crate) pcaps_written: u64,
+    pub(crate) pcaps_deleted: u64,
+    pub(crate) pcap_files: u64,
+    pub(crate) pcap_bytes: u64,
+}
+
 #[derive(Debug, Default, Clone)]
 struct TcpPort {
     role: &'static str,
@@ -353,6 +395,11 @@ pub(crate) struct Engine {
     /// not a new flow. Bounded.
     recently_closed: HashSet<Key>,
     closed_order: std::collections::VecDeque<Key>,
+    // layer 7
+    timing: timing::Table,
+    owner_tcp: HashMap<String, OwnerTcp>,
+    // layer 3
+    pub(crate) packets: PacketsInfo,
 }
 
 fn unix_ms() -> u128 {
@@ -400,6 +447,9 @@ impl Engine {
             parser_capabilities: dropped.kept.clone(),
             recently_closed: HashSet::new(),
             closed_order: std::collections::VecDeque::new(),
+            timing: timing::Table::default(),
+            owner_tcp: HashMap::new(),
+            packets: PacketsInfo::default(),
         }
     }
 
@@ -450,6 +500,7 @@ impl Engine {
         }
         let owner = self.owner_of(&key);
         let mut events = Vec::new();
+        let mut outcomes = Vec::new();
         let mut closing = false;
         let mut decided = None;
         if let Some(flow) = self.flows.get_mut(&key) {
@@ -472,6 +523,12 @@ impl Engine {
             if !p.payload.is_empty() && self.settings.layers.protocols {
                 decided = on_payload(flow, &key, &p, ingress, &mut events);
             }
+            if self.settings.layers.timing
+                && p.proto == IPPROTO_TCP
+                && timing_segment(flow, &p, ingress, &mut outcomes)
+            {
+                self.timing.unsynced += 1;
+            }
         }
         match decided {
             Some(true) => self.recognised += 1,
@@ -481,6 +538,10 @@ impl Engine {
         for e in events {
             self.proto.apply(e);
         }
+        if p.proto == IPPROTO_TCP && p.tcp_flags & TCP_RST != 0 {
+            self.owner_tcp_row(owner.as_deref().unwrap_or(UNOWNED), |r| r.resets += 1);
+        }
+        self.record(&key, &outcomes);
         if closing && let Some(f) = self.flows.remove(&key) {
             self.flows_closed += 1;
             if self.closed_order.len() >= RECENTLY_CLOSED
@@ -495,9 +556,35 @@ impl Engine {
         }
     }
 
+    /// Layer 7 outcomes of one flow, under its owner.
+    fn record(&mut self, key: &Key, outcomes: &[Outcome]) {
+        if outcomes.is_empty() {
+            return;
+        }
+        let owner = self.owner_of(key);
+        let owner = owner.as_deref().unwrap_or(UNOWNED);
+        for o in outcomes {
+            self.timing.add(owner, o);
+        }
+    }
+
+    /// The per-owner TCP row (bounded like the owners).
+    fn owner_tcp_row(&mut self, owner: &str, f: impl FnOnce(&mut OwnerTcp)) {
+        if let Some(r) = self.owner_tcp.get_mut(owner) {
+            f(r);
+        } else if self.owner_tcp.len() < MAX_OWNERS {
+            f(self.owner_tcp.entry(owner.to_owned()).or_default());
+        }
+    }
+
     /// A flow leaves the table: report a pending truncated TLS hello, settle its owner.
     #[allow(clippy::needless_pass_by_value)] // the flow is consumed: it left the table
-    fn finish(&mut self, key: &Key, flow: Flow) {
+    fn finish(&mut self, key: &Key, mut flow: Flow) {
+        if let Some(t) = flow.timing.as_mut() {
+            let mut outcomes = Vec::new();
+            t.finish(&mut outcomes);
+            self.record(key, &outcomes);
+        }
         if flow.pending_tls
             && let Detect::Yes(h) = tls::client_hello(&flow.client.bytes)
         {
@@ -605,6 +692,9 @@ impl Engine {
             .collect();
         let mut ports: HashMap<u16, TcpPort> = HashMap::new();
         let mut retrans = HashMap::with_capacity(socks.len());
+        for r in self.owner_tcp.values_mut() {
+            r.rtt_buckets = [0; 5];
+        }
         for s in &socks {
             let tcp = s.proto == IPPROTO_TCP;
             match (tcp, s.state) {
@@ -685,6 +775,21 @@ impl Engine {
                 let delta = u64::from(info.total_retrans.saturating_sub(before));
                 self.retransmits += delta;
                 row.retransmits += delta;
+                let owner = self
+                    .conn_owner
+                    .get(&(s.proto, s.local, s.local_port, s.remote, s.remote_port))
+                    .or_else(|| self.listen_owner.get(&(s.proto, s.local_port)))
+                    .cloned();
+                if let Some(o) = owner {
+                    let rtt = (s.state == sockdiag::TCP_ESTABLISHED && info.rtt_us > 0)
+                        .then(|| rtt_bucket(info.rtt_us));
+                    self.owner_tcp_row(&o, |r| {
+                        r.retransmits += delta;
+                        if let Some(b) = rtt {
+                            r.rtt_buckets[b] += 1;
+                        }
+                    });
+                }
                 if retrans.len() < sockdiag::MAX_SOCKETS {
                     retrans.insert(s.cookie, info.total_retrans);
                 }
@@ -693,14 +798,7 @@ impl Engine {
                     row.rtt_sum_us += u64::from(info.rtt_us);
                     row.rtt_n += 1;
                     row.rtt_max_us = row.rtt_max_us.max(info.rtt_us);
-                    let b = match info.rtt_us {
-                        0..1_000 => 0,
-                        1_000..10_000 => 1,
-                        10_000..100_000 => 2,
-                        100_000..1_000_000 => 3,
-                        _ => 4,
-                    };
-                    self.rtt_buckets[b] += 1;
+                    self.rtt_buckets[rtt_bucket(info.rtt_us)] += 1;
                 }
             }
         }
@@ -774,6 +872,35 @@ impl Engine {
             Value::Object(m)
         };
         let p = &self.proto;
+        let mut layers = self.settings.layers.names();
+        if self.settings.packets {
+            layers.push("packets");
+        }
+        let t = &self.timing;
+        let mut timing = t.total.to_json();
+        timing["unsynced"] = t.unsynced.into();
+        timing["keys"] = t.keys.len().into();
+        timing["keys_dropped"] = t.keys_dropped.into();
+        timing["untracked"] = t.untracked.into();
+        if let Some(m) = timing.as_object_mut() {
+            m.remove("grpc_status");
+        }
+        let pk = &self.packets;
+        let packets = json!({
+            "enabled": self.settings.packets,
+            "copied": k.stats[5],
+            "bytes_copied": k.stats[6],
+            "rate_limited": k.stats[7],
+            "ring_buffer_full": k.stats[8],
+            "received": pk.received,
+            "buffered_packets": pk.buffered_packets,
+            "buffered_bytes": pk.buffered_bytes,
+            "buffer_evicted": pk.buffer_evicted,
+            "pcaps_written": pk.pcaps_written,
+            "pcaps_deleted": pk.pcaps_deleted,
+            "pcap_files": pk.pcap_files,
+            "pcap_bytes": pk.pcap_bytes,
+        });
         json!({
             "version": WIRE_VERSION,
             "companion_version": env!("CARGO_PKG_VERSION"),
@@ -782,7 +909,7 @@ impl Engine {
             "updated_unix_ms": self.updated_ms,
             "uptime_secs": self.started.elapsed().as_secs(),
             "packet_unit": "skb",
-            "layers": self.settings.layers.names(),
+            "layers": layers,
             "privileges": {
                 "parser_capabilities": self.parser_capabilities,
                 "companion_kept": self.settings.companion_kept,
@@ -863,6 +990,8 @@ impl Engine {
                     "attempt_fails": self.host_delta("Tcp", "AttemptFails"),
                 },
             },
+            "timing": timing,
+            "packets": packets,
             "memory": {
                 "rss_kib": Self::rss_kib(),
                 "flow_buffer_bytes": self.flows.buffered_bytes(),
@@ -931,6 +1060,18 @@ impl Engine {
             .iter()
             .map(|(c, n)| (rcode_name(*c), *n))
             .collect();
+        let mut rows: Vec<(&timing::Key, &timing::Stats)> = self.timing.keys.iter().collect();
+        rows.sort_by(|a, b| b.1.requests.cmp(&a.1.requests).then(a.0.cmp(b.0)));
+        let timing_rows: Vec<Value> = rows
+            .into_iter()
+            .take(TIMING_SHOWN)
+            .map(|((owner, method, route), st)| {
+                let mut r = st.to_json();
+                r["owner"] = owner.as_str().into();
+                r["route"] = format!("{method} {route}").into();
+                r
+            })
+            .collect();
         v["tables"] = json!({
             "http1": {
                 "methods": p.http1_methods, "versions": p.http1_versions,
@@ -949,9 +1090,81 @@ impl Engine {
             "ports": ports,
             "owners": owners,
             "tcp_ports": tcp_ports,
+            "timing": timing_rows,
         });
         v
     }
+
+    /// The `lookup` answer (version 2): numbers for one owner and route, never a name and
+    /// never a list. `owner` and `route` are what the caller sent; they are not echoed.
+    pub(crate) fn lookup(&self, owner: &str, route: &str) -> Value {
+        let stats = self.timing.lookup(owner, route);
+        let tcp = self.owner_tcp.get(owner);
+        let mut v = stats.cloned().unwrap_or_default().to_json();
+        v["version"] = WIRE_VERSION_2.into();
+        v["found"] = stats.is_some().into();
+        v["updated_unix_ms"] = json!(self.updated_ms);
+        v["owner_tcp"] = json!({
+            "found": tcp.is_some(),
+            "retransmits": tcp.map_or(0, |t| t.retransmits),
+            "resets": tcp.map_or(0, |t| t.resets),
+            "rtt_ms": rtt_json(&tcp.map_or([0; 5], |t| t.rtt_buckets)),
+        });
+        v
+    }
+}
+
+/// The RTT histogram slot: under 1, 10, 100, 1000 ms, and above.
+const fn rtt_bucket(us: u32) -> usize {
+    match us {
+        0..1_000 => 0,
+        1_000..10_000 => 1,
+        10_000..100_000 => 2,
+        100_000..1_000_000 => 3,
+        _ => 4,
+    }
+}
+
+fn rtt_json(b: &[u64; 5]) -> Value {
+    json!({"lt_1": b[0], "lt_10": b[1], "lt_100": b[2], "lt_1000": b[3], "ge_1000": b[4]})
+}
+
+/// Layer 7: one TCP segment of a flow into its timing tracker. Returns whether the flow
+/// lost sync with this segment.
+fn timing_segment(
+    flow: &mut Flow,
+    p: &packet::Packet<'_>,
+    ingress: bool,
+    out: &mut Vec<Outcome>,
+) -> bool {
+    let syn = p.tcp_flags & TCP_SYN != 0;
+    // The side is known from the SYN (or, without one, from who spoke first).
+    let from_client = if syn {
+        p.tcp_flags & TCP_ACK == 0
+    } else {
+        match flow.local_is_client {
+            Some(local_client) => local_client != ingress,
+            None => return false,
+        }
+    };
+    let t = flow.timing.get_or_insert_with(Box::default);
+    if !t.active() {
+        return false;
+    }
+    t.segment(
+        &timing::Segment {
+            ts_ns: p.ts_ns,
+            from_client,
+            seq: p.seq,
+            syn,
+            fin: p.tcp_flags & TCP_FIN != 0,
+            payload: p.payload,
+            payload_len: p.payload_len,
+        },
+        out,
+    );
+    // An inactive tracker is never fed again, so this is true once per flow at most.
+    t.unsynced && !t.active()
 }
 
 const fn rcode_name(c: u8) -> &'static str {
@@ -1124,6 +1337,7 @@ mod tests {
                 max_flows: 64,
                 idle: Duration::from_secs(60),
                 companion_kept: Vec::new(),
+                packets: false,
             },
             &Dropped::for_tests(),
         )

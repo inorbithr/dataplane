@@ -1,0 +1,282 @@
+{
+  "version": 1,
+  "rules": "docs/capture/design-phase2.md (Route templates); RFC 0070 in inorbithr/core",
+  "source": "inorbithr/dataplane, until the SDK conformance suite publishes the shared vectors (then vendored byte for byte, with route_vectors.json.sha256)",
+  "vectors": [
+    {
+      "input": "/",
+      "template": "/",
+      "note": "root"
+    },
+    {
+      "input": "",
+      "template": "{other}",
+      "note": "empty target"
+    },
+    {
+      "input": "*",
+      "template": "*",
+      "note": "asterisk form (OPTIONS *)"
+    },
+    {
+      "input": "example.com:443",
+      "template": "{other}",
+      "note": "authority form (CONNECT)"
+    },
+    {
+      "input": "/v1/healthz",
+      "template": "/v1/healthz",
+      "note": "words stay"
+    },
+    {
+      "input": "/users/123/orders?x=1",
+      "template": "/users/{id}/orders",
+      "note": "digits and query"
+    },
+    {
+      "input": "/page/1",
+      "template": "/page/{id}",
+      "note": "one digit is an id (RFC 0070: all digits)"
+    },
+    {
+      "input": "/page/10",
+      "template": "/page/{id}",
+      "note": "two digits"
+    },
+    {
+      "input": "/v2",
+      "template": "/v2",
+      "note": "letters and digits are not all digits"
+    },
+    {
+      "input": "/static/app.js#top",
+      "template": "/static/app.js",
+      "note": "fragment dropped"
+    },
+    {
+      "input": "/a?b/c#d",
+      "template": "/a",
+      "note": "query cut before splitting"
+    },
+    {
+      "input": "/a#b?c",
+      "template": "/a",
+      "note": "fragment first"
+    },
+    {
+      "input": "/items/",
+      "template": "/items/",
+      "note": "trailing slash kept"
+    },
+    {
+      "input": "/items",
+      "template": "/items",
+      "note": "no trailing slash"
+    },
+    {
+      "input": "//double//slash",
+      "template": "//double//slash",
+      "note": "empty segments kept"
+    },
+    {
+      "input": "/o/3f2a9c1e-7b4d-4c1a-9e2f-0a1b2c3d4e5f",
+      "template": "/o/{id}",
+      "note": "uuid lower case"
+    },
+    {
+      "input": "/o/3F2A9C1E-7B4D-4C1A-9E2F-0A1B2C3D4E5F",
+      "template": "/o/{id}",
+      "note": "uuid upper case"
+    },
+    {
+      "input": "/o/3f2a9c1e-7b4d-4c1a-9e2f-0a1b2c3d4e5",
+      "template": "/o/{id}",
+      "note": "not a UUID (one digit short), but a token: 20 or more base64url characters with a digit"
+    },
+    {
+      "input": "/commit/0123456789abcdef",
+      "template": "/commit/{id}",
+      "note": "16 hex digits"
+    },
+    {
+      "input": "/commit/0123456789abcde",
+      "template": "/commit/0123456789abcde",
+      "note": "15 hex digits"
+    },
+    {
+      "input": "/blob/DEADBEEFCAFEBABE",
+      "template": "/blob/{id}",
+      "note": "hex upper case"
+    },
+    {
+      "input": "/report/2026-10-06",
+      "template": "/report/{id}",
+      "note": "date"
+    },
+    {
+      "input": "/report/2026-1-06",
+      "template": "/report/2026-1-06",
+      "note": "not a date"
+    },
+    {
+      "input": "/report/2026-13-45",
+      "template": "/report/{id}",
+      "note": "dates are not range-checked"
+    },
+    {
+      "input": "/t/AbCdEfGhIjKlMnOpQrS1",
+      "template": "/t/{id}",
+      "note": "20 base64url with a digit"
+    },
+    {
+      "input": "/t/AbCdEfGhIjKlMnOpQrSt",
+      "template": "/t/AbCdEfGhIjKlMnOpQrSt",
+      "note": "20 letters, no digit"
+    },
+    {
+      "input": "/t/AbCdEfGhIjKlMnOpQr1",
+      "template": "/t/AbCdEfGhIjKlMnOpQr1",
+      "note": "19 characters"
+    },
+    {
+      "input": "/t/abc_def-ghi_jkl-mno9",
+      "template": "/t/{id}",
+      "note": "base64url with - and _"
+    },
+    {
+      "input": "/t/abc.def.ghi.jkl.mno9",
+      "template": "/t/abc.def.ghi.jkl.mno9",
+      "note": "dots are not base64url"
+    },
+    {
+      "input": "/u/someone@example.com",
+      "template": "/u/{id}",
+      "note": "an address in a path"
+    },
+    {
+      "input": "/u/someone%40example.com",
+      "template": "/u/{id}",
+      "note": "percent-encoded @"
+    },
+    {
+      "input": "/files/a%20b",
+      "template": "/files/a b",
+      "note": "percent-decoded once"
+    },
+    {
+      "input": "/files/a%2520b",
+      "template": "/files/a%20b",
+      "note": "only once"
+    },
+    {
+      "input": "/files/%31%32%33",
+      "template": "/files/{id}",
+      "note": "decoded before classifying"
+    },
+    {
+      "input": "/files/a%2Fb",
+      "template": "/files/a/b",
+      "note": "an encoded slash decodes inside its segment"
+    },
+    {
+      "input": "/files/%zz",
+      "template": "/files/%zz",
+      "note": "invalid escape kept"
+    },
+    {
+      "input": "/files/%4",
+      "template": "/files/%4",
+      "note": "short escape kept"
+    },
+    {
+      "input": "/files/%ff",
+      "template": "/files/{id}",
+      "note": "not UTF-8 after decoding"
+    },
+    {
+      "input": "/files/%C3%A9t%C3%A9",
+      "template": "/files/été",
+      "note": "UTF-8 decoded"
+    },
+    {
+      "input": "/Users/ABC",
+      "template": "/Users/ABC",
+      "note": "case kept"
+    },
+    {
+      "input": "http://example.com/a/42",
+      "template": "/a/{id}",
+      "note": "absolute form"
+    },
+    {
+      "input": "HTTPS://Example.com/a/b?c",
+      "template": "/a/b",
+      "note": "absolute form, scheme in capitals"
+    },
+    {
+      "input": "http://example.com",
+      "template": "/",
+      "note": "absolute form without a path"
+    },
+    {
+      "input": "http://example.com?x=1",
+      "template": "/",
+      "note": "absolute form with a query only"
+    },
+    {
+      "input": "ftp://example.com/a",
+      "template": "{other}",
+      "note": "other schemes are not origin form"
+    },
+    {
+      "input": "/1/2/3/4/5/6/7/8",
+      "template": "/{id}/{id}/{id}/{id}/{id}/{id}/{id}/{id}",
+      "note": "eight segments"
+    },
+    {
+      "input": "/a/b/c/d/e/f/g/h/i",
+      "template": "/a/b/c/d/e/f/g/h/{rest}",
+      "note": "nine segments"
+    },
+    {
+      "input": "/a/b/c/d/e/f/g/h/",
+      "template": "/a/b/c/d/e/f/g/h/{rest}",
+      "note": "a trailing slash after eight segments is a ninth"
+    },
+    {
+      "input": "/a/b/c/d/e/f/g/h/i/j/k?x",
+      "template": "/a/b/c/d/e/f/g/h/{rest}",
+      "note": "many segments"
+    },
+    {
+      "input": "/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+      "template": "/{rest}",
+      "note": "one segment too long"
+    },
+    {
+      "input": "/short/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+      "template": "/short/{rest}",
+      "note": "the long segment goes"
+    },
+    {
+      "input": "/a/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/d",
+      "template": "/a/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/{rest}",
+      "note": "dropped from the end until it fits"
+    },
+    {
+      "input": "/api/orders/8812/items/3?coupon=X",
+      "template": "/api/orders/{id}/items/{id}",
+      "note": "RFC 0070 example"
+    },
+    {
+      "input": "/orders/8812?coupon=X",
+      "template": "/orders/{id}",
+      "note": "RFC 0070: never the query"
+    },
+    {
+      "input": "/e2e.Echo/Say",
+      "template": "/e2e.Echo/Say",
+      "note": "a gRPC method"
+    }
+  ]
+}

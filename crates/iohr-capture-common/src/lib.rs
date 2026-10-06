@@ -24,6 +24,9 @@ pub const STATS_MAP: &str = "IOHR_STATS";
 pub const CONFIG_MAP: &str = "IOHR_CONFIG";
 /// The ring buffer of [`RecordHeader`] + bytes.
 pub const EVENTS_MAP: &str = "IOHR_EVENTS";
+/// The second ring buffer (layer 3, only filled with [`CONFIG_PACKETS`]): one
+/// [`PacketHeader`] + up to [`Config::snaplen`] packet bytes per record.
+pub const PACKETS_MAP: &str = "IOHR_PACKETS";
 /// LRU hash of flows (kernel only): how many payload packets were copied per flow.
 pub const FLOWS_MAP: &str = "IOHR_FLOWS";
 /// Name of the TC classifier attached to ingress.
@@ -39,6 +42,13 @@ pub const PAYLOAD_BYTES: u32 = 512;
 pub const RECORD_DATA: usize = (HEADER_BYTES + PAYLOAD_BYTES) as usize;
 /// Default ring buffer size (bytes, a power of two).
 pub const DEFAULT_RING_BYTES: u32 = 4 * 1024 * 1024;
+/// Default size of the packets ring buffer (layer 3).
+pub const DEFAULT_PACKETS_RING_BYTES: u32 = 8 * 1024 * 1024;
+/// Largest snap length (bytes copied per packet, layer 3).
+pub const MAX_SNAPLEN: u32 = 65_535;
+/// The record sizes of the packets ring buffer: a reservation must be a constant size, so
+/// a packet goes into the smallest of these that holds it.
+pub const PACKET_TIERS: [usize; 4] = [256, 1536, 9216, 65_536];
 /// Entries in the per-port map (LRU: the least recently used port is evicted).
 pub const PORT_ENTRIES: u32 = 1024;
 /// Entries in the kernel flow map (LRU).
@@ -104,13 +114,28 @@ pub const STAT_RATE_LIMITED: u32 = 2;
 pub const STAT_RINGBUF_FULL: u32 = 3;
 /// Packets too short or malformed to read the headers of.
 pub const STAT_SHORT: u32 = 4;
+/// Layer 3: packets copied to the packets ring buffer.
+pub const STAT_PKT_COPIED: u32 = 5;
+/// Layer 3: bytes of those copies.
+pub const STAT_PKT_BYTES: u32 = 6;
+/// Layer 3: copies skipped by the packets token bucket.
+pub const STAT_PKT_RATE_LIMITED: u32 = 7;
+/// Layer 3: copies lost because the packets ring buffer had no room.
+pub const STAT_PKT_RINGBUF_FULL: u32 = 8;
 /// Slots in the stats map.
-pub const STATS: u32 = 8;
+pub const STATS: u32 = 16;
+/// Slots used in the stats map (the user side reads these).
+pub const STATS_USED: usize = 9;
 
 /// `Config::flags`: copy header records (layer 1).
 pub const CONFIG_HEADERS: u32 = 1;
 /// `Config::flags`: copy payload prefixes of a flow's first packets (layer 2).
 pub const CONFIG_PROTOCOLS: u32 = 2;
+/// `Config::flags`: copy the payload prefix of every TCP packet with payload, not only a
+/// flow's first ones (layer 7, request timing).
+pub const CONFIG_TIMING: u32 = 4;
+/// `Config::flags`: copy whole packets, up to `snaplen`, to the packets ring (layer 3).
+pub const CONFIG_PACKETS: u32 = 8;
 
 /// `RecordHeader::kind`: the record carries payload bytes after the headers.
 pub const KIND_PAYLOAD: u8 = 1;
@@ -194,10 +219,14 @@ pub struct Config {
     pub l2_len: u32,
     /// Payload-carrying packets per flow whose payload prefix is copied.
     pub first_packets: u32,
-    /// [`CONFIG_HEADERS`] | [`CONFIG_PROTOCOLS`].
+    /// [`CONFIG_HEADERS`] | [`CONFIG_PROTOCOLS`] | [`CONFIG_TIMING`] | [`CONFIG_PACKETS`].
     pub flags: u32,
-    /// Padding, zero.
-    pub reserved: u32,
+    /// Layer 3: bytes copied per packet, 64 to [`MAX_SNAPLEN`].
+    pub snaplen: u32,
+    /// Layer 3 token bucket: nanoseconds one packet copy costs; 0 = no limit.
+    pub pkt_interval_ns: u64,
+    /// Layer 3 token bucket: how far ahead of now it may run.
+    pub pkt_burst_ns: u64,
 }
 
 /// Flow key in the kernel's flow map; `local` is this host's end in both directions, so
@@ -246,6 +275,39 @@ pub struct RecordHeader {
 /// Size of [`RecordHeader`] in bytes.
 pub const RECORD_HEADER_BYTES: usize = 24;
 
+/// The fixed head of a packets ring-buffer record (layer 3); the packet bytes follow.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PacketHeader {
+    /// `bpf_ktime_get_ns()` when the packet passed.
+    pub ts_ns: u64,
+    /// `skb->len`: the packet's length.
+    pub skb_len: u32,
+    /// How many bytes of the data follow and are valid.
+    pub cap_len: u32,
+    /// `EtherType`, host order.
+    pub ethertype: u16,
+    /// [`INGRESS`] or [`EGRESS`].
+    pub direction: u8,
+    /// Link-layer header length at the start of the data.
+    pub l2_len: u8,
+    /// Padding, zero.
+    pub reserved: [u8; 4],
+}
+
+/// Size of [`PacketHeader`] in bytes.
+pub const PACKET_HEADER_BYTES: usize = 24;
+
+/// One packets ring-buffer record of tier size `N` (see [`PACKET_TIERS`]).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PacketRecord<const N: usize> {
+    /// The header.
+    pub header: PacketHeader,
+    /// The first `header.cap_len` bytes of the packet.
+    pub data: [u8; N],
+}
+
 /// One ring-buffer record: a header and up to [`RECORD_DATA`] packet bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -282,7 +344,12 @@ mod tests {
         assert_eq!(size_of::<Counters>(), 16);
         assert_eq!(size_of::<PortKey>(), 4);
         assert_eq!(size_of::<PortCounters>(), 32);
-        assert_eq!(size_of::<Config>(), 32);
+        assert_eq!(size_of::<Config>(), 48);
+        assert_eq!(size_of::<PacketHeader>(), PACKET_HEADER_BYTES);
+        assert_eq!(
+            size_of::<PacketRecord<256>>(),
+            PACKET_HEADER_BYTES + PACKET_TIERS[0]
+        );
         assert_eq!(size_of::<FlowKey>(), 40);
         assert_eq!(size_of::<RecordHeader>(), RECORD_HEADER_BYTES);
         assert_eq!(size_of::<Record>(), RECORD_HEADER_BYTES + RECORD_DATA);

@@ -81,6 +81,8 @@ pub(crate) struct Flow {
     pub(crate) pending_tls: bool,
     /// Matched to an owner (layer 4) already.
     pub(crate) owner_checked: bool,
+    /// Request timing (layer 7), for TCP flows while timing is on.
+    pub(crate) timing: Option<Box<crate::timing::Tracker>>,
 }
 
 impl Flow {
@@ -93,6 +95,7 @@ impl Flow {
             server: Side::default(),
             pending_tls: false,
             owner_checked: false,
+            timing: None,
         }
     }
 }

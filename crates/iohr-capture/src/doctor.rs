@@ -17,6 +17,9 @@ const CAP_BPF: u32 = 39;
 /// Below this `RLIMIT_MEMLOCK` (kernels before 5.11), loading maps may fail.
 const MEMLOCK_NEEDED: u64 = 64 * 1024 * 1024;
 
+/// A directory: whether it is one, its mode, its owner's uid.
+pub(crate) type DirFacts = (bool, u32, u32);
+
 /// What the checks read, as raw file contents (`None` when the file is missing).
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Facts {
@@ -46,13 +49,39 @@ pub(crate) struct Facts {
     pub(crate) groups: Option<String>,
     /// The socket group asked for (`--socket-group`).
     pub(crate) socket_group: String,
+    /// `tshark` on `PATH`, if any (for `iohr-capture dissect`).
+    pub(crate) tshark: Option<String>,
+    /// Layer 3 is switched on (`--packets`), and the pcap directory with what is there:
+    /// `(path, Some((is a directory, mode, owner uid)))`, `None` when missing.
+    pub(crate) pcap: Option<(String, Option<DirFacts>)>,
 }
 
 impl Facts {
     /// Reads the facts from this host. Never writes anything.
-    pub(crate) fn gather(interface: Option<&str>, socket_group: &str) -> Self {
+    pub(crate) fn gather(
+        interface: Option<&str>,
+        socket_group: &str,
+        pcap_dir: Option<&Path>,
+    ) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        let tshark = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|d| d.join("tshark"))
+                .find(|p| p.is_file())
+                .map(|p| p.display().to_string())
+        });
+        let pcap = pcap_dir.map(|d| {
+            (
+                d.display().to_string(),
+                fs::symlink_metadata(d)
+                    .ok()
+                    .map(|m| (m.is_dir(), m.mode() & 0o7777, m.uid())),
+            )
+        });
         Self {
             socket_group: socket_group.to_owned(),
+            tshark,
+            pcap,
             ..Self::gather_from(Path::new("/"), interface)
         }
     }
@@ -81,6 +110,8 @@ impl Facts {
             apparmor_enabled: read("sys/module/apparmor/parameters/enabled"),
             groups: read("etc/group"),
             socket_group: "iohr-capture-read".into(),
+            tshark: None,
+            pcap: None,
         }
     }
 }
@@ -146,6 +177,8 @@ pub(crate) fn evaluate(facts: &Facts) -> Vec<Check> {
         ),
         check_owners(version, facts.cgroup2),
         check_socket_group(facts.groups.as_deref(), &facts.socket_group),
+        check_pcap_dir(facts.pcap.as_ref()),
+        check_tshark(facts.tshark.as_deref()),
     ]
 }
 
@@ -443,6 +476,62 @@ fn check_socket_group(groups: Option<&str>, name: &str) -> Check {
     }
 }
 
+/// Layer 3's directory (only with `--packets`).
+fn check_pcap_dir(pcap: Option<&(String, Option<DirFacts>)>) -> Check {
+    match pcap {
+        None => Check::new(
+            "pcap directory",
+            Status::Info,
+            "packets are off (IOHR_CAPTURE_PACKETS): no pcap files",
+        ),
+        Some((dir, None)) => Check::new(
+            "pcap directory",
+            Status::Info,
+            format!(
+                "{dir} does not exist yet; it is made 0700 at start (the unit's StateDirectory=)"
+            ),
+        ),
+        Some((dir, Some((false, _, _)))) => Check::new(
+            "pcap directory",
+            Status::Fail,
+            format!("{dir} is not a directory"),
+        )
+        .fix(format!(
+            "remove it, or set IOHR_CAPTURE_PCAP_DIR to a directory (`sudo rm {dir}`)"
+        )),
+        Some((dir, Some((true, mode, _)))) if mode & 0o077 != 0 => Check::new(
+            "pcap directory",
+            Status::Warn,
+            format!("{dir} is mode {mode:o}: others can list the pcap files"),
+        )
+        .fix(format!(
+            "`sudo chmod 0700 {dir}` (the companion also sets it at start)"
+        )),
+        Some((dir, Some((true, _, uid)))) => Check::new(
+            "pcap directory",
+            Status::Pass,
+            format!("{dir}, 0700, owner uid {uid}; files 0600, deleted after the retention"),
+        ),
+    }
+}
+
+/// `tshark` for `iohr-capture dissect`: information only, capture never needs it.
+fn check_tshark(path: Option<&str>) -> Check {
+    match path {
+        Some(p) => Check::new(
+            "tshark",
+            Status::Info,
+            format!("{p}: `iohr-capture dissect FILE` runs it as you (a separate GPL program, never bundled)"),
+        ),
+        None => Check::new(
+            "tshark",
+            Status::Info,
+            "not installed: only `iohr-capture dissect` needs it",
+        )
+        .fix("`sudo apt install tshark` (Debian, Ubuntu) or `sudo dnf install wireshark-cli` (Fedora, RHEL)"),
+    }
+}
+
 fn check_lsm(selinux: Option<&str>, apparmor: Option<&str>) -> Check {
     let selinux_enforcing = selinux.is_some_and(|s| s.trim() == "1");
     let apparmor_on = apparmor.is_some_and(|s| s.trim().eq_ignore_ascii_case("y"));
@@ -484,7 +573,40 @@ mod tests {
             apparmor_enabled: None,
             groups: Some("root:x:0:\niohr-capture-read:x:998:iohr-agent\n".into()),
             socket_group: "iohr-capture-read".into(),
+            tshark: None,
+            pcap: None,
         }
+    }
+
+    #[test]
+    fn pcap_dir_and_tshark_are_never_blockers_unless_broken() {
+        let mut f = host("6.12.0");
+        let c = evaluate(&f);
+        assert_eq!(find(&c, "pcap directory").status, Status::Info);
+        assert_eq!(find(&c, "tshark").status, Status::Info);
+        assert!(
+            find(&c, "tshark")
+                .fix
+                .as_deref()
+                .unwrap_or("")
+                .contains("apt install tshark")
+        );
+        f.tshark = Some("/usr/bin/tshark".into());
+        f.pcap = Some((
+            "/var/lib/iohr-capture/pcap".into(),
+            Some((true, 0o700, 990)),
+        ));
+        let c = evaluate(&f);
+        assert!(find(&c, "tshark").fix.is_none());
+        assert_eq!(find(&c, "pcap directory").status, Status::Pass);
+        f.pcap = Some(("/x".into(), Some((true, 0o755, 0))));
+        assert_eq!(find(&evaluate(&f), "pcap directory").status, Status::Warn);
+        f.pcap = Some(("/x".into(), Some((false, 0o644, 0))));
+        let c = evaluate(&f);
+        assert_eq!(find(&c, "pcap directory").status, Status::Fail);
+        assert!(!can_run(&c));
+        f.pcap = Some(("/x".into(), None));
+        assert_eq!(find(&evaluate(&f), "pcap directory").status, Status::Info);
     }
 
     fn find<'a>(checks: &'a [Check], name: &str) -> &'a Check {

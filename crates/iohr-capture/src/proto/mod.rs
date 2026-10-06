@@ -34,50 +34,10 @@ pub(crate) enum Event {
     Postgres(postgres::Message),
 }
 
-/// Replaces ids in a path with `{id}` and drops the query and fragment, so a path template
-/// counts requests per endpoint, not per user or object: `/users/123/orders?x=1` becomes
-/// `/users/{id}/orders`.
+/// The route template of a request target: one rule set for every recogniser
+/// ([`crate::route`], RFC 0070).
 pub(crate) fn path_template(target: &str) -> String {
-    let path = target.split(['?', '#']).next().unwrap_or_default().trim();
-    // Absolute form (`http://host/path`, proxies): keep the path.
-    let path = match path.find("://") {
-        Some(i) => path[i + 3..].find('/').map_or("/", |j| &path[i + 3 + j..]),
-        None => path,
-    };
-    if path.is_empty() || path == "*" {
-        return path.to_owned();
-    }
-    let mut out = String::with_capacity(path.len().min(256));
-    for (i, seg) in path.split('/').enumerate() {
-        if i > 0 {
-            out.push('/');
-        }
-        if looks_like_id(seg) {
-            out.push_str("{id}");
-        } else {
-            out.push_str(seg);
-        }
-        if out.len() > 256 {
-            break;
-        }
-    }
-    out
-}
-
-fn looks_like_id(seg: &str) -> bool {
-    if seg.is_empty() {
-        return false;
-    }
-    let digits = seg.bytes().filter(u8::is_ascii_digit).count();
-    let hex = seg.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-');
-    seg.bytes().all(|b| b.is_ascii_digit())
-        || (hex && seg.len() >= 16 && digits > 0)
-        || (seg.len() >= 20
-            && digits >= 4
-            && seg
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
-        || seg.contains('@')
+    crate::route::template(target)
 }
 
 /// Lower-cased host without a port, only if it looks like a host name or address.
