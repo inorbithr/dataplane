@@ -10,7 +10,8 @@
 //! - the admin page HTML or `status.json`,
 //! - any OTLP export (traces, metrics, logs; bodies are protobuf, strings are raw bytes),
 //!
-//! and that the counts themselves (424242, 31337) are in no frame and no OTLP export (they
+//! and that the counts themselves (7391846205, 4602917383: long enough that no timestamp
+//! or id can contain them by chance) are in no frame and no OTLP export (they
 //! belong on the admin page only). It checks the agent never asked for `tables`, while the
 //! hello does carry the `capture:*` capability strings and the admin page does carry the
 //! counts (so the test is not vacuous). A companion whose error code is itself a name gets
@@ -42,7 +43,7 @@ use iohr_agent::config::TelemetryConfig;
 use iohr_agent::keys::KeyAlg;
 
 /// Counts from the poisoned answer: allowed on the admin page, never in a frame or OTLP.
-const COUNT_CANARIES: [&str; 2] = ["424242", "31337"];
+const COUNT_CANARIES: [&str; 2] = ["7391846205", "4602917383"];
 
 /// Values a capture snapshot can hold. None may leave the companion's socket.
 const CANARIES: [&str; 8] = [
@@ -64,10 +65,10 @@ fn poisoned_answer() -> Value {
         "interface": "canary-host.example",
         "updated_unix_ms": iohr_agent::capture::now_ms(),
         "layers": ["headers", "protocols", "owners", "tcp", "canary-dns.example"],
-        "headers": {"ingress": {"packets": 424_242, "bytes": 99}, "egress": {"packets": 7, "bytes": 8},
+        "headers": {"ingress": {"packets": 7_391_846_205_u64, "bytes": 99}, "egress": {"packets": 7, "bytes": 8},
                     "note": "canary-sni.example"},
         "drops": {"rate_limited": 0, "ring_buffer_full": 0, "flows_evicted": 0, "who": "10.99.88.77"},
-        "protocols": {"http1_requests": 31_337, "tls_client_hellos": 2, "dns_queries": 3,
+        "protocols": {"http1_requests": 4_602_917_383_u64, "tls_client_hellos": 2, "dns_queries": 3,
                       "http2_connections": 1, "grpc_calls": 1, "top_path": "/canary/path"},
         "owners": {"sockets": 5, "owners": 1, "flows_owned": 3, "flows_unowned": 0, "pod": "canary-pod-0a1b2c3d"},
         "tcp": {"established": 1, "listening": 2, "retransmits_sampled": 0, "resets_in": 0, "resets_out": 0,
@@ -232,7 +233,7 @@ fn dat10_captured_traffic_stays_on_the_host() {
         assert!(caps.contains(&c), "{c} missing from the hello: {caps:?}");
     }
     assert!(
-        html.contains("Traffic") && html.contains("424242") && html.contains("31337"),
+        html.contains("Traffic") && html.contains("7391846205") && html.contains("4602917383"),
         "{html}"
     );
     assert!(
