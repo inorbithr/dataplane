@@ -8,6 +8,8 @@ all-features = true
 yanked = "deny"
 
 [licenses]
+# crates/iohr-capture-ebpf (MIT OR GPL-2.0) is not a workspace member and has its own
+# deny.toml with the one GPL-2.0 exception (docs/adr/0002-capture-companion.md).
 confidence-threshold = 0.9
 allow = [
   "Apache-2.0",
@@ -22,6 +24,9 @@ allow = [
   "Unicode-3.0",
   "Unlicense",
 ]
+# foldhash (hashbrown's default hasher, through aya, for iohr-capture) is Zlib: permissive,
+# OSI and FSF approved. Allowed for that crate only.
+exceptions = [{ crate = "foldhash", allow = ["Zlib"] }]
 
 [bans]
 multiple-versions = "warn"

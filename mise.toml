@@ -7,7 +7,14 @@ experimental = true
 cargo.binstall = true
 
 [tools]
-rust = { version = "1.99.0", components = "rustfmt,clippy", targets = "x86_64-unknown-linux-musl,aarch64-unknown-linux-musl" }
+# Two Rust toolchains: stable builds everything; the pinned nightly (with rust-src) builds
+# only the eBPF programs in crates/iohr-capture-ebpf, whose rust-toolchain.toml names the
+# same nightly (`mise run capture:toolchain-check`). bpf-linker links them (LLVM 23).
+rust = [
+  { version = "1.99.0", components = "rustfmt,clippy", targets = "x86_64-unknown-linux-musl,aarch64-unknown-linux-musl" },
+  { version = "nightly-2026-10-05", components = "rust-src,clippy,rustfmt" },
+]
+"cargo:bpf-linker" = "0.11.1"
 cargo-binstall = "1.25.1"
 "cargo:cargo-nextest" = "0.9.146"
 cargo-deny = "0.20.2"
@@ -44,6 +51,28 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo nextest run --locked --all-features
 cargo test --locked --doc --all-features
 cargo deny check
+mise run capture:ebpf-check
+"""
+
+[tasks."capture:ebpf-check"]
+shell = "bash -e -o pipefail -c"
+description = "The eBPF crate (not a workspace member): toolchain pin, fmt, clippy for the BPF target, cargo-deny"
+dir = "{{config_root}}/crates/iohr-capture-ebpf"
+run = """
+mise run capture:toolchain-check
+# mise puts the stable toolchain first on PATH; name the pinned nightly explicitly.
+nightly=$(grep '^channel' rust-toolchain.toml | cut -d'"' -f2)
+rustup run "$nightly" cargo fmt --check
+rustup run "$nightly" cargo clippy --locked --release --target bpfel-unknown-none -Z build-std=core -- -D warnings
+cargo deny --manifest-path Cargo.toml check licenses bans sources
+"""
+
+[tasks."capture:toolchain-check"]
+shell = "bash -e -o pipefail -c"
+description = "The nightly pinned in mise.toml is the one crates/iohr-capture-ebpf/rust-toolchain.toml names"
+run = """
+pin=$(grep '^channel' crates/iohr-capture-ebpf/rust-toolchain.toml | cut -d'"' -f2)
+grep -q "version = .$pin.," mise.toml || { echo "rust-toolchain.toml names $pin; mise.toml pins another nightly" >&2; exit 1; }
 """
 
 [tasks.fmt]

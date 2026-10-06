@@ -1,0 +1,6 @@
+# The eBPF programs need nightly (build-std for the BPF target). The same toolchain is
+# pinned in mise.toml; `mise run capture:toolchain-check` fails when the two differ, and
+# crates/iohr-capture/build.rs reads the channel from this file.
+[toolchain]
+channel = "nightly-2026-10-05"
+components = ["rust-src", "clippy", "rustfmt"]
