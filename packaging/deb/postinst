@@ -2,7 +2,12 @@
 set -e
 if [ "$1" = "configure" ]; then
   if ! getent passwd iohr-agent >/dev/null; then
-    adduser --system --group --no-create-home --home /var/lib/iohr-agent iohr-agent >/dev/null
+    # iohr-capture may have created the group already (its aggregates socket's group).
+    if getent group iohr-agent >/dev/null; then
+      adduser --system --ingroup iohr-agent --no-create-home --home /var/lib/iohr-agent iohr-agent >/dev/null
+    else
+      adduser --system --group --no-create-home --home /var/lib/iohr-agent iohr-agent >/dev/null
+    fi
   fi
   chown root:iohr-agent /etc/iohr-agent /etc/iohr-agent/agent.toml /etc/iohr-agent/policy.toml
   chmod 0750 /etc/iohr-agent

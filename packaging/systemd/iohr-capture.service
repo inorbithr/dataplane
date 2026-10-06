@@ -4,8 +4,10 @@
 #   sudo systemctl enable --now iohr-capture
 # It holds CAP_BPF, CAP_PERFMON and CAP_NET_ADMIN only to load and attach its TC
 # classifiers, then drops them (on kernels before 6.6 it keeps CAP_NET_ADMIN to remove its
-# filters on exit, and before 6.5 CAP_BPF to read its counters). It counts, never drops,
-# stores nothing and sends nothing (docs/capture/install.md).
+# filters on exit, and before 6.5 CAP_BPF to read its counters). Only then does it parse
+# anything. It never drops a packet, stores nothing and sends nothing; the agent reads its
+# counts from /run/iohr-capture/aggregates.sock (0660, group iohr-agent), and
+# /run/iohr-capture/control.sock (0600) is for root (docs/capture/install.md).
 [Unit]
 Description=InOrbit capture companion (iohr-capture): eBPF traffic counters, counts only
 Documentation=https://github.com/inorbithr/dataplane/blob/main/docs/capture/install.md
@@ -16,6 +18,11 @@ After=network-online.target
 Type=simple
 User=iohr-capture
 Group=iohr-capture
+# Membership lets the companion give its aggregates socket to the agent's group.
+SupplementaryGroups=iohr-agent
+# /run/iohr-capture: the two sockets. 0755 so the agent can reach the 0660 socket in it.
+RuntimeDirectory=iohr-capture
+RuntimeDirectoryMode=0755
 EnvironmentFile=/etc/iohr-capture/capture.env
 ExecStartPre=/usr/bin/iohr-capture doctor
 ExecStart=/usr/bin/iohr-capture run
@@ -45,6 +52,8 @@ ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
+# Other users' processes stay invisible: owners are named by systemd unit, container or
+# pod from cgroup paths. For process names too, a drop-in may set ProtectProc=default.
 ProtectProc=invisible
 ProcSubset=all
 RestrictNamespaces=yes
@@ -55,7 +64,8 @@ MemoryDenyWriteExecute=yes
 RemoveIPC=yes
 DevicePolicy=closed
 IPAddressDeny=any
-# AF_NETLINK attaches and removes TC filters; AF_UNIX is for the agent socket (phase 1).
+# AF_NETLINK attaches and removes TC filters and reads sockets (sock_diag, layers 4 and 5);
+# AF_UNIX is for the two local sockets. No IP socket at all.
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
 SystemCallArchitectures=native
 # @system-service plus bpf (load, attach, map reads) and capset (the drop). No
