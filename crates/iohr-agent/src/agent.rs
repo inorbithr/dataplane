@@ -110,7 +110,10 @@ impl Agent {
         let enrollment = Arc::new(enrollment);
         let tokens = TokenSource::new(http, Arc::clone(&enrollment), Arc::new(key));
         let secrets = SecretResolver::new(config.secrets.clone(), tls.clone());
-        let executor = Arc::new(Executor::new(Arc::clone(&policy), tls.clone(), secrets));
+        let executor = Arc::new(
+            Executor::new(Arc::clone(&policy), tls.clone(), secrets)
+                .with_checks(checks.clone().map(Arc::new)),
+        );
         let state = Arc::new(AgentState::new(
             AgentInfo {
                 version: env!("CARGO_PKG_VERSION").into(),

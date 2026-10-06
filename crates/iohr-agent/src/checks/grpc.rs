@@ -141,6 +141,150 @@ async fn request(
     }
 }
 
+/// `grpc`: a unary call of the check's method (`pkg.Service/Method`) with an empty
+/// request message, judged by its `grpc-status` alone (default 0, OK; a refusal check
+/// names 16, UNAUTHENTICATED, or another code). The reply is read bounded and dropped;
+/// `grpc-message` is never looked at.
+pub(super) async fn unary(tls: &TlsContext, p: &Prepared<'_>) -> CheckDetail {
+    let started = Instant::now();
+    let Some(method) = p.spec.params.method.as_deref() else {
+        return CheckDetail::failed(ErrorClass::Connect, started);
+    };
+    let want = u64::from(p.spec.params.expect_code.unwrap_or(0));
+    let authority = authority(p);
+    let auth = p.auth.as_ref().map(|(n, v)| (n.as_str(), v.as_str()));
+    let path = format!("/{method}");
+    let outcome = if p.endpoint.tls {
+        match super::tls::connect(tls, &p.endpoint.host, p.addr, &[b"h2"], p.timeout).await {
+            Ok((stream, expires)) => {
+                unary_call(stream, "https", &authority, &path, auth, p.timeout)
+                    .await
+                    .map(|code| (code, expires))
+            }
+            Err(class) => Err(class),
+        }
+    } else {
+        match tokio::time::timeout(p.timeout, TcpStream::connect(p.addr)).await {
+            Ok(Ok(stream)) => unary_call(stream, "http", &authority, &path, auth, p.timeout)
+                .await
+                .map(|code| (code, None)),
+            Ok(Err(_)) => Err(ErrorClass::Connect),
+            Err(_) => Err(ErrorClass::Timeout),
+        }
+    };
+    match outcome {
+        Ok((code, expires)) => CheckDetail {
+            ok: code == want,
+            latency_ms: elapsed_ms(started),
+            error_class: (code != want).then_some(ErrorClass::Status),
+            tls_expires_at: expires,
+            ..CheckDetail::default()
+        },
+        Err(class) => CheckDetail::failed(class, started),
+    }
+}
+
+fn authority(p: &Prepared<'_>) -> String {
+    if p.endpoint.port == if p.endpoint.tls { 443 } else { 80 } {
+        p.endpoint.host.clone()
+    } else {
+        format!("{}:{}", p.endpoint.host, p.endpoint.port)
+    }
+}
+
+/// The call's `grpc-status`.
+async fn unary_call<S>(
+    io: S,
+    scheme: &str,
+    authority: &str,
+    path: &str,
+    auth: Option<(&str, &str)>,
+    timeout: Duration,
+) -> Result<u64, ErrorClass>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let fut = async {
+        let (client, conn) = h2::client::handshake(io)
+            .await
+            .map_err(|_| ErrorClass::Connect)?;
+        let driver = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let result = unary_request(client, scheme, authority, path, auth).await;
+        driver.abort();
+        result
+    };
+    tokio::time::timeout(timeout, fut)
+        .await
+        .map_err(|_| ErrorClass::Timeout)?
+}
+
+async fn unary_request(
+    client: h2::client::SendRequest<Bytes>,
+    scheme: &str,
+    authority: &str,
+    path: &str,
+    auth: Option<(&str, &str)>,
+) -> Result<u64, ErrorClass> {
+    let mut client = client.ready().await.map_err(|_| ErrorClass::Connect)?;
+    let mut req = http::Request::builder()
+        .method(http::Method::POST)
+        .uri(format!("{scheme}://{authority}{path}"))
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .header(
+            "user-agent",
+            concat!("iohr-agent/", env!("CARGO_PKG_VERSION")),
+        );
+    if let Some((name, value)) = auth {
+        let mut v = http::HeaderValue::from_str(value).map_err(|_| ErrorClass::Connect)?;
+        v.set_sensitive(true);
+        req = req.header(name, v);
+    }
+    let req = req.body(()).map_err(|_| ErrorClass::Connect)?;
+    let (response, mut send) = client
+        .send_request(req, false)
+        .map_err(|_| ErrorClass::Connect)?;
+    // An empty request message: every field at its default.
+    send.send_data(Bytes::from_static(&[0, 0, 0, 0, 0]), true)
+        .map_err(|_| ErrorClass::Connect)?;
+    let response = response.await.map_err(|_| ErrorClass::Connect)?;
+    if response.status() != http::StatusCode::OK {
+        return Err(ErrorClass::Status);
+    }
+    // A trailers-only response carries grpc-status in the headers.
+    if let Some(code) = grpc_status(response.headers()) {
+        return code;
+    }
+    let mut body = response.into_body();
+    let mut read = 0usize;
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.map_err(|_| ErrorClass::Connect)?;
+        let _ = body.flow_control().release_capacity(chunk.len());
+        read += chunk.len();
+        if read > super::bounds::MAX_ANSWER_BYTES {
+            return Err(ErrorClass::Answer);
+        }
+    }
+    match body.trailers().await {
+        Ok(Some(trailers)) => grpc_status(&trailers).unwrap_or(Err(ErrorClass::Answer)),
+        _ => Err(ErrorClass::Answer),
+    }
+}
+
+/// `grpc-status` as a number, when present.
+fn grpc_status(headers: &http::HeaderMap) -> Option<Result<u64, ErrorClass>> {
+    let v = headers.get("grpc-status")?;
+    Some(
+        v.to_str()
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|c| *c <= 16)
+            .ok_or(ErrorClass::Answer),
+    )
+}
+
 /// A length-prefixed `HealthCheckRequest { string service = 1; }`.
 fn encode_request(service: &str) -> Bytes {
     let mut msg = BytesMut::new();
@@ -243,6 +387,58 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// A unary server on h2c answering every call with `code`, trailers-only when asked.
+    async fn serve_unary(code: &'static str, trailers_only: bool) -> std::net::SocketAddr {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = l.accept().await {
+                tokio::spawn(async move {
+                    let mut conn = h2::server::handshake(sock).await.unwrap();
+                    while let Some(Ok((req, mut respond))) = conn.accept().await {
+                        assert_eq!(req.uri().path(), "/pkg.Svc/Do");
+                        let mut resp = http::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/grpc");
+                        if trailers_only {
+                            resp = resp
+                                .header("grpc-status", code)
+                                .header("grpc-message", "canary-grpc-message");
+                            respond.send_response(resp.body(()).unwrap(), true).unwrap();
+                            continue;
+                        }
+                        let mut send = respond
+                            .send_response(resp.body(()).unwrap(), false)
+                            .unwrap();
+                        send.send_data(Bytes::from(vec![0, 0, 0, 0, 0]), false)
+                            .unwrap();
+                        let mut trailers = http::HeaderMap::new();
+                        trailers.insert("grpc-status", code.parse().unwrap());
+                        send.send_trailers(trailers).unwrap();
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn a_unary_call_is_judged_by_its_status() {
+        for (code, only) in [("0", false), ("16", true), ("7", false)] {
+            let addr = serve_unary(code, only).await;
+            let r = unary_call(
+                TcpStream::connect(addr).await.unwrap(),
+                "http",
+                "localhost",
+                "/pkg.Svc/Do",
+                None,
+                Duration::from_secs(5),
+            )
+            .await;
+            assert_eq!(r, Ok(code.parse().unwrap()));
+        }
     }
 
     #[tokio::test]

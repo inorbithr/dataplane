@@ -7,8 +7,9 @@
 
 | Path | What it holds |
 |---|---|
-| `crates/iohr-agent/src/` | the agent: `cli` (commands), `config` (agent.toml), `policy` (policy.toml, target checks, DNS pinning), `enroll`/`keys`/`token` (identity), `session`/`protocol` (WebSocket), `executor` (admission, ceilings), `checks/` (http, tcp, tls, grpc_health), `checks_file` (checks.toml: declared checks, `checks lint`), `secrets` (env/file/k8s/vault), `admin`/`state` (local page), `capture` (the companion's counts, `capture:*` in the hello), `telemetry` (OTLP), `extsock`/`platform` (iohr token socket, init) |
+| `crates/iohr-agent/src/` | the agent: `cli` (commands), `config` (agent.toml), `policy` (policy.toml, target checks, DNS pinning), `enroll`/`keys`/`token` (identity), `session`/`protocol` (WebSocket), `executor` (admission, ceilings), `checks/` (http, tcp, tls, grpc_health; the transport surfaces grpc, sse, ws, mqtt, mcp, graphql, off unless the policy lists them), `checks_file` (checks.toml: declared checks, `checks lint`), `secrets` (env/file/k8s/vault), `admin`/`state` (local page), `capture` (the companion's counts, `capture:*` in the hello), `telemetry` (OTLP), `extsock`/`platform` (iohr token socket, init) |
 | `crates/iohr-agent/tests/end_to_end.rs` | the agent against a fake control plane |
+| `crates/iohr-agent/tests/transport_checks.rs` | the transport surfaces against poisoned local servers: verdicts, and nothing a target said in a frame, the admin page or OTLP |
 | `crates/iohr-capture*/` | the capture companion: `iohr-capture` (user space: `capture` load/attach/drop, `engine` aggregates, `proto/` recognisers, `flows`, `topk`, `sockdiag`/`owners`/`procnet` for layers 4-5, `timing` + `route` for layer 7 (route vectors in `tests/route_vectors.json`, checksummed), `pcap` for layer 3, `server` sockets (aggregates v1/v2, control), `worker` the unprivileged parser process), `-common` (shared types), `-ebpf` (eBPF programs, nightly, not a workspace member); ADR 0002, `docs/capture/` |
 | `charts/iohr-agent/` | Helm chart |
 | `packaging/` | systemd unit, default config, deb/rpm scripts |
@@ -24,7 +25,7 @@ change: change core in step, and say so in the PR.
 ## Rules
 
 - Read `CONTRIBUTING.md`. The policy wins; only timings, codes, classes and counts leave
-  the machine (plus the targets a company declares in `checks.toml` and the `capture:*` capability strings, sent in the hello); capture data never leaves the host (`crates/iohr-agent/tests/capture_privacy.rs`, control DAT-10); no new listener; small dependency set.
+  the machine (plus the targets, categories and tags a company declares in `checks.toml` and the `capture:*` capability strings, sent in the hello; a transport check's request stays in `checks.toml`, the job names its key); capture data never leaves the host (`crates/iohr-agent/tests/capture_privacy.rs`, control DAT-10); no new listener; small dependency set.
 - Hydra (the platform's identity provider) accepts only RS/PS/ES algorithms for
   `private_key_jwt`; the default key is ES256 for that reason.
 - Capture (ADR 0002): `unsafe` only in `crates/iohr-capture-ebpf` and the `aya::Pod` impls

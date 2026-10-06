@@ -73,7 +73,7 @@ How a target is decided:
 | `checks` | `true` | Accept surface checks. |
 | `load` | `false` | Load generation. Not in this version: always refused. |
 | `faults` | `false` | Faults through the proxy. Not in this version: always refused. |
-| `surfaces` | all | Which check surfaces are accepted: `http`, `tcp`, `tls`, `grpc_health`. |
+| `surfaces` | `http`, `tcp`, `tls`, `grpc_health` | Which check surfaces are accepted. The transport surfaces `grpc`, `sse`, `ws`, `mqtt`, `mcp` and `graphql` read a bounded answer (never reported) and are accepted only when listed ([checks](checks.md#transport-surfaces)). |
 | `capture` | `false` | Read the capture companion's counts ([`[capture]`](#capture)) and announce `capture:*`. Needs an agent newer than 0.1.0-alpha.4. |
 
 The agent announces what it accepts (`check:http`, …) in its `hello`, so the console only

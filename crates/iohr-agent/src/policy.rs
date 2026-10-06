@@ -110,7 +110,8 @@ pub struct Work {
     /// Faults through the proxy (not in this version; always refused).
     #[serde(default)]
     pub faults: bool,
-    /// Which check surfaces are accepted.
+    /// Which check surfaces are accepted. Without it, the four that read no answer
+    /// (`http`, `tcp`, `tls`, `grpc_health`); the transport surfaces only when listed.
     #[serde(default = "all_surfaces")]
     pub surfaces: Vec<Surface>,
     /// Read the capture companion's aggregates and announce what it can show
@@ -223,7 +224,7 @@ fn yes() -> bool {
 }
 
 fn all_surfaces() -> Vec<Surface> {
-    Surface::ALL.to_vec()
+    Surface::DEFAULT.to_vec()
 }
 
 /// `[ceilings]`.

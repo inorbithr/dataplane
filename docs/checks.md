@@ -71,17 +71,71 @@ Unknown keys are errors, so a typo never silently changes what is checked.
 | Key | Required | Meaning |
 |---|---|---|
 | `name` | yes | 1 to 64 of `a-z 0-9 -`, unique in the file. The monitor's key: renaming an entry replaces its monitor. |
-| `surface` | no | `http`, `tcp`, `tls` or `grpc_health`. Default: `http` for a URL target, `tcp` for host and port. |
+| `surface` | no | `http`, `tcp`, `tls`, `grpc_health`, or a transport surface: `grpc`, `sse`, `ws`, `mqtt`, `mcp`, `graphql` ([below](#transport-surfaces)). Default: `http` for a URL target, `tcp` for host and port. |
 | `target` | yes | A URL (`"https://api.example.com/healthz"`), `"host:port"`, a bare host for `tls` (port 443), or a table: `{ url = "…" }` or `{ host = "…", port = 5432, tls = true }` (`tls` for `grpc_health`). No user or password in a URL; credentials go in `auth`. |
 | `every` | yes | `"60s"`, `"5m"`, `"1h"`, `"1d"`: from one minute to 24 hours. |
-| `expect` | no | `status` (100 to 599, `http`), `max_ms` (1 to 30000), `valid_for_days` (1 to 365, `tls` and `http`: the certificate must stay valid that long; judged by the platform from the expiry the agent reports). Without `status`, any status below 400 passes. |
+| `expect` | no | `status` (100 to 599; `http`, `sse`, `mcp`, `graphql`), `max_ms` (1 to 30000), `valid_for_days` (1 to 365, `tls` and `http`: the certificate must stay valid that long; judged by the platform from the expiry the agent reports). Without `status`, any status below 400 passes. |
 | `fail_after` | no | Failed runs in a row before the monitor goes down, 1 to 5. Default 2 for `[[check]]`, 1 for `[[refuse]]`. |
 | `service` | no | The gRPC health service name (`grpc_health` only); empty means the whole server. |
-| `auth` | no | A secret reference (`env:NAME`, `file:/path`, `k8s:ns/name#key`, `vault:path#key`) sent as the `authorization` header of `http` and `grpc_health` checks. Never a value; the policy's `[secrets] allow` must permit it. |
+| `auth` | no | A secret reference (`env:NAME`, `file:/path`, `k8s:ns/name#key`, `vault:path#key`) sent as the `authorization` header of every surface but `tcp` and `tls` (on `ws` and `mqtt`, of the WebSocket upgrade; on `grpc`, as metadata). Never a value; the policy's `[secrets] allow` must permit it. |
+| `auth_scheme` | no | A word put before the secret's value, `"Bearer"`; without it the value is sent as it is. Stays on this machine. |
+| `category` | no | One of `availability`, `transport`, `contract`, `security`, `performance`, `synthetic`; the monitor's category. |
+| `tags` | no | Up to 10 labels, `{ transport = "ws" }`: keys `^[a-z][a-z0-9_.-]{0,31}$`, values `^[A-Za-z0-9_.:/-]{1,64}$`. They leave the machine with the check; never put customer data in them. |
 | `rfc` | no | The platform RFC this check proves (`"0029"`, `"0040.1"`); the RFC's page then shows "proved since". |
 | `by` | `[[refuse]]` | Who must refuse: `"policy"` or `"platform"`. Leave it out and give `expect` for a refusal the target answers. |
 
 At most 50 entries, `[[check]]` and `[[refuse]]` together.
+
+## Transport surfaces
+
+RFC 0040.2. Six surfaces test an API transport end to end. Each reads a bounded answer
+(at most 1 MiB, at most 32 WebSocket or MQTT messages, at most 20 events), judges it in
+memory and drops it. A result is still a verdict, the latency, an HTTP status and an
+error class: never a body, a header value, an error message or a payload. The class
+`answer` means the target answered in the wrong shape.
+
+They are off until the policy lists them in `[work] surfaces`. What each sends beyond its
+target is in the keys below and **stays on this machine**: the platform's job for the
+check names only its `name`, the agent reads the rest from this file, and it refuses a job
+whose surface or target differ from the entry. `ws`, `mqtt` and `grpc` run only as
+declared checks.
+
+| Surface | Target | Keys | Passes when |
+|---|---|---|---|
+| `sse` | URL | `events` (0 to 20, default 1) | `GET` with `Accept: text/event-stream` answers the expected status (any 2xx) as an event stream and delivers `events` events (a block with `data`; comments do not count) in time |
+| `graphql` | URL | `query` (default `{ __typename }`, at most 8 KiB), `variables` | `POST` answers the expected status with `data` and no `errors` |
+| `mcp` | URL | `min_tools` (default 1), `tool`, `args`, `allow_side_effects` | `initialize`, `notifications/initialized` and `tools/list` succeed with at least `min_tools` tools; with `tool`, its `tools/call` succeeds without `isError`. A tool is called only when `tools/list` annotates it `readOnlyHint: true`, or with `allow_side_effects = true`; otherwise the job is refused and nothing is called |
+| `ws` | URL (`http` becomes `ws`, `https` `wss`) | `method` (`pkg.Service/Method`, required), `params`, `expect_error` | the `/v1/ws` frame `call` gets a `data` frame; with `expect_error`, an `error` frame with that `code` |
+| `mqtt` | URL of the MQTT-over-WebSocket endpoint | `topic` (required, no wildcards), `params`, `expect_error` | MQTT 5 (subprotocol `mqtt`): CONNECT, SUBSCRIBE to `reply/<client id>/check`, PUBLISH at QoS 1 with that Response Topic and random Correlation Data; the answer carries no `error` user property (with `expect_error`, that value). A refusal in CONNACK, SUBACK or PUBACK is `status` |
+| `grpc` | URL or `{ host, port, tls }` | `method` (required), `expect_code` (0 to 16, default 0) | a unary call with an empty request message ends with that `grpc-status` |
+
+`http` gains `method` (`GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`), a JSON
+`body` (at most 8 KiB, sent as `application/json`) and `headers` limited to `accept` and
+`content-type`, so a health check can `POST`. Its answer is still never read.
+
+```toml
+[[check]]
+name = "graphql-heartbeat"
+surface = "graphql"
+target = "https://api.example.com/graphql"
+query = "{ __typename }"
+every = "15m"
+category = "transport"
+tags = { transport = "graphql" }
+
+[[check]]
+name = "ws-heartbeat"
+surface = "ws"
+target = "https://api.example.com/v1/ws"
+method = "iohr.ledger.v1.LedgerService/Ping"
+params = { message = "hi" }
+auth = "env:PROBE_KEY"
+auth_scheme = "Bearer"
+every = "15m"
+```
+
+`grpc` sends an empty request only: a method whose request needs fields is checked by the
+status it refuses with. Requests built from server reflection are not in this version.
 
 ## Tests that must fail: `[[refuse]]`
 
@@ -144,6 +198,8 @@ The normalized form of the example above starts:
 given with `expect`).
 
 So the targets and names you declare leave the machine: full URLs (path and query
-included), host names and ports, secret *references* and RFC numbers. Secret values never
+included), host names and ports, secret *references*, RFC numbers, categories and tags.
+A transport check's request (method, params, query, topic, tool, body, headers) and
+`auth_scheme` do not. Secret values never
 do; neither do results beyond what any job reports. The platform answers what it accepted
 and why it rejected the rest; the agent's page in the console shows both.
