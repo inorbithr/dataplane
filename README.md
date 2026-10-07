@@ -63,6 +63,21 @@ iohr agent init                 # writes agent.toml and policy.toml, checks them
 iohr agent run
 ```
 
+### macOS, as a background service
+
+After the three commands above, with `iohr agent init --dir "$HOME/Library/Application Support/InOrbit"`:
+
+```sh
+sh packaging/macos/install.sh          # a LaunchAgent for your user, no sudo
+launchctl print gui/$(id -u)/hr.inorbit.agent   # state, runs, last exit code
+tail -f ~/Library/Logs/InOrbit/agent.log
+sh packaging/macos/install.sh --remove # stop and remove it (keeps config and state)
+```
+
+launchd keeps the agent running only while it is enrolled, so an agent that has not
+enrolled yet runs once and stops; when the platform revokes it, it stops for good
+([plist](packaging/macos/hr.inorbit.agent.plist)).
+
 ### Kubernetes (Helm)
 
 ```sh

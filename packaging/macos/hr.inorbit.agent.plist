@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The InOrbit agent as a per-user LaunchAgent on macOS, the counterpart of
+  packaging/systemd/iohr-agent.service. packaging/macos/install.sh fills in @HOME@ and
+  @IOHR@ and loads it; it runs as the signed-in user, with no privileges.
+
+  launchd keeps the agent alive only while it is enrolled (state/enrollment.json exists),
+  so an agent that has not enrolled yet does not restart in a loop. The wrapper sets the
+  enrollment aside when the platform revokes the agent (exit 3), which stops it for good,
+  like RestartPreventExitStatus=3 in the systemd unit.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>hr.inorbit.agent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>@HOME@/Library/Application Support/InOrbit/bin/iohr-agent-launchd.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>IOHR_AGENT_CONFIG</key>
+    <string>@HOME@/Library/Application Support/InOrbit/agent.toml</string>
+    <key>IOHR</key>
+    <string>@IOHR@</string>
+    <key>PATH</key>
+    <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>PathState</key>
+    <dict>
+      <key>@HOME@/Library/Application Support/InOrbit/state/enrollment.json</key>
+      <true/>
+    </dict>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>@HOME@/Library/Logs/InOrbit/agent.log</string>
+  <key>StandardErrorPath</key>
+  <string>@HOME@/Library/Logs/InOrbit/agent.log</string>
+</dict>
+</plist>
