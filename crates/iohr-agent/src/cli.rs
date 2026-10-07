@@ -1009,6 +1009,17 @@ fn host_name() -> String {
         .filter(|s| !s.is_empty())
         .or_else(|| std::env::var("HOSTNAME").ok())
         .or_else(|| std::env::var("COMPUTERNAME").ok())
+        // macOS has no /etc/hostname and launchd sets no HOSTNAME; ask the system.
+        .or_else(|| {
+            std::process::Command::new("hostname")
+                .arg("-s")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+        })
         .unwrap_or_else(|| "agent".into())
         .chars()
         .take(64)
