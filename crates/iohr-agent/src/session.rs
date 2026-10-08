@@ -165,6 +165,15 @@ async fn once(agent: &Arc<Agent>, shutdown: &mut watch::Receiver<bool>) -> Resul
         true,
         Some(connector),
     );
+    // The upgrade request carries no body: its headers are the access token and the
+    // user agent. Recorded like every other message before it leaves.
+    agent.ledger_record(crate::ledger::Record {
+        kind: "session_open",
+        payload: b"",
+        rule: "contract.session",
+        destination: url.as_str(),
+        job_id: None,
+    })?;
     let (ws, _) = match tokio::time::timeout(HANDSHAKE_TIMEOUT, connect).await {
         Err(_) => return Err(Error::Session("connecting timed out".into())),
         Ok(Err(tokio_tungstenite::tungstenite::Error::Http(resp))) => {
@@ -205,7 +214,7 @@ async fn once(agent: &Arc<Agent>, shutdown: &mut watch::Receiver<bool>) -> Resul
             .map(crate::checks_file::DeclaredChecks::wire),
         metadata: agent.config.metadata.reported().map(Box::new),
     };
-    send(&mut sink, &hello).await?;
+    send(agent, &mut sink, &hello, "contract.hello", None).await?;
 
     let welcome = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         while let Some(msg) = stream.next().await {
@@ -260,7 +269,7 @@ async fn once(agent: &Arc<Agent>, shutdown: &mut watch::Receiver<bool>) -> Resul
             }
             _ = heartbeat.tick() => {
                 seq += 1;
-                send(&mut sink, &AgentFrame::Heartbeat { seq }).await?;
+                send(agent, &mut sink, &AgentFrame::Heartbeat { seq }, "contract.heartbeat", None).await?;
                 agent.state.heartbeat();
                 // The contract has no frame from the platform between jobs; a WebSocket
                 // ping makes any server answer with a pong, so a half-open connection is
@@ -268,11 +277,15 @@ async fn once(agent: &Arc<Agent>, shutdown: &mut watch::Receiver<bool>) -> Resul
                 sink.send(Message::Ping(bytes::Bytes::new()))
                     .await
                     .map_err(|e| Error::Session(format!("send failed: {e}")))?;
+                agent.state.ping();
             }
             Some(done) = rx.recv() => {
                 running.remove(&done.result.job_id);
+                agent.state.job_finished();
                 let status = done.result.status;
-                send(&mut sink, &AgentFrame::Result(done.result)).await?;
+                let rule = result_rule(&done);
+                let id = done.result.job_id.clone();
+                send(agent, &mut sink, &AgentFrame::Result(done.result), &rule, Some(&id)).await?;
                 agent.state.result_sent(done.record, status);
             }
             Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
@@ -290,7 +303,8 @@ async fn once(agent: &Arc<Agent>, shutdown: &mut watch::Receiver<bool>) -> Resul
                                 Admission::Refuse(reason) => {
                                     let done = Executor::refused(&job, reason);
                                     let status = done.result.status;
-                                    send(&mut sink, &AgentFrame::Result(done.result)).await?;
+                                    let id = done.result.job_id.clone();
+                                    send(agent, &mut sink, &AgentFrame::Result(done.result), "contract.refusal", Some(&id)).await?;
                                     agent.state.result_sent(done.record, status);
                                 }
                                 Admission::Run(admitted) => {
@@ -302,6 +316,7 @@ async fn once(agent: &Arc<Agent>, shutdown: &mut watch::Receiver<bool>) -> Resul
                                         let _ = tx.send(done).await;
                                     });
                                     running.insert(job.job_id, handle);
+                                    agent.state.job_started();
                                 }
                             }
                         }
@@ -336,11 +351,40 @@ fn now_utc_seconds() -> String {
         .unwrap_or_default()
 }
 
-async fn send<S>(sink: &mut S, frame: &AgentFrame) -> Result<()>
+/// The rule that let a result leave: the surface the policy turned on, or the contract's
+/// duty to answer every job (a refusal, or a run the policy then refused).
+fn result_rule(done: &crate::executor::Finished) -> String {
+    match (done.result.status, &done.record.surface) {
+        (crate::protocol::ResultStatus::Refused, _) | (_, None) => "contract.refusal".into(),
+        (_, Some(s)) => format!("work.surfaces.{s}"),
+    }
+}
+
+/// Serialises a frame, records it in the egress ledger, then sends it: a frame the
+/// ledger could not record is not sent.
+async fn send<S>(
+    agent: &Agent,
+    sink: &mut S,
+    frame: &AgentFrame,
+    rule: &str,
+    job_id: Option<&str>,
+) -> Result<()>
 where
     S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
     let text = serde_json::to_string(frame).map_err(|e| Error::Session(e.to_string()))?;
+    let kind = match frame {
+        AgentFrame::Hello { .. } => "hello",
+        AgentFrame::Heartbeat { .. } => "heartbeat",
+        AgentFrame::Result(_) => "result",
+    };
+    agent.ledger_record(crate::ledger::Record {
+        kind,
+        payload: text.as_bytes(),
+        rule,
+        destination: agent.session_destination.as_str(),
+        job_id,
+    })?;
     sink.send(Message::text(text))
         .await
         .map_err(|e| Error::Session(format!("send failed: {e}")))

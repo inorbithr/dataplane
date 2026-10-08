@@ -125,6 +125,9 @@ Every artifact is an OCI artifact; copy them into your registry with their signa
 | `iohr-agent enroll --token-file f` | make the key and enroll |
 | `iohr-agent run` | connect and work until stopped (exit 3: revoked) |
 | `iohr-agent status` | running, connected, policy hash, what was sent |
+| `iohr-agent page [--open]` | the local agent page's address, or the browser opened on it signed in |
+| `iohr-agent ledger verify` | check the egress ledger's chain: nothing removed, inserted or changed; exit 1 on any problem ([docs/ledger.md](docs/ledger.md)) |
+| `iohr-agent ledger export [--out F]` | every ledger entry as JSON lines, for your SIEM |
 | `iohr-agent policy check [--target URL]` | validate the policy, test a target against it |
 | `iohr-agent checks lint [--resolve]` | validate `checks.toml` against the policy, offline; exit 1 on any error |
 | `iohr-agent config validate` | check `agent.toml` with `IOHR_AGENT_META_*` overrides applied; every problem names its line; exit 2 on any error |
@@ -137,8 +140,14 @@ Every artifact is an OCI artifact; copy them into your registry with their signa
 sections (where the agent runs, who owns it, what binds it) that devops fills so the
 platform can place its observations; full examples are in [packaging/examples](packaging/examples).
 
-The admin page at `http://127.0.0.1:7790/` (JSON at `/status.json`) is read-only and
-answers only on loopback. Telemetry goes to your OpenTelemetry collector when
+The local agent page at `http://127.0.0.1:7790/` is where you check this agent without
+taking our word for it: its connection and identity, each declared check with its last
+runs, the effective policy and what the agent can never do, every message it sent the
+platform (the [egress ledger](docs/ledger.md)), the jobs it accepted and refused, host
+observations when the policy turns them on, and its own redacted log. Every section has a
+JSON twin under `/api/v1/`. It is read-only, answers only on loopback by default, refuses
+other `Host` names and cross-site requests, runs no script, and redacts secrets from
+everything it shows ([threat model](docs/security/admin-page.md)). Telemetry goes to your OpenTelemetry collector when
 `[telemetry] enabled = true` in `agent.toml`; nothing is exported by default.
 
 ## Traffic capture (preview)

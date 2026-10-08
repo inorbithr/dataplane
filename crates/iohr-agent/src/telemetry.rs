@@ -61,6 +61,7 @@ pub fn init(cfg: &TelemetryConfig, json: bool) -> Result<Telemetry> {
         let _ = tracing_subscriber::registry()
             .with(filter)
             .with(fmt)
+            .with(crate::logbuf::RingLayer)
             .try_init();
         return Ok(Telemetry::default());
     }
@@ -110,6 +111,7 @@ pub fn init(cfg: &TelemetryConfig, json: bool) -> Result<Telemetry> {
     let _ = tracing_subscriber::registry()
         .with(filter)
         .with(fmt)
+        .with(crate::logbuf::RingLayer)
         .with(otel_traces)
         .with(otel_logs)
         .try_init();

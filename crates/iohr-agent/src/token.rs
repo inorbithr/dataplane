@@ -26,6 +26,7 @@ pub struct TokenSource {
     enrollment: Arc<Enrollment>,
     key: Arc<AgentKey>,
     cached: Mutex<Option<(Zeroizing<String>, Instant)>>,
+    ledger: Option<Arc<crate::ledger::Ledger>>,
 }
 
 #[derive(Deserialize)]
@@ -44,7 +45,15 @@ impl TokenSource {
             enrollment,
             key,
             cached: Mutex::new(None),
+            ledger: None,
         }
+    }
+
+    /// Records each token request in the egress ledger before it is sent.
+    #[must_use]
+    pub fn with_ledger(mut self, ledger: Option<Arc<crate::ledger::Ledger>>) -> Self {
+        self.ledger = ledger;
+        self
     }
 
     /// The client assertion: `iss` = `sub` = client id, `aud` = token endpoint, short-lived,
@@ -91,10 +100,30 @@ impl TokenSource {
             ("scope", self.enrollment.scope.as_str()),
             ("audience", self.enrollment.audience.as_str()),
         ];
+        let body = Zeroizing::new(
+            url::form_urlencoded::Serializer::new(String::new())
+                .extend_pairs(form)
+                .finish(),
+        );
+        if let Some(l) = &self.ledger {
+            let mut dest = self.enrollment.token_endpoint.clone();
+            dest.set_query(None);
+            l.record(crate::ledger::Record {
+                kind: "token_request",
+                payload: body.as_bytes(),
+                rule: "contract.token",
+                destination: dest.as_str(),
+                job_id: None,
+            })?;
+        }
         let resp = self
             .http
             .post(self.enrollment.token_endpoint.clone())
-            .form(&form)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(body.as_str().to_owned())
             .send()
             .await
             .map_err(|e| {

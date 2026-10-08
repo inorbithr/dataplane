@@ -281,6 +281,11 @@ impl Executor {
             .map(str::to_owned);
         let at = now_rfc3339();
         tracing::info!(job_id = %job.job_id, kind = %job.kind, reason = %reason, "job refused by local policy");
+        let key = job
+            .spec
+            .get("key")
+            .and_then(|s| s.as_str())
+            .map(str::to_owned);
         Finished {
             result: JobResult {
                 job_id: job.job_id.clone(),
@@ -291,7 +296,9 @@ impl Executor {
                     error_class: Some(ErrorClass::RefusedByPolicy),
                     ..CheckDetail::default()
                 },
-                refusal: Some(Refusal { reason }),
+                refusal: Some(Refusal {
+                    reason: reason.clone(),
+                }),
             },
             record: JobRecord {
                 at,
@@ -300,6 +307,12 @@ impl Executor {
                 target_host: None,
                 verdict: "refused".into(),
                 latency_ms: 0,
+                job_id: Some(job.job_id.clone()),
+                key,
+                reason: Some(reason),
+                error_class: Some("refused_by_policy".into()),
+                status_code: None,
+                tls_expires_at: None,
             },
         }
     }
@@ -352,6 +365,11 @@ impl Executor {
             tracing::info!(verdict = status.as_str(), latency_ms = detail.latency_ms, error_class = ?detail.error_class, "job finished");
         }
         let finished_at = now_rfc3339();
+        let error_class = detail.error_class.and_then(|c| {
+            serde_json::to_value(c)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+        });
         Finished {
             record: JobRecord {
                 at: finished_at.clone(),
@@ -360,6 +378,12 @@ impl Executor {
                 target_host: Some(a.endpoint.host.clone()),
                 verdict: status.as_str().into(),
                 latency_ms: detail.latency_ms,
+                job_id: Some(job_id.clone()),
+                key: a.spec.key.clone(),
+                reason: refusal.as_ref().map(|r| r.reason.clone()),
+                error_class,
+                status_code: detail.status_code,
+                tls_expires_at: detail.tls_expires_at.clone(),
             },
             result: JobResult {
                 job_id,
