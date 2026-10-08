@@ -26,7 +26,7 @@ by writing the file. An environment variable wins over both, for the fields it n
 `IOHR_AGENT_META_ASSET_TAGS=owner-team=sre,tier=gold`, `IOHR_AGENT_META_REPORT=false`).
 A list splits on commas, tags are `key=value` pairs, `clock_uncertainty_ms` is a number.
 An override is checked exactly like a value in the file; a bad one names the variable.
-Everything else in the file (`api`, `name`, paths, `[admin]`, `[telemetry]`, `[secrets]`,
+Everything else in the file (`api`, `name`, paths, `[admin]`, `[ledger]`, `[telemetry]`, `[secrets]`,
 `[tls]`, `[session]`) has no environment form; `IOHR_AGENT_CONFIG` names the file.
 
 ## The sections
@@ -36,7 +36,7 @@ console), `environment` (must equal the policy's), `policy`, `checks`, `key`,
 `state_dir` (relative paths resolve against the file's directory), `key_alg` (`es256`
 or `ed25519`).
 
-`[admin]` the loopback status page; `[telemetry]` OTLP export, off by default;
+`[admin]` the local agent page: loopback only unless `allow_non_loopback`, which then needs `tls_cert` and `tls_key` and always asks for the page's token; `require_token` asks for it on loopback too; `hosts` adds `Host` values it answers to ([security/admin-page.md](security/admin-page.md)); `[ledger]` the egress ledger, on by default, `retain_days` and `max_mb` ([ledger.md](ledger.md)); `[telemetry]` OTLP export, off by default;
 `[secrets]` the Vault and Kubernetes stores references may resolve from; `[tls]` an extra
 CA bundle; `[session]` reconnect backoff; `[docs]` the documentation sources
 `atlas docs sync` reads, each credential a secret reference ([docs-connectors.md](docs-connectors.md)).

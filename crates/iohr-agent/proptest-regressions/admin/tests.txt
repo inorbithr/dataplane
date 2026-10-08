@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 4a75975ed9f3755ec26abf1bfe1974f79c630f9931f4b240ef8569121d444883 # shrinks to (planted, needle) = ("ghp_a0aA00Aa0AaA0Aa0Aa0aaKyT", "ghp_a0aA00Aa0AaA0Aa0Aa0aaKyT"), path = "hkwec"

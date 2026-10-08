@@ -37,6 +37,63 @@ async fn watch_capture(
     }
 }
 
+/// How often the page's host reading is refreshed.
+const HOST_REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Reads the host for the page's Host section (what `atlas observe host --report` prints,
+/// and its findings). Local only: none of it is sent.
+async fn report_host(
+    sampler: crate::host::sampler::Shared,
+    policy: crate::policy::HostPolicy,
+    state: Arc<AgentState>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut tick = tokio::time::interval(HOST_REPORT_EVERY);
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => return,
+            _ = tick.tick() => {
+                let sampler = Arc::clone(&sampler);
+                let journal = policy.journal;
+                let read = tokio::task::spawn_blocking(move || {
+                    let snap = crate::host::snapshot(&crate::host::Options {
+                        root: crate::host::sysfs::Root::host(),
+                        journal,
+                        ids: None,
+                    });
+                    let g = match sampler.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    let findings = crate::host::derive::derive(
+                        &snap,
+                        Some(&g),
+                        crate::host::derive::DEFAULT_CHIPSET_WARN,
+                    );
+                    let text = crate::host::report::text(&snap, &findings, Some(&g));
+                    crate::state::HostReport {
+                        at: crate::enroll::now_rfc3339(),
+                        text,
+                        findings: findings
+                            .into_iter()
+                            .map(|f| crate::state::FindingView {
+                                check: f.check.to_owned(),
+                                subject: f.subject,
+                                verdict: f.verdict.as_str().to_owned(),
+                                reason: f.reason,
+                            })
+                            .collect(),
+                    }
+                })
+                .await;
+                if let Ok(r) = read {
+                    state.host_reported(r);
+                }
+            }
+        }
+    }
+}
+
 /// A ready-to-run agent.
 #[derive(Debug)]
 pub struct Agent {
@@ -60,6 +117,10 @@ pub struct Agent {
     pub tls: TlsContext,
     /// The host sampler (`[work] host`), sampled while the agent runs.
     pub host: Option<crate::host::sampler::Shared>,
+    /// The egress ledger (`[ledger]`), when kept.
+    pub ledger: Option<Arc<crate::ledger::Ledger>>,
+    /// Where session frames go (`wss://…/v1/agents/session`), for the ledger.
+    pub session_destination: String,
 }
 
 impl Agent {
@@ -110,7 +171,23 @@ impl Agent {
         let policy = Arc::new(policy);
         let policy_hash = policy.hash();
         let enrollment = Arc::new(enrollment);
-        let tokens = TokenSource::new(http, Arc::clone(&enrollment), Arc::new(key));
+        let ledger = if config.ledger.enabled {
+            Some(Arc::new(crate::ledger::Ledger::open(
+                &crate::ledger::dir_in(&config.state_dir),
+                config.ledger.clone(),
+                &policy_hash,
+            )?))
+        } else {
+            tracing::warn!(
+                "the egress ledger is off ([ledger] enabled = false): what is sent to the platform is not recorded on this machine"
+            );
+            None
+        };
+        let session_destination = crate::session::session_url(&config.api)
+            .map(|u| u.to_string())
+            .unwrap_or_default();
+        let tokens = TokenSource::new(http, Arc::clone(&enrollment), Arc::new(key))
+            .with_ledger(ledger.clone());
         let secrets = SecretResolver::new(config.secrets.clone(), tls.clone());
         let host = policy.host().map(|h| {
             Arc::new(std::sync::Mutex::new(crate::host::sampler::Sampler::new(
@@ -142,6 +219,7 @@ impl Agent {
             },
             how_to_stop(),
         ));
+        state.set_api(config.api.as_str());
         Ok(Self {
             config,
             policy,
@@ -153,7 +231,36 @@ impl Agent {
             executor,
             tls,
             host,
+            ledger,
+            session_destination,
         })
+    }
+
+    /// Records a message in the egress ledger before it is sent.
+    ///
+    /// # Errors
+    /// When the ledger is kept and cannot record it: the message must not be sent.
+    pub fn ledger_record(&self, r: crate::ledger::Record<'_>) -> Result<()> {
+        if let Some(l) = &self.ledger {
+            l.record(r)?;
+        }
+        Ok(())
+    }
+
+    /// What the admin page reads.
+    #[must_use]
+    pub fn admin_context(&self, token: Option<String>) -> crate::admin::Context {
+        crate::admin::Context {
+            state: Arc::clone(&self.state),
+            policy: Arc::clone(&self.policy),
+            checks: self.checks.clone().map(Arc::new),
+            ledger: self.ledger.clone(),
+            ledger_config: self.config.ledger.clone(),
+            api: self.config.api.to_string(),
+            admin: self.config.admin.clone(),
+            state_dir: self.config.state_dir.display().to_string(),
+            token,
+        }
     }
 
     /// Serves the admin page (if enabled) and runs sessions until shutdown or revocation.
@@ -162,17 +269,30 @@ impl Agent {
     /// When the admin address cannot be bound, or the agent is revoked.
     pub async fn run(self: Arc<Self>, shutdown: watch::Receiver<bool>) -> Result<()> {
         if self.config.admin.enabled {
-            let listener = tokio::net::TcpListener::bind(self.config.admin.listen)
+            let admin = &self.config.admin;
+            let tls = crate::admin::server_tls(admin)?;
+            let token = crate::admin::write_token(&self.config.state_dir)?;
+            let listener = tokio::net::TcpListener::bind(admin.listen)
                 .await
-                .map_err(|e| {
-                    Error::Config(format!("admin.listen {}: {e}", self.config.admin.listen))
-                })?;
+                .map_err(|e| Error::Config(format!("admin.listen {}: {e}", admin.listen)))?;
             if let Ok(addr) = listener.local_addr() {
-                tracing::info!(%addr, "admin page at http://{addr}/");
+                let scheme = if tls.is_some() { "https" } else { "http" };
+                tracing::info!(%addr, "admin page at {scheme}://{addr}/");
+                if !addr.ip().is_loopback() {
+                    let warning = format!(
+                        "WARNING: the admin page listens on {addr}, beyond this machine (admin.allow_non_loopback). It is served over TLS and asks for its token, but anyone who can reach {addr} can try. Prefer 127.0.0.1 and an SSH tunnel."
+                    );
+                    tracing::warn!("{warning}");
+                    #[allow(clippy::print_stderr)]
+                    {
+                        eprintln!("\n{}\n{warning}\n{}\n", "!".repeat(78), "!".repeat(78));
+                    }
+                }
             }
             tokio::spawn(crate::admin::serve(
                 listener,
-                Arc::clone(&self.state),
+                Arc::new(self.admin_context(Some(token))),
+                tls,
                 shutdown.clone(),
             ));
         }
@@ -201,6 +321,14 @@ impl Agent {
                         chipset_millicelsius: chipset,
                     });
                 },
+            ));
+        }
+        if let (Some(h), Some(p)) = (&self.host, self.policy.host()) {
+            tokio::spawn(report_host(
+                Arc::clone(h),
+                p,
+                Arc::clone(&self.state),
+                shutdown.clone(),
             ));
         }
         crate::session::run(self, shutdown).await

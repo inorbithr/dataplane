@@ -1,5 +1,6 @@
 //! The command line: `init`, `enroll`, `run`, `status`, `policy check`, `checks lint`,
-//! `config validate|show|schema`, `capture status`, `atlas observe`, `atlas docs sync|sources`. As an iohr
+//! `config validate|show|schema`, `capture status`, `atlas observe`, `atlas docs sync|sources`,
+//! `page`, `ledger verify|export`. As an iohr
 //! extension the same commands are `iohr agent …`.
 
 use std::io::{BufRead as _, IsTerminal as _, Write as _};
@@ -68,6 +69,51 @@ pub enum Command {
     /// Atlas observers: evidence about a checkout and a cluster, never claims.
     #[command(subcommand)]
     Atlas(AtlasCommand),
+    /// The local agent page: print its address, or open it signed in (`--open`).
+    Page(PageArgs),
+    /// The egress ledger: what this agent sent to the platform, recorded here first.
+    #[command(subcommand)]
+    Ledger(LedgerCommand),
+}
+
+/// `page`.
+#[derive(Debug, Args)]
+pub struct PageArgs {
+    /// Open the page in the browser, signed in with this run's token.
+    #[arg(long)]
+    pub open: bool,
+}
+
+/// `ledger …`.
+#[derive(Debug, Subcommand)]
+pub enum LedgerCommand {
+    /// Check the chain: every entry intact, none removed, inserted or changed. Exit 1 on
+    /// any problem.
+    Verify(LedgerArgs),
+    /// Write every entry, oldest first, as JSON lines (to stdout, or `--out`).
+    Export(LedgerExportArgs),
+}
+
+/// `ledger verify`.
+#[derive(Debug, Args)]
+pub struct LedgerArgs {
+    /// The ledger directory (default: `ledger` in agent.toml's state directory).
+    #[arg(long)]
+    pub dir: Option<PathBuf>,
+    /// Print the result as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `ledger export`.
+#[derive(Debug, Args)]
+pub struct LedgerExportArgs {
+    /// The ledger directory (default: `ledger` in agent.toml's state directory).
+    #[arg(long)]
+    pub dir: Option<PathBuf>,
+    /// Write here instead of stdout.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
 }
 
 /// `config …`.
@@ -437,7 +483,131 @@ async fn dispatch(cmd: Command, config_path: &Path) -> Result<ExitCode> {
         Command::Atlas(AtlasCommand::Docs(AtlasDocsCommand::Sources)) => {
             atlas_docs_sources(config_path)
         }
+        Command::Page(a) => page(&a, config_path),
+        Command::Ledger(LedgerCommand::Verify(a)) => ledger_verify(&a, config_path),
+        Command::Ledger(LedgerCommand::Export(a)) => ledger_export(&a, config_path),
         Command::Run(_) => Ok(ExitCode::SUCCESS),
+    }
+}
+
+fn ledger_dir(flag: Option<&PathBuf>, config_path: &Path) -> Result<PathBuf> {
+    match flag {
+        Some(d) => Ok(d.clone()),
+        None => Ok(crate::ledger::dir_in(
+            &AgentConfig::load(config_path)?.state_dir,
+        )),
+    }
+}
+
+fn ledger_verify(args: &LedgerArgs, config_path: &Path) -> Result<ExitCode> {
+    let dir = ledger_dir(args.dir.as_ref(), config_path)?;
+    if !dir.is_dir() {
+        return Err(Error::Config(format!(
+            "no ledger at {}: the agent has not sent anything yet, or [ledger] is off",
+            dir.display()
+        )));
+    }
+    let v = crate::ledger::verify(&dir);
+    if args.json {
+        out(&serde_json::to_string_pretty(&v).unwrap_or_default());
+    } else {
+        out(&format!(
+            "{} — {} entries in {} files ({}), from {}",
+            if v.ok() { "intact" } else { "BROKEN" },
+            v.entries,
+            v.files,
+            dir.display(),
+            v.starts_at
+        ));
+        if let (Some(seq), Some(head)) = (v.last_seq, &v.head) {
+            out(&format!("  head   entry {seq}  {head}"));
+        }
+        for p in &v.problems {
+            out(&format!("  problem  {p}"));
+        }
+    }
+    Ok(if v.ok() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
+}
+
+fn ledger_export(args: &LedgerExportArgs, config_path: &Path) -> Result<ExitCode> {
+    let dir = ledger_dir(args.dir.as_ref(), config_path)?;
+    if let Some(path) = &args.out {
+        let mut f = std::fs::File::create(path).map_err(|e| Error::io(path, e))?;
+        let n = crate::ledger::export(&dir, &mut f)?;
+        out(&format!("{n} bytes written to {}", path.display()));
+    } else {
+        let stdout = std::io::stdout();
+        let mut lock = stdout.lock();
+        crate::ledger::export(&dir, &mut lock)?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `page`: the address, or the browser opened on it with this run's token (which turns
+/// into a cookie for that browser and leaves the address bar at once).
+fn page(args: &PageArgs, config_path: &Path) -> Result<ExitCode> {
+    let cfg = AgentConfig::load(config_path)?;
+    if !cfg.admin.enabled {
+        return Err(Error::Config(
+            "the admin page is off ([admin] enabled = false)".into(),
+        ));
+    }
+    let mut addr = cfg.admin.listen;
+    if addr.ip().is_unspecified() {
+        addr.set_ip(std::net::Ipv4Addr::LOCALHOST.into());
+    }
+    let scheme = if cfg.admin.tls_cert.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    let host = if addr.ip().is_loopback() {
+        format!("127.0.0.1:{}", addr.port())
+    } else {
+        addr.to_string()
+    };
+    let base = format!("{scheme}://{host}/");
+    if !args.open {
+        out(&base);
+        if cfg.admin.token_required() {
+            out(&format!(
+                "It asks for its token: `{} page --open` opens it signed in.",
+                invoked_as()
+            ));
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    let token_path = cfg.state_dir.join(crate::admin::TOKEN_FILE);
+    let token = std::fs::read_to_string(&token_path).map_err(|e| {
+        Error::Config(format!(
+            "{}: {e} (is the agent running? the token is written when it starts)",
+            token_path.display()
+        ))
+    })?;
+    let url = format!("{base}auth?token={}", token.trim());
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let status = std::process::Command::new(opener)
+        .arg(&url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            out(&format!("Opened {base} in your browser, signed in."));
+            Ok(ExitCode::SUCCESS)
+        }
+        _ => Err(Error::Config(format!(
+            "could not start {opener}; open {base} yourself (the token is in {})",
+            token_path.display()
+        ))),
     }
 }
 
@@ -676,6 +846,9 @@ async fn run_async(cfg: AgentConfig) -> Result<()> {
             .await?
         }
     };
+    if let Ok(t) = std::env::var(TOKEN_ENV) {
+        crate::redact::register(t.trim());
+    }
     let key = AgentKey::load(&cfg.key)?;
     let agent = Arc::new(Agent::new(cfg, policy, checks, enrollment, key)?);
     tracing::info!(
@@ -884,11 +1057,12 @@ async fn status(args: &StatusArgs, config_path: &Path) -> Result<ExitCode> {
             .timeout(Duration::from_secs(3))
             .build()
             .map_err(|e| Error::Config(e.to_string()))?;
-        match client
-            .get(format!("http://{addr}/status.json"))
-            .send()
-            .await
-        {
+        let mut req = client.get(format!("http://{addr}/status.json"));
+        // When the page asks for its token, this machine's operator has it.
+        if let Ok(t) = std::fs::read_to_string(cfg.state_dir.join(crate::admin::TOKEN_FILE)) {
+            req = req.bearer_auth(t.trim());
+        }
+        match req.send().await {
             Ok(r) if r.status().is_success() => r.json::<crate::state::Snapshot>().await.ok(),
             _ => None,
         }

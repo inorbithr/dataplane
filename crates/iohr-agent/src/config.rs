@@ -13,6 +13,7 @@ use url::Url;
 use crate::atlas::docs::config::DocsConfig;
 use crate::error::{Error, Result};
 use crate::keys::KeyAlg;
+use crate::ledger::LedgerConfig;
 use crate::metadata::{self, MetadataConfig};
 
 /// The environment variable that names the configuration file.
@@ -73,6 +74,10 @@ pub struct AgentConfig {
     /// `docs/docs-connectors.md`). Credentials are secret references, never values.
     #[serde(default, skip_serializing_if = "DocsConfig::is_empty")]
     pub docs: DocsConfig,
+    /// The egress ledger: every message sent to the platform, recorded here first
+    /// (`docs/ledger.md`).
+    #[serde(default, skip_serializing_if = "LedgerConfig::is_default")]
+    pub ledger: LedgerConfig,
 }
 
 /// The read-only admin page.
@@ -86,8 +91,23 @@ pub struct AdminConfig {
     #[serde(default = "default_admin")]
     pub listen: SocketAddr,
     /// Allow a non-loopback address (for a cluster-internal page behind a network policy).
+    /// Needs `tls_cert` and `tls_key`; the page then always asks for its token.
     #[serde(default)]
     pub allow_non_loopback: bool,
+    /// Ask for the page's token (written to `<state_dir>/admin.token`, opened with
+    /// `iohr agent page --open`) on loopback too. Always on beyond loopback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_token: Option<bool>,
+    /// PEM certificate chain for serving the page over TLS (needed beyond loopback).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_cert: Option<PathBuf>,
+    /// PEM private key for `tls_cert` (mode 0600).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_key: Option<PathBuf>,
+    /// More `Host` header values the page answers to (`agent.internal:7790`), beyond
+    /// `127.0.0.1`, `localhost` and `[::1]` with its port. Anything else is refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
 }
 
 impl Default for AdminConfig {
@@ -96,7 +116,66 @@ impl Default for AdminConfig {
             enabled: true,
             listen: DEFAULT_ADMIN,
             allow_non_loopback: false,
+            require_token: None,
+            tls_cert: None,
+            tls_key: None,
+            hosts: Vec::new(),
         }
+    }
+}
+
+impl AdminConfig {
+    /// Whether the address is a loopback one.
+    #[must_use]
+    pub fn is_loopback(&self) -> bool {
+        self.listen.ip().is_loopback()
+    }
+
+    /// Whether the page asks for its token.
+    #[must_use]
+    pub fn token_required(&self) -> bool {
+        !self.is_loopback() || self.require_token.unwrap_or(false)
+    }
+
+    /// The rules for the page beyond loopback: an explicit opt-in, TLS and the token.
+    ///
+    /// # Errors
+    /// The first rule broken.
+    pub fn check(&self) -> std::result::Result<(), String> {
+        if self.is_loopback() {
+            if self.tls_cert.is_some() != self.tls_key.is_some() {
+                return Err("admin.tls_cert and admin.tls_key go together".into());
+            }
+            return Ok(());
+        }
+        if !self.allow_non_loopback {
+            return Err(format!(
+                "admin.listen {} is not a loopback address; set admin.allow_non_loopback = true (with admin.tls_cert and admin.tls_key) to serve it beyond this machine",
+                self.listen
+            ));
+        }
+        if self.tls_cert.is_none() || self.tls_key.is_none() {
+            return Err(format!(
+                "admin.listen {} is not a loopback address: the page is then served only over TLS; set admin.tls_cert and admin.tls_key",
+                self.listen
+            ));
+        }
+        if self.require_token == Some(false) {
+            return Err(format!(
+                "admin.listen {} is not a loopback address: the page then always asks for its token; remove admin.require_token = false",
+                self.listen
+            ));
+        }
+        for h in &self.hosts {
+            if h.is_empty()
+                || h.len() > 255
+                || h.bytes()
+                    .any(|b| !(b.is_ascii_alphanumeric() || b"-.:[]".contains(&b)))
+            {
+                return Err(format!("admin.hosts: {h:?} is not a host[:port]"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -262,6 +341,7 @@ impl AgentConfig {
             session: SessionConfig::default(),
             metadata: MetadataConfig::default(),
             docs: DocsConfig::default(),
+            ledger: LedgerConfig::default(),
         }
     }
 
@@ -330,6 +410,12 @@ impl AgentConfig {
         if let Some(dir) = &mut self.docs.content_dir {
             fix(dir);
         }
+        if let Some(p) = &mut self.admin.tls_cert {
+            fix(p);
+        }
+        if let Some(p) = &mut self.admin.tls_key {
+            fix(p);
+        }
     }
 
     /// Checks the rules a file must follow.
@@ -342,11 +428,9 @@ impl AgentConfig {
             return Err(Error::Config("name must be 1 to 64 characters".into()));
         }
         crate::policy::check_environment(&self.environment).map_err(Error::Config)?;
-        if !self.admin.allow_non_loopback && !self.admin.listen.ip().is_loopback() {
-            return Err(Error::Config(format!(
-                "admin.listen {} is not a loopback address; set admin.allow_non_loopback = true to serve it beyond this machine",
-                self.admin.listen
-            )));
+        self.admin.check().map_err(Error::Config)?;
+        if let Some(p) = self.ledger.problems().first() {
+            return Err(Error::Config(p.clone()));
         }
         if self.session.backoff_min_ms == 0
             || self.session.backoff_max_ms < self.session.backoff_min_ms
@@ -493,7 +577,33 @@ mod tests {
         cfg.admin.listen = "0.0.0.0:7790".parse().unwrap();
         assert!(cfg.validate().is_err());
         cfg.admin.allow_non_loopback = true;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("only over TLS"), "{err}");
+        cfg.admin.tls_cert = Some("cert.pem".into());
+        cfg.admin.tls_key = Some("key.pem".into());
         assert!(cfg.validate().is_ok());
+        assert!(cfg.admin.token_required());
+        cfg.admin.require_token = Some(false);
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("always asks for its token"), "{err}");
+    }
+
+    #[test]
+    fn a_non_loopback_page_without_tls_and_token_is_refused_at_startup() {
+        let text = format!("{HEAD}[admin]\nlisten = \"0.0.0.0:7790\"\nallow_non_loopback = true\n");
+        let err = parse(&text).unwrap_err().to_string();
+        assert!(err.contains("only over TLS"), "{err}");
+        let text = format!("{HEAD}[admin]\nlisten = \"0.0.0.0:7790\"\n");
+        assert!(
+            parse(&text)
+                .unwrap_err()
+                .to_string()
+                .contains("not a loopback address")
+        );
+        let text = format!(
+            "{HEAD}[admin]\nlisten = \"0.0.0.0:7790\"\nallow_non_loopback = true\ntls_cert = \"c.pem\"\ntls_key = \"k.pem\"\nrequire_token = false\n"
+        );
+        assert!(parse(&text).unwrap_err().to_string().contains("token"));
     }
 
     #[test]

@@ -508,3 +508,69 @@ fail_after = 1
     stop.send(true).unwrap();
     task.await.unwrap().unwrap();
 }
+
+/// ADR 0049: every frame the platform received has a ledger entry with its exact size and
+/// SHA-256, in order, chained; the token requests and the session opening are recorded
+/// too; the chain verifies, and an edit breaks it.
+#[tokio::test]
+async fn every_upstream_frame_has_a_ledger_entry() {
+    let mut h = harness(KeyAlg::Es256).await;
+    let (agent, stop, task) = start(&h).await;
+    next(&mut h.frames, "hello").await;
+    h.cmds.send(job("j-refused", "load", json!({}))).ok();
+    next(&mut h.frames, "result").await;
+    next(&mut h.frames, "heartbeat").await;
+    stop.send(true).unwrap();
+    task.await.unwrap().unwrap();
+
+    let dir = iohr_agent::ledger::dir_in(&h.cfg.state_dir);
+    let v = iohr_agent::ledger::verify(&dir);
+    assert!(v.ok(), "{v:?}");
+    let mut out = Vec::new();
+    iohr_agent::ledger::export(&dir, &mut out).unwrap();
+    let entries: Vec<iohr_agent::ledger::Entry> = String::from_utf8(out)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let frames: Vec<&iohr_agent::ledger::Entry> = entries
+        .iter()
+        .filter(|e| ["hello", "heartbeat", "result"].contains(&e.kind.as_str()))
+        .collect();
+    let raw = h.fake.raw.lock().unwrap().clone();
+    assert_ne!(raw, [] as [std::string::String; 0]);
+    // The agent may have recorded a frame the platform never read (sent at shutdown);
+    // never the other way round.
+    assert!(
+        frames.len() >= raw.len(),
+        "{} entries, {} frames",
+        frames.len(),
+        raw.len()
+    );
+    for (e, r) in frames.iter().zip(&raw) {
+        assert_eq!(
+            e.sha256,
+            iohr_agent::ledger::sha256_hex(r.as_bytes()),
+            "{e:?}"
+        );
+        assert_eq!(e.bytes, r.len() as u64);
+        assert_eq!(e.policy, h.policy.hash());
+        assert!(e.destination.ends_with("/v1/agents/session"), "{e:?}");
+    }
+    let refused = frames.iter().find(|e| e.kind == "result").unwrap();
+    assert_eq!(refused.rule, "contract.refusal");
+    assert_eq!(refused.job_id.as_deref(), Some("j-refused"));
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.kind == "token_request" && e.rule == "contract.token")
+    );
+    assert!(entries.iter().any(|e| e.kind == "session_open"));
+    // The ledger knows nothing of payloads: no field holds the frames' content.
+    let text = serde_json::to_string(&entries).unwrap();
+    assert!(!text.contains("agent_version") && !text.contains("client_assertion"));
+    // The page shows the same head.
+    let (seq, head) = agent.ledger.as_ref().unwrap().head();
+    assert_eq!(Some(seq), v.last_seq);
+    assert_eq!(Some(head), v.head);
+}

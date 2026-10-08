@@ -1,8 +1,9 @@
 //! What the agent has done, for the local admin page and `status`: counts and kinds,
 //! never content.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -13,11 +14,28 @@ use crate::protocol::ResultStatus;
 const RECENT: usize = 200;
 /// How far back it lists them.
 const WINDOW: time::Duration = time::Duration::days(1);
+/// Runs kept per declared check (the page's sparkline).
+pub const CHECK_HISTORY: usize = 60;
+/// Most checks with a history (`checks.toml` allows 50).
+const MAX_CHECK_KEYS: usize = 64;
+/// Longest string from the platform kept in a record.
+const MAX_FIELD: usize = 256;
 
 /// Shared, cheap to lock.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct AgentState {
     inner: Mutex<Snapshot>,
+    started: Instant,
+    /// Runs per declared check, newest last.
+    checks: Mutex<BTreeMap<String, VecDeque<JobRecord>>>,
+    /// When jobs arrived in the last minute.
+    arrivals: Mutex<VecDeque<Instant>>,
+}
+
+impl Default for AgentState {
+    fn default() -> Self {
+        Self::new(AgentInfo::default(), PolicyInfo::default(), String::new())
+    }
 }
 
 /// The status document (`/status.json`).
@@ -49,6 +67,51 @@ pub struct Snapshot {
     /// The host sampler, when `[work] host = true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<HostInfo>,
+    /// The platform's API.
+    #[serde(default)]
+    pub api: String,
+    /// When this process started, RFC 3339.
+    #[serde(default)]
+    pub started_at: String,
+    /// Seconds since then.
+    #[serde(default)]
+    pub uptime_secs: u64,
+    /// When the last heartbeat went out.
+    #[serde(default)]
+    pub last_heartbeat_at: Option<String>,
+    /// Jobs that arrived in the last 60 seconds.
+    #[serde(default)]
+    pub jobs_last_minute: u64,
+    /// Jobs running now.
+    #[serde(default)]
+    pub running_jobs: u64,
+    /// The latest host reading, when `[work] host = true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_report: Option<HostReport>,
+}
+
+/// A periodic reading of this host for the page: the human report and the findings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HostReport {
+    /// When it was read, RFC 3339.
+    pub at: String,
+    /// `atlas observe host --report`'s text.
+    pub text: String,
+    /// Derived findings.
+    pub findings: Vec<FindingView>,
+}
+
+/// One finding, as the page shows it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FindingView {
+    /// Which derivation.
+    pub check: String,
+    /// What it is about.
+    pub subject: String,
+    /// `supported`, `not_supported`, `unknown`.
+    pub verdict: String,
+    /// Why.
+    pub reason: String,
 }
 
 /// The host sampler's state, for the admin page and `status`.
@@ -119,6 +182,9 @@ pub struct Sent {
     pub results_failed: u64,
     /// Refusals.
     pub results_refused: u64,
+    /// WebSocket pings (empty control frames that keep the session honest).
+    #[serde(default)]
+    pub pings: u64,
 }
 
 /// Counts of frames received.
@@ -133,7 +199,7 @@ pub struct Received {
 }
 
 /// One job, as the page shows it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct JobRecord {
     /// When it finished, RFC 3339.
     pub at: String,
@@ -147,6 +213,55 @@ pub struct JobRecord {
     pub verdict: String,
     /// Milliseconds.
     pub latency_ms: u64,
+    /// The platform's id for the job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    /// The declared check it ran (`name` in `checks.toml`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// Why it was refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The class of failure (`timeout`, `refused_by_policy`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<String>,
+    /// HTTP status received.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<u16>,
+    /// The certificate's `notAfter`, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_expires_at: Option<String>,
+}
+
+fn cap(s: &mut Option<String>) {
+    if let Some(v) = s {
+        if v.len() > MAX_FIELD {
+            let mut cut = MAX_FIELD;
+            while !v.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            v.truncate(cut);
+        }
+        *v = crate::redact::redact(v);
+    }
+}
+
+impl JobRecord {
+    /// Bounds and redacts every field that came from the platform or a target.
+    #[must_use]
+    pub fn bounded(mut self) -> Self {
+        let mut kind = Some(std::mem::take(&mut self.kind));
+        cap(&mut kind);
+        self.kind = kind.unwrap_or_default();
+        cap(&mut self.surface);
+        cap(&mut self.target_host);
+        cap(&mut self.job_id);
+        cap(&mut self.key);
+        cap(&mut self.reason);
+        cap(&mut self.error_class);
+        cap(&mut self.tls_expires_at);
+        self
+    }
 }
 
 impl AgentState {
@@ -158,9 +273,65 @@ impl AgentState {
                 agent,
                 policy,
                 stop,
+                started_at: crate::enroll::now_rfc3339(),
                 ..Snapshot::default()
             }),
+            started: Instant::now(),
+            checks: Mutex::new(BTreeMap::new()),
+            arrivals: Mutex::new(VecDeque::new()),
         }
+    }
+
+    /// Names the platform's API on the page.
+    pub fn set_api(&self, api: &str) {
+        self.with(|s| api.clone_into(&mut s.api));
+    }
+
+    /// The runs of each declared check, oldest first.
+    #[must_use]
+    pub fn check_runs(&self) -> BTreeMap<String, Vec<JobRecord>> {
+        let g = match self.checks.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        g.iter()
+            .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
+            .collect()
+    }
+
+    fn arrivals_in_last_minute(&self) -> u64 {
+        let mut a = match self.arrivals.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let now = Instant::now();
+        while a
+            .front()
+            .is_some_and(|t| now.duration_since(*t).as_secs() >= 60)
+        {
+            a.pop_front();
+        }
+        a.len() as u64
+    }
+
+    /// The latest host reading.
+    pub fn host_reported(&self, r: HostReport) {
+        self.with(|s| s.host_report = Some(r));
+    }
+
+    /// A WebSocket ping went out.
+    pub fn ping(&self) {
+        self.with(|s| s.sent.pings += 1);
+    }
+
+    /// A job was admitted and is running.
+    pub fn job_started(&self) {
+        self.with(|s| s.running_jobs += 1);
+    }
+
+    /// An admitted job ended.
+    pub fn job_finished(&self) {
+        self.with(|s| s.running_jobs = s.running_jobs.saturating_sub(1));
     }
 
     fn with<R>(&self, f: impl FnOnce(&mut Snapshot) -> R) -> R {
@@ -174,9 +345,13 @@ impl AgentState {
     /// A copy for rendering.
     #[must_use]
     pub fn snapshot(&self) -> Snapshot {
+        let last_minute = self.arrivals_in_last_minute();
+        let uptime = self.started.elapsed().as_secs();
         self.with(|s| {
             let cutoff = OffsetDateTime::now_utc() - WINDOW;
             let mut copy = s.clone();
+            copy.jobs_last_minute = last_minute;
+            copy.uptime_secs = uptime;
             copy.recent_jobs.retain(|j| {
                 OffsetDateTime::parse(&j.at, &time::format_description::well_known::Rfc3339)
                     .is_ok_and(|t| t >= cutoff)
@@ -199,9 +374,12 @@ impl AgentState {
 
     /// The session went down.
     pub fn disconnected(&self, error: Option<String>) {
+        let mut error = error;
+        cap(&mut error);
         self.with(|s| {
             s.connected = false;
             s.connected_since = None;
+            s.running_jobs = 0;
             if error.is_some() {
                 s.last_error = error;
             }
@@ -228,11 +406,26 @@ impl AgentState {
 
     /// A heartbeat went out.
     pub fn heartbeat(&self) {
-        self.with(|s| s.sent.heartbeat += 1);
+        self.with(|s| {
+            s.sent.heartbeat += 1;
+            s.last_heartbeat_at = Some(crate::enroll::now_rfc3339());
+        });
     }
 
     /// A job arrived.
     pub fn job_received(&self) {
+        {
+            let mut a = match self.arrivals.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            a.push_back(Instant::now());
+            // Bounded: the policy allows at most 6000 a minute; a platform sending more
+            // only has its oldest arrivals forgotten here (the executor refuses them).
+            if a.len() > 10_000 {
+                a.pop_front();
+            }
+        }
         self.with(|s| s.received.jobs += 1);
     }
 
@@ -243,6 +436,20 @@ impl AgentState {
 
     /// A result went out.
     pub fn result_sent(&self, record: JobRecord, status: ResultStatus) {
+        let record = record.bounded();
+        if let Some(key) = &record.key {
+            let mut g = match self.checks.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            if g.contains_key(key) || g.len() < MAX_CHECK_KEYS {
+                let runs = g.entry(key.clone()).or_default();
+                if runs.len() == CHECK_HISTORY {
+                    runs.pop_front();
+                }
+                runs.push_back(record.clone());
+            }
+        }
         self.with(|s| {
             match status {
                 ResultStatus::Ok => s.sent.results_ok += 1,

@@ -1233,6 +1233,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "p256",
+ "proptest",
  "reqwest",
  "rustix",
  "rustls",

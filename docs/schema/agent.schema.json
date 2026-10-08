@@ -6,7 +6,7 @@
       "properties": {
         "allow_non_loopback": {
           "default": false,
-          "description": "Allow a non-loopback address (for a cluster-internal page behind a network policy).",
+          "description": "Allow a non-loopback address (for a cluster-internal page behind a network policy).\nNeeds `tls_cert` and `tls_key`; the page then always asks for its token.",
           "type": "boolean"
         },
         "enabled": {
@@ -14,10 +14,38 @@
           "description": "Serve it at all.",
           "type": "boolean"
         },
+        "hosts": {
+          "description": "More `Host` header values the page answers to (`agent.internal:7790`), beyond\n`127.0.0.1`, `localhost` and `[::1]` with its port. Anything else is refused.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "listen": {
           "default": "127.0.0.1:7790",
           "description": "Where it listens. Loopback unless `allow_non_loopback` is set.",
           "type": "string"
+        },
+        "require_token": {
+          "description": "Ask for the page's token (written to `<state_dir>/admin.token`, opened with\n`iohr agent page --open`) on loopback too. Always on beyond loopback.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "tls_cert": {
+          "description": "PEM certificate chain for serving the page over TLS (needed beyond loopback).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tls_key": {
+          "description": "PEM private key for `tls_cert` (mode 0600).",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -483,6 +511,32 @@
           "default": "/var/run/secrets/kubernetes.io/serviceaccount/token",
           "description": "The service account token file.",
           "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "LedgerConfig": {
+      "additionalProperties": false,
+      "description": "`[ledger]` in `agent.toml`.",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "description": "Keep the ledger. On by default; turning it off is shown on the page.",
+          "type": "boolean"
+        },
+        "max_mb": {
+          "default": 256,
+          "description": "Most megabytes the ledger may use (1 to 10240); the oldest days go first.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "retain_days": {
+          "default": 30,
+          "description": "Days of ledger files kept (1 to 3650).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "type": "object"
@@ -1120,6 +1174,10 @@
       "$ref": "#/$defs/KeyAlg",
       "default": "es256",
       "description": "Which key to make at enrollment."
+    },
+    "ledger": {
+      "$ref": "#/$defs/LedgerConfig",
+      "description": "The egress ledger: every message sent to the platform, recorded here first\n(`docs/ledger.md`)."
     },
     "metadata": {
       "$ref": "#/$defs/MetadataConfig",

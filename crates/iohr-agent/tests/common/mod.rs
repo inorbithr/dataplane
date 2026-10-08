@@ -55,6 +55,8 @@ pub struct Fake {
     pub rejected_assertions: AtomicUsize,
     pub frames: mpsc::UnboundedSender<(usize, Value)>,
     pub cmds: Mutex<mpsc::UnboundedReceiver<Cmd>>,
+    /// Every text frame exactly as received, for comparing with the agent's ledger.
+    pub raw: std::sync::Mutex<Vec<String>>,
 }
 
 pub struct Harness {
@@ -76,6 +78,7 @@ pub async fn fake_control_plane() -> (
     let (ftx, frx) = mpsc::unbounded_channel();
     let (ctx, crx) = mpsc::unbounded_channel();
     let fake = Arc::new(Fake {
+        raw: std::sync::Mutex::new(Vec::new()),
         base: Url::parse(&format!("http://{addr}/")).unwrap(),
         jwk: Mutex::new(None),
         issued: Mutex::new(HashSet::new()),
@@ -234,6 +237,7 @@ pub async fn session(f: Arc<Fake>, socket: WebSocket) {
     let Some(Ok(Message::Text(hello))) = rx.next().await else {
         return;
     };
+    f.raw.lock().unwrap().push(hello.as_str().to_owned());
     let hello: Value = serde_json::from_str(hello.as_str()).unwrap();
     assert_eq!(hello["type"], "hello");
     let _ = f.frames.send((n, hello));
@@ -246,7 +250,7 @@ pub async fn session(f: Arc<Fake>, socket: WebSocket) {
     loop {
         tokio::select! {
             m = rx.next() => match m {
-                Some(Ok(Message::Text(t))) => { let _ = f.frames.send((n, serde_json::from_str(t.as_str()).unwrap())); }
+                Some(Ok(Message::Text(t))) => { f.raw.lock().unwrap().push(t.as_str().to_owned()); let _ = f.frames.send((n, serde_json::from_str(t.as_str()).unwrap())); }
                 Some(Ok(_)) => {}
                 _ => return,
             },
