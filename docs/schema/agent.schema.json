@@ -242,6 +242,84 @@
       "pattern": "^\\d{4}-\\d{2}-\\d{2}/\\d{4}-\\d{2}-\\d{2}$",
       "type": "string"
     },
+    "DocsConfig": {
+      "additionalProperties": false,
+      "description": "The documentation sources.",
+      "properties": {
+        "content_dir": {
+          "description": "Where the normalized copies live, one directory per source (default:\n`<state_dir>/docs`). Readable by the agent's user only.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sources": {
+          "description": "The sources, read by `iohr-agent atlas docs sync`.",
+          "items": {
+            "$ref": "#/$defs/DocsSourceConfig"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "DocsSourceConfig": {
+      "additionalProperties": false,
+      "description": "One documentation source.",
+      "properties": {
+        "base_url": {
+          "description": "The API's base URL, when it is not the provider's public one (a test server, an\negress gateway). `https`, or `http` to a loopback address.",
+          "format": "uri",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "comments": {
+          "default": true,
+          "description": "Read comments too, where the provider and the credential allow it.",
+          "type": "boolean"
+        },
+        "id": {
+          "description": "A name for it: lower-case letters, digits and `-`, at most 40, unique. It names the\nentities (`doc/<id>/...`) and the local store, so renaming it starts over.",
+          "type": "string"
+        },
+        "max_items": {
+          "description": "Items fetched per run at most (default 5000). A run that reaches it is incomplete,\nand the next run continues.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "provider": {
+          "$ref": "#/$defs/Provider",
+          "description": "The provider."
+        },
+        "requests_per_minute": {
+          "description": "Requests per minute at most (default: the provider's published limit).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "token": {
+          "description": "The credential as a secret reference, never the value: `env:NOTION_TOKEN`,\n`file:/run/secrets/notion`, `k8s:<namespace>/<name>#<key>`,\n`vault:<mount>/<path>#<key>`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "provider"
+      ],
+      "type": "object"
+    },
     "Egress": {
       "description": "How the machine reaches outside.",
       "oneOf": [
@@ -770,6 +848,16 @@
         }
       ]
     },
+    "Provider": {
+      "description": "A provider this agent can read, as named in `agent.toml`.",
+      "oneOf": [
+        {
+          "const": "notion",
+          "description": "Notion, through an internal integration's token.",
+          "type": "string"
+        }
+      ]
+    },
     "ProviderKind": {
       "description": "Who provides the machine.",
       "oneOf": [
@@ -1014,6 +1102,10 @@
       "default": "checks.toml",
       "description": "The declared checks (RFC 0040.1); a missing file declares nothing.",
       "type": "string"
+    },
+    "docs": {
+      "$ref": "#/$defs/DocsConfig",
+      "description": "Documentation sources Atlas reads through this agent (Notion first;\n`docs/docs-connectors.md`). Credentials are secret references, never values."
     },
     "environment": {
       "description": "The environment this agent serves; must equal the policy's.",

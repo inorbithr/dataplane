@@ -3,9 +3,11 @@
 //! evidence proves (ADR 0005 and ADR 0023 in inorbithr/core). Read-only: a checkout on
 //! disk and, through the local policy, the Kubernetes API of one context. Output is one
 //! JSON record per line ([`record::Record`]), every record built through
-//! `iohr_evidence`'s validating constructors.
+//! `iohr_evidence`'s validating constructors. `atlas docs sync` reads a company's
+//! documentation sources the same way ([`docs`]).
 
 pub mod common;
+pub mod docs;
 pub mod k8s;
 pub mod kube;
 pub mod record;
@@ -96,6 +98,7 @@ pub async fn observe(req: &ObserveRequest, policy: Option<&Policy>) -> Result<(S
             context: c.name.clone(),
             namespaces: namespaces.clone(),
         }),
+        docs: Vec::new(),
     }));
 
     if let Some(r) = &repository {

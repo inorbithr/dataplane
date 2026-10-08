@@ -11,6 +11,9 @@ iohr-agent atlas observe --repo ../core \
   --kube-context k3d-tbd -n tbd --policy policy.toml --out inorbit.jsonl
 ```
 
+A company's documentation (Notion first) is read by `atlas docs sync` into the same
+records; see [docs-connectors.md](docs-connectors.md).
+
 Nothing is sent anywhere. The output is a local file (or standard output), and a summary
 of counts goes to standard error.
 

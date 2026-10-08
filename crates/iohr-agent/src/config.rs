@@ -10,6 +10,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::atlas::docs::config::DocsConfig;
 use crate::error::{Error, Result};
 use crate::keys::KeyAlg;
 use crate::metadata::{self, MetadataConfig};
@@ -68,6 +69,10 @@ pub struct AgentConfig {
     /// (RFC 0088; `docs/config.md`). `IOHR_AGENT_META_<SECTION>_<FIELD>` overrides a field.
     #[serde(default, skip_serializing_if = "MetadataConfig::is_default")]
     pub metadata: MetadataConfig,
+    /// Documentation sources Atlas reads through this agent (Notion first;
+    /// `docs/docs-connectors.md`). Credentials are secret references, never values.
+    #[serde(default, skip_serializing_if = "DocsConfig::is_empty")]
+    pub docs: DocsConfig,
 }
 
 /// The read-only admin page.
@@ -256,6 +261,7 @@ impl AgentConfig {
             tls: TlsConfig::default(),
             session: SessionConfig::default(),
             metadata: MetadataConfig::default(),
+            docs: DocsConfig::default(),
         }
     }
 
@@ -321,6 +327,9 @@ impl AgentConfig {
         if let Some(ca) = &mut self.tls.ca_file {
             fix(ca);
         }
+        if let Some(dir) = &mut self.docs.content_dir {
+            fix(dir);
+        }
     }
 
     /// Checks the rules a file must follow.
@@ -351,6 +360,10 @@ impl AgentConfig {
         }
         if let Some(p) = self.metadata.problems().first() {
             return Err(Error::Config(p.to_string()));
+        }
+        let docs = self.docs.problems();
+        if !docs.is_empty() {
+            return Err(Error::Config(docs.join("\n")));
         }
         if let Some(v) = &self.secrets.vault {
             check_platform_url(&v.addr)

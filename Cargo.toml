@@ -64,6 +64,8 @@ zeroize = "1"
 axum = { version = "0.8", features = ["ws"] }
 proptest = "1"
 tempfile = "3"
+# Tests only: recorded provider answers for the documentation connectors.
+wiremock = "0.6"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

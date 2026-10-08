@@ -1,5 +1,5 @@
 //! The command line: `init`, `enroll`, `run`, `status`, `policy check`, `checks lint`,
-//! `config validate|show|schema`, `capture status`, `atlas observe`. As an iohr
+//! `config validate|show|schema`, `capture status`, `atlas observe`, `atlas docs sync|sources`. As an iohr
 //! extension the same commands are `iohr agent …`.
 
 use std::io::{BufRead as _, IsTerminal as _, Write as _};
@@ -90,6 +90,39 @@ pub enum AtlasCommand {
     /// Read a checkout and/or a cluster and write the evidence as JSON lines. Read-only;
     /// the cluster's API server must pass the policy. Nothing is sent anywhere.
     Observe(AtlasObserveArgs),
+    /// Documentation sources (`[[docs.sources]]` in agent.toml): Notion first.
+    #[command(subcommand)]
+    Docs(AtlasDocsCommand),
+}
+
+/// `atlas docs …`.
+#[derive(Debug, Subcommand)]
+pub enum AtlasDocsCommand {
+    /// Read the configured sources into the local content store (only what changed since
+    /// the last complete run) and write the evidence as JSON lines. Read-only; each
+    /// provider's host and each credential reference must pass the policy. Nothing is
+    /// sent anywhere.
+    Sync(AtlasDocsSyncArgs),
+    /// List the configured sources: provider, credential reference, local store.
+    Sources,
+}
+
+/// `atlas docs sync`.
+#[derive(Debug, Args)]
+pub struct AtlasDocsSyncArgs {
+    /// Only this source; repeat for more (default: every source).
+    #[arg(long = "source")]
+    pub sources: Vec<String>,
+    /// List everything, not only what changed, and delete local copies of what is no
+    /// longer visible. Run it daily; incremental runs cannot see deletions.
+    #[arg(long)]
+    pub full: bool,
+    /// The policy (default: the one agent.toml names).
+    #[arg(long)]
+    pub policy: Option<PathBuf>,
+    /// Where to write the records (default: standard output).
+    #[arg(long)]
+    pub out: Option<PathBuf>,
 }
 
 /// `atlas observe`.
@@ -369,6 +402,12 @@ async fn dispatch(cmd: Command, config_path: &Path) -> Result<ExitCode> {
         Command::Config(ConfigCommand::Show) => config_show(config_path),
         Command::Config(ConfigCommand::Schema) => config_schema(),
         Command::Atlas(AtlasCommand::Observe(a)) => atlas_observe(&a, config_path).await,
+        Command::Atlas(AtlasCommand::Docs(AtlasDocsCommand::Sync(a))) => {
+            atlas_docs_sync(&a, config_path).await
+        }
+        Command::Atlas(AtlasCommand::Docs(AtlasDocsCommand::Sources)) => {
+            atlas_docs_sources(config_path)
+        }
         Command::Run(_) => Ok(ExitCode::SUCCESS),
     }
 }
@@ -419,6 +458,97 @@ async fn atlas_observe(args: &AtlasObserveArgs, config_path: &Path) -> Result<Ex
             err,
             "  manifest: {all} deployments, {known} known at a revision"
         );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn atlas_docs_sync(args: &AtlasDocsSyncArgs, config_path: &Path) -> Result<ExitCode> {
+    let cfg = AgentConfig::load(config_path)?;
+    let policy = Policy::load(args.policy.as_deref().unwrap_or(&cfg.policy))?;
+    let (sink, outcomes) =
+        crate::atlas::docs::run::sync_configured(&cfg, &policy, &args.sources, args.full).await?;
+    match &args.out {
+        Some(path) => {
+            let file = std::fs::File::create(path).map_err(|e| Error::io(path, e))?;
+            let mut w = std::io::BufWriter::new(file);
+            sink.write_to(&mut w)?;
+            w.flush().map_err(|e| Error::io(path, e))?;
+        }
+        None => sink.write_to(std::io::stdout().lock())?,
+    }
+    let mut err = std::io::stderr().lock();
+    let mut ok = true;
+    for o in &outcomes {
+        match (&o.summary, &o.error) {
+            (Some(s), _) if s.revoked => {
+                ok = false;
+                let _ = writeln!(
+                    err,
+                    "atlas docs {}: the credential was refused; its local copies were deleted",
+                    o.id
+                );
+            }
+            (Some(s), _) => {
+                ok &= s.complete;
+                let _ = writeln!(
+                    err,
+                    "atlas docs {}: {} listed, {} read ({} changed), {} unchanged, {} gone, {} failed, {}; {} requests, {} retries, {} rate limited",
+                    o.id,
+                    s.listed,
+                    s.fetched,
+                    s.changed,
+                    s.unchanged,
+                    s.gone,
+                    s.failed,
+                    if s.complete {
+                        "complete"
+                    } else {
+                        "incomplete (the next run continues)"
+                    },
+                    o.requests.0,
+                    o.requests.1,
+                    o.requests.2
+                );
+            }
+            (None, Some(e)) => {
+                ok = false;
+                let _ = writeln!(err, "atlas docs {}: {e}", o.id);
+            }
+            (None, None) => {}
+        }
+    }
+    Ok(if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
+}
+
+fn atlas_docs_sources(config_path: &Path) -> Result<ExitCode> {
+    let cfg = AgentConfig::load(config_path)?;
+    let content = cfg.docs.content_dir(&cfg.state_dir);
+    if cfg.docs.sources.is_empty() {
+        out("no [[docs.sources]] in agent.toml");
+    }
+    for s in &cfg.docs.sources {
+        let store = content.join(&s.id);
+        let held = std::fs::read_dir(store.join("items")).map_or(0, |d| {
+            d.filter_map(std::result::Result::ok)
+                .filter(|e| {
+                    let n = e.file_name();
+                    let n = n.to_string_lossy();
+                    n.ends_with(".md") && !n.ends_with(".comments.md")
+                })
+                .count()
+        });
+        out(&format!(
+            "{}\t{}\t{}\t{} items in {}",
+            s.id,
+            s.provider,
+            s.token.as_deref().unwrap_or("-"),
+            held,
+            store.display()
+        ));
     }
     Ok(ExitCode::SUCCESS)
 }
