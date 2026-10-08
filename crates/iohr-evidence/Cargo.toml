@@ -1,0 +1,29 @@
+[package]
+name = "iohr-evidence"
+description = "What Atlas evidence is: typed ids, content digests, observed time, evidence methods, observers, observations, artefacts, extractions, testimony and world snapshots. The public half of Atlas core (ADR 0023 in inorbithr/core); no proof lives here."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[features]
+# Helpers that build evidence through the validating constructors, for tests here and in
+# Atlas core.
+testkit = []
+
+[dependencies]
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true
