@@ -203,6 +203,7 @@ async fn once(agent: &Arc<Agent>, shutdown: &mut watch::Receiver<bool>) -> Resul
             .checks
             .as_ref()
             .map(crate::checks_file::DeclaredChecks::wire),
+        metadata: agent.config.metadata.reported().map(Box::new),
     };
     send(&mut sink, &hello).await?;
 

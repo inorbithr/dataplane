@@ -339,3 +339,52 @@ async fn enrollment_refuses_a_wrong_environment_and_reuse() {
         "the token is never echoed"
     );
 }
+
+#[tokio::test]
+async fn hello_reports_metadata_without_what_stays_local() {
+    let mut h = harness(KeyAlg::Es256).await;
+    let m = &mut h.cfg.metadata;
+    m.placement.country = Some("DE".to_owned().try_into().unwrap());
+    m.placement.site_id = Some("FRA-DC2".into());
+    m.placement.rack = Some("B12".into());
+    m.organisation.team = Some("payments-sre".into());
+    m.security.trust_domain = Some("example/fra-dc2/payments".into());
+    m.security.secrets_backend = Some("vault:kv/prod".into());
+    m.network.ntp = Some("ntp.example.internal".into());
+    m.operations.runbook = Some("https://runbooks.example.internal/payments".into());
+    let (_agent, stop, task) = start(&h).await;
+
+    let (_, hello) = next(&mut h.frames, "hello").await;
+    let meta = &hello["metadata"];
+    assert_eq!(meta["placement"]["country"], "DE", "{hello}");
+    assert_eq!(meta["placement"]["site_id"], "FRA-DC2");
+    assert_eq!(meta["organisation"]["team"], "payments-sre");
+    assert_eq!(meta["security"]["trust_domain"], "example/fra-dc2/payments");
+    let text = meta.to_string();
+    for local in ["rack", "secrets_backend", "ntp", "operations", "runbook"] {
+        assert!(
+            !text.contains(&format!("\"{local}\":")),
+            "{local} left the machine: {text}"
+        );
+    }
+    stop.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn hello_carries_no_metadata_when_reporting_is_off_or_nothing_is_set() {
+    let mut h = harness(KeyAlg::Es256).await;
+    let (_agent, stop, task) = start(&h).await;
+    let (_, hello) = next(&mut h.frames, "hello").await;
+    assert!(hello.get("metadata").is_none(), "{hello}");
+    stop.send(true).unwrap();
+    task.await.unwrap().unwrap();
+
+    h.cfg.metadata.placement.country = Some("HR".to_owned().try_into().unwrap());
+    h.cfg.metadata.report = false;
+    let (_agent, stop, task) = start(&h).await;
+    let (_, hello) = next(&mut h.frames, "hello").await;
+    assert!(hello.get("metadata").is_none(), "{hello}");
+    stop.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}

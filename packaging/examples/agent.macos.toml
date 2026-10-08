@@ -1,0 +1,100 @@
+# iohr-agent: a complete example for a Mac (RFC 0088). Relative paths resolve against this
+# file's directory, so it works wherever it lives (`~/.config/iohr-agent/agent.toml` by
+# default, or the directory `iohr-agent init --dir` wrote). Every [metadata.*] field is
+# optional: delete what you do not know rather than guess. Check with
+# `iohr-agent config validate`.
+api = "https://api.inorbit.hr"
+name = "macbook-ops-01"
+environment = "staging"
+policy = "policy.toml"
+checks = "checks.toml"
+key = "agent.key"
+state_dir = "state"
+
+[admin]
+listen = "127.0.0.1:7790"
+
+[telemetry]
+enabled = false
+
+# Where this agent runs, who owns it, what binds it and what it can be trusted for
+# (RFC 0088). Every field is optional; an unset field is unknown, never a default.
+# `iohr-agent config validate` checks it; `iohr-agent config schema` prints the schema.
+# Rack, row, dns, ntp, certificate_authority, secrets_backend, audit_destination and
+# [metadata.operations] never leave this machine; `report = false` sends nothing at all.
+# Any field can be set from the environment as IOHR_AGENT_META_<SECTION>_<FIELD>.
+[metadata]
+report = true
+
+[metadata.placement]
+provider = "on_prem"        # cloud, on_prem, colocation, edge
+provider_name = "own"
+site_id = "ZAG-OFFICE"
+site_name = "Zagreb office"
+region = "eu-central"
+zone = "office-floor-3"
+rack = "desk"
+row = "3"
+country = "HR"                 # ISO 3166-1 alpha-2
+jurisdiction = "EU"
+residency_zone = "eu"          # needs country
+latency_zone = "eu-west"
+
+[metadata.organisation]
+legal_entity = "Example Payments GmbH"
+business_unit = "Payments"
+department = "Platform engineering"
+team = "payments-sre"
+cost_centre = "CC-4411"
+project = "checkout"
+owner_role = "service owner"   # a role, never a name
+contact_channel = "#payments-oncall"
+on_call_rota = "pagerduty:P7Q2"
+escalation_policy = "pagerduty:EP9"
+
+[metadata.environment]
+tier = "staging"            # production, staging, development, test, disaster_recovery
+criticality = "low"       # critical, high, medium, low
+change_freeze = ["2026-12-20/2027-01-05"]
+maintenance_windows = ["Sun 02:00-04:00 Europe/Berlin"]
+sla_ref = "SLA-GOLD"
+slo_refs = ["slo:checkout-p95"]
+
+[metadata.asset]
+cmdb_id = "CI0012345"
+catalogue_refs = ["backstage:component:checkout"]
+hardware_class = "bare_metal"  # bare_metal, virtual_machine, container, serverless
+commissioned = "2024-03-01"
+decommission_planned = "2027-03-01"
+[metadata.asset.tags]
+owner-team = "payments-sre"
+
+[metadata.compliance]
+regimes = ["gdpr", "dora"]     # gdpr, hipaa, dora, soc2, iso27001, pci_dss, nis2, ccpa, other:<name>
+data_classes_allowed = ["public", "internal", "confidential"]
+may_leave_jurisdiction = ["public", "internal"]
+external_models_may_see = ["public"]
+retention_policy = "RET-7Y"
+audit_destination = "siem:splunk-eu"
+
+[metadata.security]
+trust_domain = "example/zag-office/laptops"
+attestation = "none"  # none, tpm, measured_boot, confidential_vm
+isolation = "shared"        # shared, dedicated, air_gapped
+certificate_authority = "example-internal-ca"
+secrets_backend = "vault:kv/prod"
+
+[metadata.network]
+zone = "internal"
+egress = "direct"               # direct, proxy, none
+dns = "internal"
+ntp = "ntp.example.internal"
+clock_source = "ntp"           # ntp, ptp, rtc, unknown
+clock_uncertainty_ms = 50
+
+[metadata.operations]
+profile = "standard"           # minimal, standard, deep, incident, forensic
+runbook = "https://runbooks.example.internal/payments"
+
+[metadata.platform]
+group = "eu-payments"

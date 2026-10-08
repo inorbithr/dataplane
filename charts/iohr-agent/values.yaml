@@ -86,6 +86,19 @@ secrets:
       name: ""
       key: token
 
+# Where this agent runs, who owns it, what binds it and what it can be trusted for (RFC
+# 0088): the `[metadata]` sections of agent.toml, as YAML. Every field is optional; an
+# unset field is unknown. The field reference is docs/config.md in the repository; rack,
+# row, dns, ntp, certificate_authority, secrets_backend, audit_destination and the
+# operations section never leave the pod. Example:
+#   metadata:
+#     placement: { provider: cloud, provider_name: aws, region: eu-central-1, country: DE }
+#     organisation: { team: payments-sre, contact_channel: "#payments-oncall" }
+#     environment: { tier: production, criticality: high }
+#     compliance: { regimes: [gdpr, dora], data_classes_allowed: [public, internal] }
+#     security: { trust_domain: example/aws-eu-central-1/payments }
+metadata: {}
+
 # The enrollment key and record live here; without a volume a restart would need a new
 # enrollment token.
 persistence:

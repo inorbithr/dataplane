@@ -1,3 +1,7 @@
+[default]
+# The ISO 3166-1 country codes (crates/iohr-agent/src/metadata.rs) are not words.
+extend-ignore-re = ['(?s)const ISO_3166_1_ALPHA_2.*?\];']
+
 [default.extend-words]
 hr = "hr"
 # setpriv --inh-caps (tools/capture_e2e_guest.py)

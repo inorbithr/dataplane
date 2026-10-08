@@ -1,0 +1,1094 @@
+{
+  "$defs": {
+    "AdminConfig": {
+      "additionalProperties": false,
+      "description": "The read-only admin page.",
+      "properties": {
+        "allow_non_loopback": {
+          "default": false,
+          "description": "Allow a non-loopback address (for a cluster-internal page behind a network policy).",
+          "type": "boolean"
+        },
+        "enabled": {
+          "default": true,
+          "description": "Serve it at all.",
+          "type": "boolean"
+        },
+        "listen": {
+          "default": "127.0.0.1:7790",
+          "description": "Where it listens. Loopback unless `allow_non_loopback` is set.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "Asset": {
+      "additionalProperties": false,
+      "description": "`[metadata.asset]`.",
+      "properties": {
+        "catalogue_refs": {
+          "description": "Service-catalogue references (`backstage:component:checkout`).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "cmdb_id": {
+          "description": "The configuration item in the CMDB.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "commissioned": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IsoDate"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When it was commissioned."
+        },
+        "decommission_planned": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IsoDate"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When it is planned to go away; after `commissioned`."
+        },
+        "hardware_class": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HardwareClass"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Bare metal, virtual machine, container or serverless."
+        },
+        "tags": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Free tags for what has no typed home.",
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "Attestation": {
+      "description": "What the machine can attest about its boot.",
+      "oneOf": [
+        {
+          "const": "none",
+          "description": "Nothing.",
+          "type": "string"
+        },
+        {
+          "const": "tpm",
+          "description": "A TPM.",
+          "type": "string"
+        },
+        {
+          "const": "measured_boot",
+          "description": "Measured boot.",
+          "type": "string"
+        },
+        {
+          "const": "confidential_vm",
+          "description": "A confidential virtual machine.",
+          "type": "string"
+        }
+      ]
+    },
+    "ClockSource": {
+      "description": "Which clock the machine keeps.",
+      "oneOf": [
+        {
+          "const": "ntp",
+          "description": "NTP.",
+          "type": "string"
+        },
+        {
+          "const": "ptp",
+          "description": "PTP.",
+          "type": "string"
+        },
+        {
+          "const": "rtc",
+          "description": "A real-time clock with no sync.",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "description": "Not known.",
+          "type": "string"
+        }
+      ]
+    },
+    "Compliance": {
+      "additionalProperties": false,
+      "description": "`[metadata.compliance]`.",
+      "properties": {
+        "audit_destination": {
+          "description": "Where audit records go, as a reference. Never reported.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "data_classes_allowed": {
+          "description": "The data classes that may be on this machine.",
+          "items": {
+            "$ref": "#/$defs/DataClass"
+          },
+          "type": "array"
+        },
+        "external_models_may_see": {
+          "description": "The classes a third-party model may see; a subset of `may_leave_jurisdiction`,\nnever `restricted`.",
+          "items": {
+            "$ref": "#/$defs/DataClass"
+          },
+          "type": "array"
+        },
+        "may_leave_jurisdiction": {
+          "description": "The classes that may leave the jurisdiction; a subset of `data_classes_allowed`.",
+          "items": {
+            "$ref": "#/$defs/DataClass"
+          },
+          "type": "array"
+        },
+        "regimes": {
+          "description": "The regimes in scope, as the company declares them.",
+          "items": {
+            "$ref": "#/$defs/Regime"
+          },
+          "type": "array"
+        },
+        "retention_policy": {
+          "description": "The retention policy, as a reference.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "CountryCode": {
+      "description": "An ISO 3166-1 alpha-2 country code, upper case.",
+      "pattern": "^[A-Z]{2}$",
+      "type": "string"
+    },
+    "Criticality": {
+      "description": "How much depends on the machine.",
+      "oneOf": [
+        {
+          "const": "critical",
+          "description": "The business stops without it.",
+          "type": "string"
+        },
+        {
+          "const": "high",
+          "description": "High.",
+          "type": "string"
+        },
+        {
+          "const": "medium",
+          "description": "Medium.",
+          "type": "string"
+        },
+        {
+          "const": "low",
+          "description": "Low.",
+          "type": "string"
+        }
+      ]
+    },
+    "DataClass": {
+      "description": "A data class, as RFC 0086 names them.",
+      "oneOf": [
+        {
+          "const": "public",
+          "description": "May be published.",
+          "type": "string"
+        },
+        {
+          "const": "internal",
+          "description": "Internal to the company.",
+          "type": "string"
+        },
+        {
+          "const": "confidential",
+          "description": "Confidential.",
+          "type": "string"
+        },
+        {
+          "const": "restricted",
+          "description": "Secrets, personal or health data: stays where it was read.",
+          "type": "string"
+        }
+      ]
+    },
+    "DateInterval": {
+      "description": "A date interval, YYYY-MM-DD/YYYY-MM-DD, both days inclusive.",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}/\\d{4}-\\d{2}-\\d{2}$",
+      "type": "string"
+    },
+    "Egress": {
+      "description": "How the machine reaches outside.",
+      "oneOf": [
+        {
+          "const": "direct",
+          "description": "Directly.",
+          "type": "string"
+        },
+        {
+          "const": "proxy",
+          "description": "Through a proxy.",
+          "type": "string"
+        },
+        {
+          "const": "none",
+          "description": "Not at all.",
+          "type": "string"
+        }
+      ]
+    },
+    "EnvironmentMeta": {
+      "additionalProperties": false,
+      "description": "`[metadata.environment]`.",
+      "properties": {
+        "change_freeze": {
+          "description": "Date intervals (`2026-12-20/2027-01-05`) during which nothing changes.",
+          "items": {
+            "$ref": "#/$defs/DateInterval"
+          },
+          "type": "array"
+        },
+        "criticality": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Criticality"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How much depends on it."
+        },
+        "maintenance_windows": {
+          "description": "Maintenance windows, in the company's words (`Sun 02:00-04:00 Europe/Berlin`).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "sla_ref": {
+          "description": "The SLA, as a reference.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "slo_refs": {
+          "description": "SLOs, as references.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "tier": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Tier"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Production, staging, development, test or disaster recovery."
+        }
+      },
+      "type": "object"
+    },
+    "HardwareClass": {
+      "description": "What the machine is.",
+      "oneOf": [
+        {
+          "const": "bare_metal",
+          "description": "Bare metal.",
+          "type": "string"
+        },
+        {
+          "const": "virtual_machine",
+          "description": "A virtual machine.",
+          "type": "string"
+        },
+        {
+          "const": "container",
+          "description": "A container.",
+          "type": "string"
+        },
+        {
+          "const": "serverless",
+          "description": "A serverless runtime.",
+          "type": "string"
+        }
+      ]
+    },
+    "IsoDate": {
+      "description": "A calendar date, YYYY-MM-DD.",
+      "format": "date",
+      "type": "string"
+    },
+    "Isolation": {
+      "description": "How isolated the machine is.",
+      "oneOf": [
+        {
+          "const": "shared",
+          "description": "Shared with other tenants or workloads.",
+          "type": "string"
+        },
+        {
+          "const": "dedicated",
+          "description": "Dedicated to this workload.",
+          "type": "string"
+        },
+        {
+          "const": "air_gapped",
+          "description": "No network path to the outside.",
+          "type": "string"
+        }
+      ]
+    },
+    "KeyAlg": {
+      "description": "Which kind of key the agent makes.",
+      "oneOf": [
+        {
+          "const": "es256",
+          "description": "EC P-256, signs ES256. Accepted by Hydra for `private_key_jwt`.",
+          "type": "string"
+        },
+        {
+          "const": "ed25519",
+          "description": "Ed25519, signs `EdDSA`.",
+          "type": "string"
+        }
+      ]
+    },
+    "KubernetesConfig": {
+      "additionalProperties": false,
+      "description": "Kubernetes API access for `k8s:` references.",
+      "properties": {
+        "api": {
+          "description": "API server; defaults to the in-cluster address from `KUBERNETES_SERVICE_HOST`.",
+          "format": "uri",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ca_file": {
+          "default": "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+          "description": "The cluster CA bundle.",
+          "type": "string"
+        },
+        "token_file": {
+          "default": "/var/run/secrets/kubernetes.io/serviceaccount/token",
+          "description": "The service account token file.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "MetadataConfig": {
+      "additionalProperties": false,
+      "description": "The `[metadata]` table.",
+      "properties": {
+        "asset": {
+          "$ref": "#/$defs/Asset",
+          "default": {},
+          "description": "What it is in the inventory."
+        },
+        "compliance": {
+          "$ref": "#/$defs/Compliance",
+          "default": {},
+          "description": "What binds it."
+        },
+        "environment": {
+          "$ref": "#/$defs/EnvironmentMeta",
+          "default": {},
+          "description": "What kind of environment it serves."
+        },
+        "network": {
+          "$ref": "#/$defs/Network",
+          "default": {},
+          "description": "Its network and clock."
+        },
+        "operations": {
+          "$ref": "#/$defs/Operations",
+          "default": {},
+          "description": "How it is operated. Never reported."
+        },
+        "organisation": {
+          "$ref": "#/$defs/Organisation",
+          "default": {},
+          "description": "Who owns it."
+        },
+        "placement": {
+          "$ref": "#/$defs/Placement",
+          "default": {},
+          "description": "Where it runs."
+        },
+        "platform": {
+          "$ref": "#/$defs/PlatformMeta",
+          "default": {},
+          "description": "What it believes about its place on the platform, as information."
+        },
+        "report": {
+          "default": true,
+          "description": "Send the reported subset to the platform in the hello (RFC 0088, \"What leaves\nthe machine\"). Off, nothing of this table leaves the machine.",
+          "type": "boolean"
+        },
+        "security": {
+          "$ref": "#/$defs/Security",
+          "default": {},
+          "description": "What it can be trusted for."
+        }
+      },
+      "type": "object"
+    },
+    "Network": {
+      "additionalProperties": false,
+      "description": "`[metadata.network]`.",
+      "properties": {
+        "clock_source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClockSource"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The clock source (RFC 0086's clock quality)."
+        },
+        "clock_uncertainty_ms": {
+          "description": "The clock's worst-case error, in milliseconds, at most a minute.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "dns": {
+          "description": "The DNS source, as a name. Never reported.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "egress": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Egress"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How it reaches outside."
+        },
+        "ntp": {
+          "description": "The NTP source, as a name. Never reported.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "zone": {
+          "description": "The network zone (`dmz`, `internal`, `management`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "Operations": {
+      "additionalProperties": false,
+      "description": "`[metadata.operations]`. Never reported.",
+      "properties": {
+        "profile": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Profile"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The collector profile."
+        },
+        "runbook": {
+          "description": "The runbook, as a reference or address.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "Organisation": {
+      "additionalProperties": false,
+      "description": "`[metadata.organisation]`. References and roles, never a person's data.",
+      "properties": {
+        "business_unit": {
+          "description": "The business unit.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "contact_channel": {
+          "description": "A channel to reach the owners (`#payments-oncall`), not a person.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cost_centre": {
+          "description": "The cost centre.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "department": {
+          "description": "The department.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "escalation_policy": {
+          "description": "An escalation policy as a reference.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "legal_entity": {
+          "description": "The legal entity that runs the machine.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "on_call_rota": {
+          "description": "An on-call rota as a reference (`pagerduty:P7Q2`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "owner_role": {
+          "description": "The role that owns it (\"service owner\"), not a name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "project": {
+          "description": "The project.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "team": {
+          "description": "The team.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "Placement": {
+      "additionalProperties": false,
+      "description": "`[metadata.placement]`.",
+      "properties": {
+        "country": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CountryCode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "ISO 3166-1 alpha-2, upper case."
+        },
+        "jurisdiction": {
+          "description": "The jurisdiction whose law applies, e.g. `EU`, `US-CA`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "latency_zone": {
+          "description": "The latency zone the company defines.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderKind"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Cloud, on-premises, colocation or edge."
+        },
+        "provider_name": {
+          "description": "The provider's name (a cloud, a colocation company, \"own\").",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rack": {
+          "description": "The rack. Never reported.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "region": {
+          "description": "The region, in the provider's or the company's words.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "residency_zone": {
+          "description": "The data-residency zone the company defines; needs `country`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "row": {
+          "description": "The row. Never reported.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "site_id": {
+          "description": "The site or datacentre id, as the inventory names it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "site_name": {
+          "description": "The site's name for people.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "zone": {
+          "description": "The availability zone, hall or failure zone within the region.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "PlatformMeta": {
+      "additionalProperties": false,
+      "description": "`[metadata.platform]`. Information only: the platform's own labels decide targeting.",
+      "properties": {
+        "group": {
+          "description": "The agent group it believes it belongs to.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "Profile": {
+      "description": "Which collectors run.",
+      "oneOf": [
+        {
+          "const": "minimal",
+          "description": "Minimal.",
+          "type": "string"
+        },
+        {
+          "const": "standard",
+          "description": "Standard.",
+          "type": "string"
+        },
+        {
+          "const": "deep",
+          "description": "Deep.",
+          "type": "string"
+        },
+        {
+          "const": "incident",
+          "description": "Raised for an incident.",
+          "type": "string"
+        },
+        {
+          "const": "forensic",
+          "description": "Forensic, under explicit authority.",
+          "type": "string"
+        }
+      ]
+    },
+    "ProviderKind": {
+      "description": "Who provides the machine.",
+      "oneOf": [
+        {
+          "const": "cloud",
+          "description": "A public cloud.",
+          "type": "string"
+        },
+        {
+          "const": "on_prem",
+          "description": "The company's own premises.",
+          "type": "string"
+        },
+        {
+          "const": "colocation",
+          "description": "A colocation provider's datacentre.",
+          "type": "string"
+        },
+        {
+          "const": "edge",
+          "description": "An edge site.",
+          "type": "string"
+        }
+      ]
+    },
+    "Regime": {
+      "description": "A compliance regime: gdpr, hipaa, dora, soc2, iso27001, pci_dss, nis2, ccpa, or other:<name>.",
+      "pattern": "^(gdpr|hipaa|dora|soc2|iso27001|pci_dss|nis2|ccpa|other:[a-z0-9_-]{1,32})$",
+      "type": "string"
+    },
+    "SecretsConfig": {
+      "additionalProperties": false,
+      "description": "Secret stores. A reference is resolved at the moment of the call and dropped after.",
+      "properties": {
+        "kubernetes": {
+          "$ref": "#/$defs/KubernetesConfig",
+          "default": {
+            "api": null,
+            "ca_file": "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+            "token_file": "/var/run/secrets/kubernetes.io/serviceaccount/token"
+          },
+          "description": "Kubernetes Secrets, read with the pod's service account."
+        },
+        "vault": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VaultConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "HashiCorp Vault (KV version 2)."
+        }
+      },
+      "type": "object"
+    },
+    "Security": {
+      "additionalProperties": false,
+      "description": "`[metadata.security]`.",
+      "properties": {
+        "attestation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Attestation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the machine can attest about its boot."
+        },
+        "certificate_authority": {
+          "description": "The certificate authority it trusts, as a name. Never reported.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "isolation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Isolation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How isolated it is."
+        },
+        "secrets_backend": {
+          "description": "The secrets backend, as a reference (`vault:kv/prod`). Never reported.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "trust_domain": {
+          "description": "The trust domain: machines that fail together share one. Observations from one\ndomain count as one independent source (RFC 0086).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "SessionConfig": {
+      "additionalProperties": false,
+      "description": "Reconnect timing.",
+      "properties": {
+        "backoff_max_ms": {
+          "default": 60000,
+          "description": "Largest reconnect delay ceiling, in milliseconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "backoff_min_ms": {
+          "default": 1000,
+          "description": "First reconnect delay ceiling, in milliseconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "TelemetryConfig": {
+      "additionalProperties": false,
+      "description": "OpenTelemetry export over OTLP/HTTP. Off unless enabled.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Export traces, metrics and logs.",
+          "type": "boolean"
+        },
+        "endpoint": {
+          "default": "http://127.0.0.1:4318",
+          "description": "The collector's OTLP/HTTP base URL; `/v1/traces` etc. are appended.",
+          "type": "string"
+        },
+        "service_name": {
+          "default": "iohr-agent",
+          "description": "`service.name` on everything exported.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "Tier": {
+      "description": "What kind of environment the machine serves.",
+      "oneOf": [
+        {
+          "const": "production",
+          "description": "Production.",
+          "type": "string"
+        },
+        {
+          "const": "staging",
+          "description": "Staging.",
+          "type": "string"
+        },
+        {
+          "const": "development",
+          "description": "Development.",
+          "type": "string"
+        },
+        {
+          "const": "test",
+          "description": "Test.",
+          "type": "string"
+        },
+        {
+          "const": "disaster_recovery",
+          "description": "Disaster recovery.",
+          "type": "string"
+        }
+      ]
+    },
+    "TlsConfig": {
+      "additionalProperties": false,
+      "description": "TLS trust beyond the system's roots.",
+      "properties": {
+        "ca_file": {
+          "description": "A PEM bundle of extra CA certificates (a company CA).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "VaultConfig": {
+      "additionalProperties": false,
+      "description": "HashiCorp Vault.",
+      "properties": {
+        "addr": {
+          "description": "The address of Vault, e.g. `https://vault.internal:8200`.",
+          "format": "uri",
+          "type": "string"
+        },
+        "namespace": {
+          "description": "Vault Enterprise namespace.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "token": {
+          "default": "env:VAULT_TOKEN",
+          "description": "Where the Vault token comes from: `env:NAME` or `file:/path`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "addr"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The parsed `agent.toml`. Relative paths are resolved against the file's directory.",
+  "properties": {
+    "admin": {
+      "$ref": "#/$defs/AdminConfig",
+      "default": {
+        "allow_non_loopback": false,
+        "enabled": true,
+        "listen": "127.0.0.1:7790"
+      },
+      "description": "The local admin page."
+    },
+    "api": {
+      "description": "The platform API base URL.",
+      "format": "uri",
+      "type": "string"
+    },
+    "checks": {
+      "default": "checks.toml",
+      "description": "The declared checks (RFC 0040.1); a missing file declares nothing.",
+      "type": "string"
+    },
+    "environment": {
+      "description": "The environment this agent serves; must equal the policy's.",
+      "type": "string"
+    },
+    "key": {
+      "default": "agent.key",
+      "description": "The private key file (mode 0600).",
+      "type": "string"
+    },
+    "key_alg": {
+      "$ref": "#/$defs/KeyAlg",
+      "default": "es256",
+      "description": "Which key to make at enrollment."
+    },
+    "metadata": {
+      "$ref": "#/$defs/MetadataConfig",
+      "description": "Where this agent runs, who owns it, what binds it and what it can be trusted for\n(RFC 0088; `docs/config.md`). `IOHR_AGENT_META_<SECTION>_<FIELD>` overrides a field."
+    },
+    "name": {
+      "description": "A name for this agent shown in the console.",
+      "type": "string"
+    },
+    "policy": {
+      "default": "policy.toml",
+      "description": "The policy file.",
+      "type": "string"
+    },
+    "secrets": {
+      "$ref": "#/$defs/SecretsConfig",
+      "default": {
+        "kubernetes": {
+          "api": null,
+          "ca_file": "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+          "token_file": "/var/run/secrets/kubernetes.io/serviceaccount/token"
+        },
+        "vault": null
+      },
+      "description": "Secret stores the agent may read references from."
+    },
+    "session": {
+      "$ref": "#/$defs/SessionConfig",
+      "default": {
+        "backoff_max_ms": 60000,
+        "backoff_min_ms": 1000
+      },
+      "description": "Session tuning."
+    },
+    "state_dir": {
+      "default": "state",
+      "description": "Where the enrollment record lives.",
+      "type": "string"
+    },
+    "telemetry": {
+      "$ref": "#/$defs/TelemetryConfig",
+      "default": {
+        "enabled": false,
+        "endpoint": "http://127.0.0.1:4318",
+        "service_name": "iohr-agent"
+      },
+      "description": "OpenTelemetry export."
+    },
+    "tls": {
+      "$ref": "#/$defs/TlsConfig",
+      "default": {
+        "ca_file": null
+      },
+      "description": "TLS trust."
+    }
+  },
+  "required": [
+    "api",
+    "name",
+    "environment"
+  ],
+  "title": "agent.toml",
+  "type": "object"
+}
