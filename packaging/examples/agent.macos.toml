@@ -1,6 +1,7 @@
 # iohr-agent: a complete example for a Mac (RFC 0088). Relative paths resolve against this
-# file's directory, so it works wherever it lives (`~/.config/iohr-agent/agent.toml` by
-# default, or the directory `iohr-agent init --dir` wrote). Every [metadata.*] field is
+# file's directory, so it works wherever it lives. As a LaunchAgent
+# (packaging/macos/install.sh) it is `~/Library/Application Support/InOrbit/agent.toml`,
+# the directory `iohr agent init --dir` wrote; run by hand, `~/.config/iohr-agent/agent.toml`. Every [metadata.*] field is
 # optional: delete what you do not know rather than guess. Check with
 # `iohr-agent config validate`.
 api = "https://api.inorbit.hr"

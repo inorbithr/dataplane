@@ -1009,21 +1009,27 @@ fn host_name() -> String {
         .filter(|s| !s.is_empty())
         .or_else(|| std::env::var("HOSTNAME").ok())
         .or_else(|| std::env::var("COMPUTERNAME").ok())
-        // macOS has no /etc/hostname and launchd sets no HOSTNAME; ask the system.
-        .or_else(|| {
-            std::process::Command::new("hostname")
-                .arg("-s")
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| s.trim().to_owned())
-                .filter(|s| !s.is_empty())
-        })
+        // macOS has no /etc/hostname and launchd sets no HOSTNAME; ask the kernel.
+        .or_else(kernel_host_name)
         .unwrap_or_else(|| "agent".into())
         .chars()
         .take(64)
         .collect()
+}
+
+/// The kernel's node name, short form (`mac-17` for `mac-17.local`), the same as
+/// `hostname -s` without running a program.
+#[cfg(unix)]
+fn kernel_host_name() -> Option<String> {
+    let uts = rustix::system::uname();
+    let name = uts.nodename().to_str().ok()?;
+    let short = name.split('.').next().unwrap_or(name).trim();
+    (!short.is_empty()).then(|| short.to_owned())
+}
+
+#[cfg(not(unix))]
+fn kernel_host_name() -> Option<String> {
+    None
 }
 
 fn toml_list(items: &[String]) -> String {
@@ -1327,6 +1333,13 @@ fn header_comment(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn the_kernel_names_the_host_in_short_form() {
+        let name = kernel_host_name().unwrap();
+        assert!(!name.is_empty() && !name.contains('.'), "{name}");
+    }
 
     #[test]
     fn generated_policy_is_valid_and_readable() {

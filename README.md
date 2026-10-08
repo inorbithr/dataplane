@@ -76,7 +76,8 @@ sh packaging/macos/install.sh --remove # stop and remove it (keeps config and st
 
 launchd keeps the agent running only while it is enrolled, so an agent that has not
 enrolled yet runs once and stops; when the platform revokes it, it stops for good
-([plist](packaging/macos/hr.inorbit.agent.plist)).
+([plist](packaging/macos/hr.inorbit.agent.plist)). A complete `agent.toml` for a Mac,
+with metadata, is [packaging/examples/agent.macos.toml](packaging/examples/agent.macos.toml).
 
 ### Kubernetes (Helm)
 

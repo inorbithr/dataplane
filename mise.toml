@@ -92,7 +92,7 @@ shell = "bash -e -o pipefail -c"
 description = "Spelling, shell scripts, workflow lint and workflow security audit"
 run = [
   "typos",
-  "shellcheck tools/*.sh packaging/deb/* packaging/deb-capture/*",
+  "shellcheck tools/*.sh packaging/deb/* packaging/deb-capture/* packaging/macos/*.sh",
   "actionlint",
   "zizmor --min-severity low .github/workflows",
 ]

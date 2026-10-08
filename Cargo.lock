@@ -1183,6 +1183,7 @@ dependencies = [
  "opentelemetry_sdk",
  "p256",
  "reqwest",
+ "rustix",
  "rustls",
  "rustls-native-certs",
  "schemars",

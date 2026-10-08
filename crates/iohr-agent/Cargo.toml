@@ -52,6 +52,10 @@ url.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 
+# The host name on macOS, without running `hostname`.
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
 [dev-dependencies]
 axum.workspace = true
 tempfile.workspace = true
