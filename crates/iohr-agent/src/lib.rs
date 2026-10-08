@@ -7,6 +7,7 @@
 
 pub mod admin;
 pub mod agent;
+pub mod atlas;
 pub mod capture;
 pub mod checks;
 pub mod checks_file;

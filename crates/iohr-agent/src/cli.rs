@@ -1,6 +1,6 @@
 //! The command line: `init`, `enroll`, `run`, `status`, `policy check`, `checks lint`,
-//! `config validate|show|schema`, `capture status`. As an iohr extension the same commands
-//! are `iohr agent …`.
+//! `config validate|show|schema`, `capture status`, `atlas observe`. As an iohr
+//! extension the same commands are `iohr agent …`.
 
 use std::io::{BufRead as _, IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -65,6 +65,9 @@ pub enum Command {
     /// agent.toml tools: validate it, show the effective configuration, print its schema.
     #[command(subcommand)]
     Config(ConfigCommand),
+    /// Atlas observers: evidence about a checkout and a cluster, never claims.
+    #[command(subcommand)]
+    Atlas(AtlasCommand),
 }
 
 /// `config …`.
@@ -79,6 +82,38 @@ pub enum ConfigCommand {
     /// Print the JSON Schema of agent.toml (the repository keeps it at
     /// docs/schema/agent.schema.json).
     Schema,
+}
+
+/// `atlas …`.
+#[derive(Debug, Subcommand)]
+pub enum AtlasCommand {
+    /// Read a checkout and/or a cluster and write the evidence as JSON lines. Read-only;
+    /// the cluster's API server must pass the policy. Nothing is sent anywhere.
+    Observe(AtlasObserveArgs),
+}
+
+/// `atlas observe`.
+#[derive(Debug, Args)]
+pub struct AtlasObserveArgs {
+    /// A checkout to read (Cargo manifests, Kubernetes manifests, Envoy routes).
+    #[arg(long)]
+    pub repo: Option<PathBuf>,
+    /// The kubeconfig to read a cluster through (default: `$KUBECONFIG`, then
+    /// `~/.kube/config`, when `--kube-context` is given).
+    #[arg(long)]
+    pub kubeconfig: Option<PathBuf>,
+    /// The kubeconfig context (default: its current context).
+    #[arg(long)]
+    pub kube_context: Option<String>,
+    /// A namespace to read; repeat for more (default: the context's, else `default`).
+    #[arg(long = "namespace", short = 'n')]
+    pub namespaces: Vec<String>,
+    /// The policy that must admit the API server (default: the one agent.toml names).
+    #[arg(long)]
+    pub policy: Option<PathBuf>,
+    /// Where to write the records (default: standard output).
+    #[arg(long)]
+    pub out: Option<PathBuf>,
 }
 
 /// `capture …`.
@@ -333,8 +368,59 @@ async fn dispatch(cmd: Command, config_path: &Path) -> Result<ExitCode> {
         Command::Config(ConfigCommand::Validate) => config_validate(config_path),
         Command::Config(ConfigCommand::Show) => config_show(config_path),
         Command::Config(ConfigCommand::Schema) => config_schema(),
+        Command::Atlas(AtlasCommand::Observe(a)) => atlas_observe(&a, config_path).await,
         Command::Run(_) => Ok(ExitCode::SUCCESS),
     }
+}
+
+async fn atlas_observe(args: &AtlasObserveArgs, config_path: &Path) -> Result<ExitCode> {
+    let kubeconfig = args.kubeconfig.clone().or_else(|| {
+        args.kube_context.as_ref()?;
+        std::env::var_os("KUBECONFIG")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".kube/config")))
+    });
+    let policy = if kubeconfig.is_some() {
+        let path = match &args.policy {
+            Some(p) => p.clone(),
+            None => AgentConfig::load(config_path)?.policy,
+        };
+        Some(Policy::load(&path)?)
+    } else {
+        None
+    };
+    let req = crate::atlas::ObserveRequest {
+        repo: args.repo.clone(),
+        kubeconfig,
+        kube_context: args.kube_context.clone(),
+        namespaces: args.namespaces.clone(),
+    };
+    let (sink, summary) = crate::atlas::observe(&req, policy.as_ref()).await?;
+    match &args.out {
+        Some(path) => {
+            let file = std::fs::File::create(path).map_err(|e| Error::io(path, e))?;
+            let mut w = std::io::BufWriter::new(file);
+            sink.write_to(&mut w)?;
+            w.flush().map_err(|e| Error::io(path, e))?;
+        }
+        None => sink.write_to(std::io::stdout().lock())?,
+    }
+    let mut err = std::io::stderr().lock();
+    let _ = writeln!(
+        err,
+        "atlas observe: {} records, {} entities",
+        summary.records, summary.entities
+    );
+    for (m, n) in &summary.per_method {
+        let _ = writeln!(err, "  {m:<20} {n}");
+    }
+    if let Some((all, known)) = summary.components {
+        let _ = writeln!(
+            err,
+            "  manifest: {all} deployments, {known} known at a revision"
+        );
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn out(line: &str) {

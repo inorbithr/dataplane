@@ -1168,12 +1168,14 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "bytes",
+ "chrono",
  "clap",
  "ed25519-dalek",
  "futures-util",
  "getrandom 0.4.3",
  "h2",
  "http",
+ "iohr-evidence",
  "ipnet",
  "opentelemetry",
  "opentelemetry-appender-tracing",
@@ -1186,6 +1188,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "sha2",
  "tempfile",
  "thiserror",
@@ -1198,6 +1201,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "url",
+ "uuid",
  "zeroize",
 ]
 
@@ -2168,6 +2172,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_yaml_ng"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b4db627b98b36d4203a7b458cf3573730f2bb591b28871d916dfa9efabfd41f"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
+]
+
+[[package]]
 name = "serdect"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2754,6 +2771,12 @@ name = "unicode-ident"
 version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
+
+[[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"
