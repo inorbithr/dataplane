@@ -295,8 +295,15 @@
       "additionalProperties": false,
       "description": "One documentation source.",
       "properties": {
+        "account": {
+          "description": "The account the token belongs to, where the provider needs one (Confluence: the\nAtlassian account's email). Not secret.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "base_url": {
-          "description": "The API's base URL, when it is not the provider's public one (a test server, an\negress gateway). `https`, or `http` to a loopback address.",
+          "description": "The API's base URL. Notion: leave it out (`https://api.notion.com`). Confluence:\n`https://<site>.atlassian.net`, or `https://api.atlassian.com/ex/confluence/<cloud\nid>` for a scoped token. `https`, or `http` to a loopback address.",
           "format": "uri",
           "type": [
             "string",
@@ -333,6 +340,13 @@
             "integer",
             "null"
           ]
+        },
+        "spaces": {
+          "description": "Only these spaces (Confluence space keys); empty means every space the credential\ncan read.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         },
         "token": {
           "description": "The credential as a secret reference, never the value: `env:NOTION_TOKEN`,\n`file:/run/secrets/notion`, `k8s:<namespace>/<name>#<key>`,\n`vault:<mount>/<path>#<key>`.",
@@ -908,6 +922,11 @@
         {
           "const": "notion",
           "description": "Notion, through an internal integration's token.",
+          "type": "string"
+        },
+        {
+          "const": "confluence",
+          "description": "Confluence Cloud (REST API v2), through an Atlassian account's API token.",
           "type": "string"
         }
       ]

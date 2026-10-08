@@ -43,10 +43,19 @@ pub struct DocsSourceConfig {
     /// `vault:<mount>/<path>#<key>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
-    /// The API's base URL, when it is not the provider's public one (a test server, an
-    /// egress gateway). `https`, or `http` to a loopback address.
+    /// The API's base URL. Notion: leave it out (`https://api.notion.com`). Confluence:
+    /// `https://<site>.atlassian.net`, or `https://api.atlassian.com/ex/confluence/<cloud
+    /// id>` for a scoped token. `https`, or `http` to a loopback address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<Url>,
+    /// The account the token belongs to, where the provider needs one (Confluence: the
+    /// Atlassian account's email). Not secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// Only these spaces (Confluence space keys); empty means every space the credential
+    /// can read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spaces: Vec<String>,
     /// Read comments too, where the provider and the credential allow it.
     #[serde(default = "yes")]
     pub comments: bool,
@@ -111,6 +120,37 @@ impl DocsConfig {
             {
                 out.push(format!("{at}.base_url: {e}"));
             }
+            match s.provider {
+                Provider::Notion => {
+                    if !s.spaces.is_empty() {
+                        out.push(format!(
+                            "{at}.spaces: Notion has no spaces filter; share only the pages Atlas may read with the integration"
+                        ));
+                    }
+                }
+                Provider::Confluence => {
+                    if s.base_url.is_none() {
+                        out.push(format!(
+                            "{at}.base_url: confluence needs the site (https://<site>.atlassian.net) or the API gateway URL"
+                        ));
+                    }
+                    if s.account.as_deref().is_none_or(|a| a.trim().is_empty()) {
+                        out.push(format!(
+                            "{at}.account: confluence needs the Atlassian account's email the token belongs to"
+                        ));
+                    }
+                    for k in &s.spaces {
+                        if k.is_empty()
+                            || k.len() > 255
+                            || !k
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b == b'~' || b == b'_')
+                        {
+                            out.push(format!("{at}.spaces: {k:?} is not a space key"));
+                        }
+                    }
+                }
+            }
             if s.requests_per_minute == Some(0) {
                 out.push(format!("{at}.requests_per_minute: must be at least 1"));
             }
@@ -166,6 +206,8 @@ mod tests {
             provider: Provider::Notion,
             token: token.map(Into::into),
             base_url: None,
+            account: None,
+            spaces: Vec::new(),
             comments: true,
             requests_per_minute: None,
             max_items: None,
@@ -212,6 +254,28 @@ mod tests {
         assert!(p[0].contains("used twice"));
         assert!(p[1].contains("lower-case"));
         assert!(p[2].contains("needs a credential"));
+    }
+
+    #[test]
+    fn confluence_needs_a_site_and_an_account() {
+        let mut s = source("wiki", Some("env:CONFLUENCE_TOKEN"));
+        s.provider = Provider::Confluence;
+        s.spaces = vec!["ENG".into(), "bad key".into()];
+        let p = DocsConfig {
+            content_dir: None,
+            sources: vec![s.clone()],
+        }
+        .problems();
+        assert_eq!(p.len(), 3, "{p:?}");
+        s.base_url = Some("https://acme.atlassian.net".parse().unwrap());
+        s.account = Some("atlas-reader@acme.example".into());
+        s.spaces = vec!["ENG".into(), "~5b10a2844c".into()];
+        let p = DocsConfig {
+            content_dir: None,
+            sources: vec![s],
+        }
+        .problems();
+        assert!(p.is_empty(), "{p:?}");
     }
 
     #[test]

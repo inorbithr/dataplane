@@ -18,10 +18,11 @@ to a local file (or standard output), and a summary of counts goes to standard e
 | Provider | State | Reads |
 |---|---|---|
 | Notion | in development (merged, in no release yet) | pages, database rows (properties as fields), data source schemas, page comments; attachments by reference |
+| Confluence Cloud | in development (merged, in no release yet) | pages and blog posts (ADF to markdown), labels, footer comments, spaces; attachments by reference |
 
-Other providers (Confluence, Google Docs, GitBook, static docs sites, SharePoint, Slab,
-Coda) use the same framework. Each one is added in its own pull request and listed here
-once it is merged.
+Other providers (Google Docs, GitBook, static docs sites, SharePoint, Slab, Coda) use the
+same framework. Each one is added in its own pull request and listed here once it is
+merged.
 
 ## What a run produces
 
@@ -157,3 +158,45 @@ it was cut.
 
 The tests run against wiremock with fixtures shaped like the documented answers
 (`tests/fixtures/notion/`). CI never calls the real API.
+
+## Confluence Cloud
+
+**Auth: an Atlassian account's API token over HTTP Basic.** Create a dedicated account
+(for example `atlas-reader@`) that can see only the spaces Atlas may read. Give it a
+**scoped** API token (id.atlassian.com, Security, API tokens, Create API token with scopes)
+with only these scopes: `read:page:confluence`, `read:blogpost:confluence`,
+`read:space:confluence`, `read:label:confluence`, `read:attachment:confluence`,
+`read:comment:confluence`, `read:confluence-user`. A scoped token works only through the
+API gateway, so `base_url = "https://api.atlassian.com/ex/confluence/<cloud id>"` (the cloud
+id is at `https://<site>.atlassian.net/_edge/tenant_info`). A classic token works against
+`https://<site>.atlassian.net`. An OAuth 2.0 (3LO) app is not used, for the same reason as
+Notion's public integration: the token would pass through InOrbit's cloud.
+
+```toml
+[[docs.sources]]
+id = "acme-wiki"
+provider = "confluence"
+base_url = "https://api.atlassian.com/ex/confluence/1324a887-45db-1bf4-1e99-ef0ff456d421"
+account = "atlas-reader@acme.example"   # the token's account; not secret
+token = "vault:kv/iohr/confluence#token"
+spaces = ["ENG", "OPS"]                  # space keys; empty reads every visible space
+```
+
+The policy allows `api.atlassian.com` (or `<site>.atlassian.net`) and the reference.
+
+| Confluence | Becomes |
+|---|---|
+| page | `page`: `doc.parent` when its parent is a page, `doc.in_space`, version as `@v<n>` in the artefact's location, labels as `doc.field.labels` |
+| blog post | `page`, id `blogpost:<id>` |
+| space | a space, named `Name (KEY)` |
+| body (ADF) | markdown: headings, paragraphs, lists, task and decision lists, code, panels and quotes, expands, tables, cards as links; links to other pages of the site become `doc.mentions`; a mention keeps the account id (`@user:<id>`), never the display name; media are listed as attachments; macros without a body are skipped |
+| attachments | name, media type, size and the page's attachment link; the file is not downloaded |
+| footer comments | a separate artefact (`#comments`); a 403 turns them off for the rest of the run |
+
+Listing uses `sort=-modified-date` over `/wiki/api/v2/pages` and `/wiki/api/v2/blogposts`
+(filtered by `space-id` when `spaces` is set), so an incremental run stops at the first
+item older than its window. Atlassian's limits are cost-based and not published per
+tenant. The agent paces to 300 requests a minute by default and honours 429 with
+`Retry-After`. Inline comments and page properties macros are not read yet.
+
+Tests: `tests/docs_confluence.rs` with fixtures in `tests/fixtures/confluence/`.

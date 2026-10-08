@@ -1,0 +1,31 @@
+{
+  "results": [
+    {
+      "id": "103",
+      "status": "current",
+      "title": "Old notes",
+      "spaceId": "98304",
+      "parentId": "102",
+      "parentType": "page",
+      "position": 1,
+      "authorId": "u-author",
+      "ownerId": "u-owner",
+      "createdAt": "2025-06-01T08:00:00.000Z",
+      "version": {
+        "createdAt": "2026-10-01T12:00:00.000Z",
+        "message": "",
+        "number": 2,
+        "minorEdit": false,
+        "authorId": "u-editor"
+      },
+      "_links": {
+        "webui": "/spaces/ENG/pages/103/Old+notes",
+        "editui": "/pages/resumedraft.action?draftId=103",
+        "tinyui": "/x/abc"
+      }
+    }
+  ],
+  "_links": {
+    "base": "__SITE__/wiki"
+  }
+}

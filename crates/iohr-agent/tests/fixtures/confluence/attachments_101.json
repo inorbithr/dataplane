@@ -1,0 +1,19 @@
+{
+  "results": [
+    {
+      "id": "att9",
+      "status": "current",
+      "title": "rollout.png",
+      "mediaType": "image/png",
+      "fileSize": 2048,
+      "pageId": "101",
+      "webuiLink": "/pages/viewpageattachments.action?pageId=101&preview=rollout.png",
+      "downloadLink": "/download/attachments/101/rollout.png",
+      "version": {
+        "number": 1,
+        "createdAt": "2026-10-08T08:00:00.000Z"
+      }
+    }
+  ],
+  "_links": {}
+}

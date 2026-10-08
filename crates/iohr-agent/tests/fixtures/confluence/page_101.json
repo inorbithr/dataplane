@@ -1,0 +1,31 @@
+{
+  "id": "101",
+  "status": "current",
+  "title": "Deploy runbook",
+  "spaceId": "98304",
+  "parentId": "102",
+  "parentType": "page",
+  "position": 1,
+  "authorId": "u-author",
+  "ownerId": "u-owner",
+  "createdAt": "2025-06-01T08:00:00.000Z",
+  "version": {
+    "createdAt": "2026-10-08T09:00:00.000Z",
+    "message": "",
+    "number": 3,
+    "minorEdit": false,
+    "authorId": "u-editor"
+  },
+  "_links": {
+    "webui": "/spaces/ENG/pages/101/Deploy+runbook",
+    "editui": "/pages/resumedraft.action?draftId=101",
+    "tinyui": "/x/abc",
+    "base": "__SITE__/wiki"
+  },
+  "body": {
+    "atlas_doc_format": {
+      "representation": "atlas_doc_format",
+      "value": "{\"type\": \"doc\", \"version\": 1, \"content\": [{\"type\": \"heading\", \"attrs\": {\"level\": 1}, \"content\": [{\"type\": \"text\", \"text\": \"Before you deploy\"}]}, {\"type\": \"paragraph\", \"content\": [{\"type\": \"text\", \"text\": \"Check \"}, {\"type\": \"text\", \"text\": \"the home page\", \"marks\": [{\"type\": \"link\", \"attrs\": {\"href\": \"__SITE__/wiki/spaces/ENG/pages/102/Engineering+home\"}}]}, {\"type\": \"text\", \"text\": \" and \"}, {\"type\": \"text\", \"text\": \"CI\", \"marks\": [{\"type\": \"link\", \"attrs\": {\"href\": \"https://ci.acme.example/labs\"}}]}, {\"type\": \"text\", \"text\": \". Ask \"}, {\"type\": \"mention\", \"attrs\": {\"id\": \"u-oncall\", \"text\": \"@Dana Oncall\"}}, {\"type\": \"text\", \"text\": \".\"}]}, {\"type\": \"codeBlock\", \"attrs\": {\"language\": \"sh\"}, \"content\": [{\"type\": \"text\", \"text\": \"make deploy ENV=prod\"}]}, {\"type\": \"panel\", \"attrs\": {\"panelType\": \"warning\"}, \"content\": [{\"type\": \"paragraph\", \"content\": [{\"type\": \"text\", \"text\": \"Never on Fridays.\"}]}]}]}"
+    }
+  }
+}

@@ -3,9 +3,9 @@
 # under [secrets] allow and each provider host under [networks] allow, for example:
 #
 #   [networks]
-#   allow = ["api.notion.com"]
+#   allow = ["api.notion.com", "api.atlassian.com"]
 #   [secrets]
-#   allow = ["vault:kv/iohr/notion#token"]
+#   allow = ["vault:kv/iohr/notion#token", "vault:kv/iohr/confluence#token"]
 #
 # Run `iohr-agent config validate`, then `iohr-agent atlas docs sync --out docs.jsonl`
 # (incremental) and `--full` once a day (finds deletions). Nothing is sent anywhere.
@@ -33,3 +33,13 @@ token = "vault:kv/iohr/notion#token"
 comments = true
 # requests_per_minute = 180   # Notion's average of three a second
 # max_items = 5000            # per run; the next run continues
+
+# Confluence Cloud: a dedicated account that sees only these spaces, with a scoped API
+# token holding the read scopes listed in docs/docs-connectors.md.
+[[docs.sources]]
+id = "acme-wiki"
+provider = "confluence"
+base_url = "https://api.atlassian.com/ex/confluence/1324a887-45db-1bf4-1e99-ef0ff456d421"
+account = "atlas-reader@acme.example"
+token = "vault:kv/iohr/confluence#token"
+spaces = ["ENG", "OPS"]

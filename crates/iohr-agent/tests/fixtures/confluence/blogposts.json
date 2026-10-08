@@ -1,0 +1,31 @@
+{
+  "results": [
+    {
+      "id": "201",
+      "status": "current",
+      "title": "October freeze",
+      "spaceId": "98304",
+      "parentId": null,
+      "parentType": null,
+      "position": 1,
+      "authorId": "u-author",
+      "ownerId": "u-owner",
+      "createdAt": "2025-06-01T08:00:00.000Z",
+      "version": {
+        "createdAt": "2026-10-02T10:00:00.000Z",
+        "message": "",
+        "number": 1,
+        "minorEdit": false,
+        "authorId": "u-editor"
+      },
+      "_links": {
+        "webui": "/spaces/ENG/blog/2026/10/02/201/October+freeze",
+        "editui": "/pages/resumedraft.action?draftId=201",
+        "tinyui": "/x/abc"
+      }
+    }
+  ],
+  "_links": {
+    "base": "__SITE__/wiki"
+  }
+}
