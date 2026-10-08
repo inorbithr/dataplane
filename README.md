@@ -1,4 +1,9 @@
-<p align="center"><img alt="dataplane: iohr agent run in a terminal with http, tls and grpc checks passing and one target refused by policy, over request timings and zero bodies sent" src=".github/assets/social-preview.png" width="100%"></p>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/hero-dark.png">
+    <img alt="dataplane: The agent in your network: checks from inside, connects outbound only. (preview)" src=".github/assets/hero-light.png" width="100%">
+  </picture>
+</p>
 
 <p align="center">InOrbit data plane for reliability testing, observability, and experiment execution.</p>
 
