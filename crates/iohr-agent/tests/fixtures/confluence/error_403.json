@@ -1,0 +1,4 @@
+{
+  "statusCode": 403,
+  "message": "Current user not permitted to use Confluence"
+}

@@ -153,6 +153,8 @@ fn setup(server: &MockServer, secrets_allow: &str) -> Setup {
             provider: Provider::Notion,
             token: Some(format!("file:{}", token_file.display())),
             base_url: Some(server.uri().parse().unwrap()),
+            account: None,
+            spaces: Vec::new(),
             comments: true,
             requests_per_minute: Some(60_000),
             max_items: None,

@@ -1,0 +1,20 @@
+{
+  "results": [
+    {
+      "id": "98304",
+      "key": "ENG",
+      "name": "Engineering",
+      "type": "global",
+      "status": "current",
+      "authorId": "5b10ac8d82e05b22cc7d4ef5",
+      "createdAt": "2025-01-10T09:00:00.000Z",
+      "homepageId": "102",
+      "_links": {
+        "webui": "/spaces/ENG"
+      }
+    }
+  ],
+  "_links": {
+    "base": "__SITE__/wiki"
+  }
+}

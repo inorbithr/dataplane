@@ -1,0 +1,31 @@
+{
+  "id": "102",
+  "status": "current",
+  "title": "Engineering home",
+  "spaceId": "98304",
+  "parentId": null,
+  "parentType": null,
+  "position": 1,
+  "authorId": "u-author",
+  "ownerId": "u-owner",
+  "createdAt": "2025-06-01T08:00:00.000Z",
+  "version": {
+    "createdAt": "2026-10-07T12:00:00.000Z",
+    "message": "",
+    "number": 1,
+    "minorEdit": false,
+    "authorId": "u-editor"
+  },
+  "_links": {
+    "webui": "/spaces/ENG/pages/102/Engineering+home",
+    "editui": "/pages/resumedraft.action?draftId=102",
+    "tinyui": "/x/abc",
+    "base": "__SITE__/wiki"
+  },
+  "body": {
+    "atlas_doc_format": {
+      "representation": "atlas_doc_format",
+      "value": "{\"type\": \"doc\", \"version\": 1, \"content\": [{\"type\": \"paragraph\", \"content\": [{\"type\": \"text\", \"text\": \"Welcome.\"}]}]}"
+    }
+  }
+}

@@ -16,7 +16,9 @@
 //! structured fields; the documents themselves stay in the content store on this machine,
 //! and a revoked credential or an unshared page deletes the local copy.
 
+pub mod adf;
 pub mod config;
+pub mod confluence;
 pub mod http;
 pub mod markdown;
 pub mod mock;
@@ -258,12 +260,15 @@ pub trait DocsSource: Send + Sync {
 pub enum Provider {
     /// Notion, through an internal integration's token.
     Notion,
+    /// Confluence Cloud (REST API v2), through an Atlassian account's API token.
+    Confluence,
 }
 
 impl fmt::Display for Provider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Notion => "notion",
+            Self::Confluence => "confluence",
         })
     }
 }

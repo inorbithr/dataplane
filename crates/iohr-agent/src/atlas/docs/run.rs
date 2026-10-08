@@ -7,6 +7,7 @@ use iohr_evidence::time::Timestamp;
 
 use super::Provider;
 use super::config::{DEFAULT_MAX_ITEMS, DocsSourceConfig};
+use super::confluence::{self, Confluence};
 use super::http::Limits;
 use super::notion::{self, Notion};
 use super::sync::{SyncOptions, SyncSummary, sync_source};
@@ -144,6 +145,34 @@ async fn run_one(
             let src = Notion::connect(s.base_url.clone(), &token, policy, tls, limits, s.comments)
                 .await
                 .map_err(|e| Error::Atlas(format!("docs source {}: {e}", s.id)))?;
+            drop(token);
+            let summary = sync_source(&src, &opts, sink, clock).await?;
+            let st = src.client().stats();
+            Ok((summary, (st.requests(), st.retries(), st.rate_limited())))
+        }
+        Provider::Confluence => {
+            let limits =
+                Limits::for_rate(s.requests_per_minute.unwrap_or(confluence::RATE_PER_MINUTE));
+            let base = s
+                .base_url
+                .clone()
+                .ok_or_else(|| Error::Config(format!("docs source {}: no base_url", s.id)))?;
+            let account = s
+                .account
+                .as_deref()
+                .ok_or_else(|| Error::Config(format!("docs source {}: no account", s.id)))?;
+            let src = Confluence::connect(
+                base,
+                account,
+                &token,
+                policy,
+                tls,
+                limits,
+                s.spaces.clone(),
+                s.comments,
+            )
+            .await
+            .map_err(|e| Error::Atlas(format!("docs source {}: {e}", s.id)))?;
             drop(token);
             let summary = sync_source(&src, &opts, sink, clock).await?;
             let st = src.client().stats();
