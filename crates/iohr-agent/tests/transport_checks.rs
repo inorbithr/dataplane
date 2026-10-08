@@ -663,7 +663,7 @@ fn transport_checks_report_verdicts_and_nothing_the_target_said() {
             assert_eq!(r["detail"]["error_class"].as_str(), *class, "{id}: {r}");
         }
         let snap = agent.state.snapshot();
-        let html = iohr_agent::admin::render_all(&agent.admin_context(None));
+        let html = iohr_agent::admin::render_all(&agent.admin_context(None, None));
         let status = serde_json::to_string(&snap).unwrap();
         stop.send(true).unwrap();
         task.await.unwrap().unwrap();

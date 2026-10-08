@@ -6,7 +6,6 @@
 use std::io::{BufRead as _, IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Args, CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
@@ -14,13 +13,12 @@ use tokio::sync::watch;
 use url::Url;
 use zeroize::Zeroizing;
 
-use crate::agent::Agent;
 use crate::checks_file::{self, DeclaredChecks, Kind, RefuseBy, Verdict};
 use crate::config::{self, AgentConfig, VaultConfig};
 use crate::enroll::{self, EnrollParams, Enrollment};
 use crate::error::{Error, Result};
 use crate::extsock;
-use crate::keys::{self, AgentKey, KeyAlg};
+use crate::keys::{self, KeyAlg};
 use crate::metadata;
 use crate::platform;
 use crate::policy::{Policy, TargetError};
@@ -71,9 +69,25 @@ pub enum Command {
     Atlas(AtlasCommand),
     /// The local agent page: print its address, or open it signed in (`--open`).
     Page(PageArgs),
+    /// What InOrbit sees about your checks and this machine (`[share]` in the policy):
+    /// `full`, `hash` (the default) or `label`; without one, what it is now.
+    Share(ShareArgs),
     /// The egress ledger: what this agent sent to the platform, recorded here first.
     #[command(subcommand)]
     Ledger(LedgerCommand),
+}
+
+/// `share`.
+#[derive(Debug, Args)]
+pub struct ShareArgs {
+    /// `full`: each check's URL or host and port; `hash`: a label and a keyed hash, the
+    /// target stays here; `label`: the label only.
+    #[arg(value_parser = ["full", "hash", "label"])]
+    pub targets: Option<String>,
+    /// Send this machine's host name in the hello (`on`), or not (`off`). Unchanged when
+    /// not given.
+    #[arg(long, value_parser = ["on", "off"])]
+    pub hostname: Option<String>,
 }
 
 /// `page`.
@@ -340,6 +354,15 @@ pub struct InitArgs {
     /// Never prompt; fail when something is missing.
     #[arg(long)]
     pub yes: bool,
+    /// What InOrbit sees about your declared checks: `full` (each target), `hash` (a label
+    /// and a keyed hash; the default) or `label` (the label only). `[share]` in the policy;
+    /// change it later on the agent's page or with `iohr agent share`.
+    #[arg(long, value_parser = ["full", "hash", "label"])]
+    pub share_targets: Option<String>,
+    /// Send this machine's host name to InOrbit (`on`); `off`, the default, shows the
+    /// agent's name instead.
+    #[arg(long, value_parser = ["on", "off"])]
+    pub share_hostname: Option<String>,
     /// Skip the platform check and enrollment even when iohr offers a token.
     #[arg(long)]
     pub no_platform: bool,
@@ -484,10 +507,115 @@ async fn dispatch(cmd: Command, config_path: &Path) -> Result<ExitCode> {
             atlas_docs_sources(config_path)
         }
         Command::Page(a) => page(&a, config_path),
+        Command::Share(a) => share_cmd(&a, config_path).await,
         Command::Ledger(LedgerCommand::Verify(a)) => ledger_verify(&a, config_path),
         Command::Ledger(LedgerCommand::Export(a)) => ledger_export(&a, config_path),
         Command::Run(_) => Ok(ExitCode::SUCCESS),
     }
+}
+
+/// `share`: sets `[share]` in the policy file in place (comments kept), then asks the
+/// running agent to reload through its page (with this run's token). An agent that is not
+/// running takes it when it starts; either way the change is on the ledger when it does.
+async fn share_cmd(args: &ShareArgs, config_path: &Path) -> Result<ExitCode> {
+    use crate::policy::{SharePolicy, TargetShare};
+    let cfg = AgentConfig::load(config_path)?;
+    let policy = Policy::load(&cfg.policy)?;
+    let now = policy.share();
+    let describe = |s: &SharePolicy| {
+        format!(
+            "targets {} ({}), host name {}",
+            s.targets.as_str(),
+            match s.targets {
+                TargetShare::Full => "each check's URL or host and port",
+                TargetShare::Hash => "a label and a keyed hash; targets stay here",
+                TargetShare::Label => "labels only; targets stay here",
+            },
+            if s.hostname { "sent" } else { "kept here" }
+        )
+    };
+    let Some(t) = &args.targets else {
+        if args.hostname.is_some() {
+            return Err(Error::Config(
+                "name the targets level too: iohr agent share full|hash|label --hostname on|off"
+                    .into(),
+            ));
+        }
+        out(&format!(
+            "InOrbit sees: {}{}",
+            describe(&now),
+            if policy.share.is_some() {
+                ""
+            } else {
+                " (the defaults; [share] is not set)"
+            }
+        ));
+        out(&format!("Policy: {}", cfg.policy.display()));
+        return Ok(ExitCode::SUCCESS);
+    };
+    let want = SharePolicy {
+        targets: match t.as_str() {
+            "full" => TargetShare::Full,
+            "label" => TargetShare::Label,
+            _ => TargetShare::Hash,
+        },
+        hostname: args.hostname.as_deref().map_or(now.hostname, |h| h == "on"),
+    };
+    let changed = crate::share::write_policy(&cfg.policy, &want).map_err(|e| match e {
+        Error::Io { .. } => Error::Config(format!(
+            "{e}; the policy is not writable by this user: run it with sudo, or as the user that owns {}",
+            cfg.policy.display()
+        )),
+        other => other,
+    })?;
+    out(&format!(
+        "{} {}: {}",
+        if changed { "Set" } else { "Already" },
+        cfg.policy.display(),
+        describe(&want)
+    ));
+    // Ask the running agent to take it now.
+    let mut addr = cfg.admin.listen;
+    if addr.ip().is_unspecified() {
+        addr.set_ip(std::net::Ipv4Addr::LOCALHOST.into());
+    }
+    let token = std::fs::read_to_string(cfg.state_dir.join(crate::admin::TOKEN_FILE)).ok();
+    let reloaded = match (cfg.admin.enabled && addr.ip().is_loopback(), token) {
+        (true, Some(token)) => {
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .map_err(|e| Error::Config(e.to_string()))?;
+            match client
+                .post(format!("http://{addr}/policy/reload"))
+                .bearer_auth(token.trim())
+                .send()
+                .await
+            {
+                Ok(r) => {
+                    let ok = r.status().is_success();
+                    let body: serde_json::Value = r.json().await.unwrap_or_default();
+                    Some((ok, body["message"].as_str().unwrap_or_default().to_owned()))
+                }
+                Err(_) => None,
+            }
+        }
+        _ => None,
+    };
+    match reloaded {
+        Some((true, msg)) => out(&format!(
+            "The running agent {msg}; the change is in its ledger."
+        )),
+        Some((false, msg)) => {
+            out(&format!("The running agent did not take it: {msg}"));
+            return Ok(ExitCode::from(1));
+        }
+        None => out(
+            "No running agent answered on its page: it takes this when it starts, and records it in its ledger then.",
+        ),
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn ledger_dir(flag: Option<&PathBuf>, config_path: &Path) -> Result<PathBuf> {
@@ -849,23 +977,15 @@ async fn run_async(cfg: AgentConfig) -> Result<()> {
     if let Ok(t) = std::env::var(TOKEN_ENV) {
         crate::redact::register(t.trim());
     }
-    let key = AgentKey::load(&cfg.key)?;
-    let agent = Arc::new(Agent::new(cfg, policy, checks, enrollment, key)?);
-    tracing::info!(
-        agent_id = %agent.enrollment.agent_id,
-        environment = %agent.config.environment,
-        policy_hash = %agent.policy_hash,
-        checks = agent.checks.as_ref().map_or(0, |c| c.entries.len()),
-        checks_hash = agent.checks.as_ref().map_or("none", |c| c.hash.as_str()),
-        "starting"
-    );
+    // The policy and checks are read again, and on every reload, by the supervisor.
+    drop((policy, checks));
     let (tx, rx) = watch::channel(false);
     tokio::spawn(async move {
         wait_for_signal().await;
         tracing::info!("stopping");
         let _ = tx.send(true);
     });
-    agent.run(rx).await
+    crate::agent::supervise(cfg, enrollment, rx).await
 }
 
 async fn wait_for_signal() {
@@ -1427,6 +1547,47 @@ fn kernel_host_name() -> Option<String> {
     None
 }
 
+/// The one question about what leaves, asked once at setup with the defaults shown.
+fn ask_share(p: &Prompter, a: &InitArgs) -> Result<crate::policy::SharePolicy> {
+    use crate::policy::{SharePolicy, TargetShare};
+    let targets = match &a.share_targets {
+        Some(t) => t.clone(),
+        None => {
+            if p.interactive {
+                out("What InOrbit sees about your checks:");
+                out("  full   each check's URL, or host and port");
+                out("  hash   a label and a keyed hash; the target stays here (default)");
+                out("  label  the label only");
+            }
+            p.ask("What InOrbit sees (full, hash, label)", Some("hash"))?
+        }
+    };
+    let targets = match targets.trim() {
+        "full" => TargetShare::Full,
+        "hash" => TargetShare::Hash,
+        "label" => TargetShare::Label,
+        other => {
+            return Err(Error::Config(format!(
+                "what InOrbit sees: full, hash or label, not {other:?}"
+            )));
+        }
+    };
+    let hostname = match &a.share_hostname {
+        Some(h) => h == "on",
+        None => matches!(
+            p.ask(
+                "Send this machine's host name to InOrbit? (yes, no)",
+                Some("no")
+            )?
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+            "yes" | "y" | "on"
+        ),
+    };
+    Ok(SharePolicy { targets, hostname })
+}
+
 fn toml_list(items: &[String]) -> String {
     let quoted: Vec<String> = items
         .iter()
@@ -1591,7 +1752,11 @@ async fn init(a: &InitArgs, config_path: &Path) -> Result<ExitCode> {
 
     // Everything is checked before anything is written.
     cfg.validate()?;
-    let text = policy_text(&environment, &domains, &allow, &secrets_allow);
+    let share = ask_share(&p, a)?;
+    let text = crate::share::edit_policy_text(
+        &policy_text(&environment, &domains, &allow, &secrets_allow),
+        &share,
+    )?;
     let policy = Policy::from_toml(&text)?;
     out(&format!("Configuration valid; policy {}", policy.hash()));
 

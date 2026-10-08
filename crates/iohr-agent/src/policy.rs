@@ -24,8 +24,13 @@ pub mod limits {
 }
 
 /// The parsed, validated policy.
+///
+/// Forward-compatible at the top level only: a section this version does not know
+/// (`[read]`, written for a later agent) is kept out of the policy, logged loudly and shown
+/// on the local page, and the agent starts. An unknown key inside a known section, or an
+/// unknown key at the top level that is not a section, still refuses the file: a typo in
+/// a deny rule must fail closed (`docs/policy.md`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Policy {
     /// The one environment this agent serves (`staging`, `production`).
     pub environment: String,
@@ -57,6 +62,12 @@ pub struct Policy {
     /// defaults: targets as a keyed hash and a label, no host name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub share: Option<SharePolicy>,
+    /// Everything else at the top level, sorted out by [`Policy::from_toml`].
+    #[serde(flatten, skip_serializing)]
+    unknown: std::collections::BTreeMap<String, toml::Value>,
+    /// The top-level sections this version ignored.
+    #[serde(skip)]
+    ignored: Vec<String>,
     #[serde(skip)]
     compiled: Compiled,
 }
@@ -404,10 +415,24 @@ impl Policy {
     /// When the file is missing or invalid.
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).map_err(|e| Error::io(path, e))?;
-        Self::from_toml(&text).map_err(|e| match e {
+        let p = Self::from_toml(&text).map_err(|e| match e {
             Error::Policy(m) => Error::Policy(format!("{}: {m}", path.display())),
             other => other,
-        })
+        })?;
+        for s in &p.ignored {
+            tracing::warn!(
+                file = %path.display(),
+                section = %s,
+                "POLICY: [{s}] is not a section this agent version knows; it is IGNORED. Upgrade the agent, or remove it"
+            );
+        }
+        Ok(p)
+    }
+
+    /// Top-level sections this version did not know and ignored (shown on the page).
+    #[must_use]
+    pub fn ignored_sections(&self) -> &[String] {
+        &self.ignored
     }
 
     /// Parses and validates policy TOML.
@@ -429,6 +454,16 @@ impl Policy {
     }
 
     fn compile(&mut self) -> std::result::Result<(), String> {
+        // Only a whole unknown section is let through, with a warning.
+        for (k, v) in std::mem::take(&mut self.unknown) {
+            if v.is_table() {
+                self.ignored.push(k);
+            } else {
+                return Err(format!(
+                    "unknown key `{k}` at the top level (only a whole unknown [section] is ignored)"
+                ));
+            }
+        }
         check_environment(&self.environment)?;
         let mut bound = Vec::with_capacity(self.domains.bound.len());
         for d in &self.domains.bound {
@@ -971,6 +1006,30 @@ allow = ["vault:kv/staging/*", "env:CHECK_TOKEN"]
                 Policy::from_toml(&format!("{base}[share]\n{bad}\n")).is_err(),
                 "{bad}"
             );
+        }
+    }
+
+    #[test]
+    fn an_unknown_section_warns_and_an_unknown_key_still_refuses() {
+        let base = "environment = \"staging\"\n";
+        let p = Policy::from_toml(&format!(
+            "{base}[read]\nrepos = [\"x\"]\n[future.nested]\na = 1\n"
+        ))
+        .unwrap();
+        assert_eq!(p.ignored_sections(), ["future", "read"]);
+        assert_eq!(
+            p.hash(),
+            Policy::from_toml(base).unwrap().hash(),
+            "ignored sections are not hashed"
+        );
+        // A typo inside a known section still refuses the file.
+        for bad in [
+            "[networks]\ndeny_list = [\"10.0.0.0/8\"]\n",
+            "[work]\nchecks = true\nlaod = true\n",
+            "[share]\ntarget = \"full\"\n",
+            "enviroment = \"prod\"\n",
+        ] {
+            assert!(Policy::from_toml(&format!("{base}{bad}")).is_err(), "{bad}");
         }
     }
 }

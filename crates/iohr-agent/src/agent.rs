@@ -123,6 +123,8 @@ pub struct Agent {
     pub session_destination: String,
     /// The declared checks as the hello carries them under `[share]`, and their hash.
     pub shared_checks: Option<(Vec<serde_json::Value>, String)>,
+    /// The key target hashes are made with (never sent).
+    pub share_key: Vec<u8>,
 }
 
 impl Agent {
@@ -216,7 +218,7 @@ impl Agent {
             Executor::new(Arc::clone(&policy), tls.clone(), secrets)
                 .with_checks(checks.clone().map(Arc::new))
                 .with_host(host.clone())
-                .with_share(share.targets, share_key),
+                .with_share(share.targets, share_key.clone()),
         );
         let state = Arc::new(AgentState::new(
             AgentInfo {
@@ -252,6 +254,7 @@ impl Agent {
             ledger,
             session_destination,
             shared_checks,
+            share_key,
         })
     }
 
@@ -268,8 +271,15 @@ impl Agent {
 
     /// What the admin page reads.
     #[must_use]
-    pub fn admin_context(&self, token: Option<String>) -> crate::admin::Context {
+    pub fn admin_context(
+        &self,
+        token: Option<String>,
+        reload: Option<tokio::sync::mpsc::Sender<Reload>>,
+    ) -> crate::admin::Context {
         crate::admin::Context {
+            reload,
+            share_key: self.share_key.clone(),
+            policy_path: self.config.policy.clone(),
             state: Arc::clone(&self.state),
             policy: Arc::clone(&self.policy),
             checks: self.checks.clone().map(Arc::new),
@@ -287,34 +297,23 @@ impl Agent {
     /// # Errors
     /// When the admin address cannot be bound, or the agent is revoked.
     pub async fn run(self: Arc<Self>, shutdown: watch::Receiver<bool>) -> Result<()> {
-        if self.config.admin.enabled {
-            let admin = &self.config.admin;
-            let tls = crate::admin::server_tls(admin)?;
-            let token = crate::admin::write_token(&self.config.state_dir)?;
-            let listener = tokio::net::TcpListener::bind(admin.listen)
-                .await
-                .map_err(|e| Error::Config(format!("admin.listen {}: {e}", admin.listen)))?;
-            if let Ok(addr) = listener.local_addr() {
-                let scheme = if tls.is_some() { "https" } else { "http" };
-                tracing::info!(%addr, "admin page at {scheme}://{addr}/");
-                if !addr.ip().is_loopback() {
-                    let warning = format!(
-                        "WARNING: the admin page listens on {addr}, beyond this machine (admin.allow_non_loopback). It is served over TLS and asks for its token, but anyone who can reach {addr} can try. Prefer 127.0.0.1 and an SSH tunnel."
-                    );
-                    tracing::warn!("{warning}");
-                    #[allow(clippy::print_stderr)]
-                    {
-                        eprintln!("\n{}\n{warning}\n{}\n", "!".repeat(78), "!".repeat(78));
-                    }
-                }
-            }
+        if let Some(admin) = AdminListener::bind(&self.config).await? {
+            let ctx = Arc::new(self.admin_context(Some(admin.token.clone()), None));
             tokio::spawn(crate::admin::serve(
-                listener,
-                Arc::new(self.admin_context(Some(token))),
-                tls,
+                admin.listener,
+                ctx,
+                admin.tls,
                 shutdown.clone(),
             ));
         }
+        self.run_core(shutdown).await
+    }
+
+    /// Runs the background work and sessions, without the admin page.
+    ///
+    /// # Errors
+    /// When the agent is revoked.
+    pub async fn run_core(self: Arc<Self>, shutdown: watch::Receiver<bool>) -> Result<()> {
         if let Some(policy) = self.policy.capture() {
             tokio::spawn(watch_capture(
                 policy,
@@ -351,5 +350,189 @@ impl Agent {
             ));
         }
         crate::session::run(self, shutdown).await
+    }
+}
+
+/// A request to load the policy and the checks again (from the page or
+/// `iohr agent share`): the answer says whether the agent now runs with them.
+#[derive(Debug)]
+pub struct Reload {
+    /// Ok with what changed, or why the files were not taken (the agent keeps running
+    /// with what it had).
+    pub reply: tokio::sync::oneshot::Sender<std::result::Result<String, String>>,
+}
+
+/// The admin page's listener, bound once for the process.
+#[derive(Debug)]
+pub struct AdminListener {
+    /// Bound.
+    pub listener: tokio::net::TcpListener,
+    /// TLS, beyond loopback.
+    pub tls: Option<tokio_rustls::TlsAcceptor>,
+    /// This run's token (`<state_dir>/admin.token`).
+    pub token: String,
+}
+
+impl AdminListener {
+    /// Binds `[admin] listen`, when the page is on.
+    ///
+    /// # Errors
+    /// When the address cannot be bound, or TLS or the token cannot be set up.
+    pub async fn bind(config: &AgentConfig) -> Result<Option<Self>> {
+        let admin = &config.admin;
+        if !admin.enabled {
+            return Ok(None);
+        }
+        let tls = crate::admin::server_tls(admin)?;
+        let token = crate::admin::write_token(&config.state_dir)?;
+        let listener = tokio::net::TcpListener::bind(admin.listen)
+            .await
+            .map_err(|e| Error::Config(format!("admin.listen {}: {e}", admin.listen)))?;
+        if let Ok(addr) = listener.local_addr() {
+            let scheme = if tls.is_some() { "https" } else { "http" };
+            tracing::info!(%addr, "admin page at {scheme}://{addr}/");
+            if !addr.ip().is_loopback() {
+                let warning = format!(
+                    "WARNING: the admin page listens on {addr}, beyond this machine (admin.allow_non_loopback). It is served over TLS and asks for its token, but anyone who can reach {addr} can try. Prefer 127.0.0.1 and an SSH tunnel."
+                );
+                tracing::warn!("{warning}");
+                #[allow(clippy::print_stderr)]
+                {
+                    eprintln!("\n{}\n{warning}\n{}\n", "!".repeat(78), "!".repeat(78));
+                }
+            }
+        }
+        Ok(Some(Self {
+            listener,
+            tls,
+            token,
+        }))
+    }
+}
+
+/// The policy and checks files, read and checked against the configuration and the
+/// enrollment without starting anything.
+fn load_files(
+    config: &AgentConfig,
+    enrollment: &Enrollment,
+) -> Result<(Policy, Option<DeclaredChecks>)> {
+    let policy = Policy::load(&config.policy)?;
+    let checks = DeclaredChecks::load(&config.checks)?;
+    if policy.environment != config.environment || policy.environment != enrollment.environment {
+        return Err(Error::Policy(format!(
+            "the policy is for environment {:?}; agent.toml and the enrollment say {:?} and {:?}",
+            policy.environment, config.environment, enrollment.environment
+        )));
+    }
+    Ok((policy, checks))
+}
+
+fn build(
+    config: &AgentConfig,
+    policy: Policy,
+    checks: Option<DeclaredChecks>,
+    enrollment: &Enrollment,
+) -> Result<Arc<Agent>> {
+    let key = AgentKey::load(&config.key)?;
+    let agent = Agent::new(config.clone(), policy, checks, enrollment.clone(), key)?;
+    tracing::info!(
+        agent_id = %agent.enrollment.agent_id,
+        environment = %agent.config.environment,
+        policy_hash = %agent.policy_hash,
+        checks = agent.checks.as_ref().map_or(0, |c| c.entries.len()),
+        targets = agent.policy.share().targets.as_str(),
+        hostname = agent.policy.share().hostname,
+        "starting"
+    );
+    if let Err(e) = crate::share::note_change(
+        &agent.config.state_dir,
+        &agent.policy.share(),
+        agent.ledger.as_deref(),
+    ) {
+        tracing::warn!(error = %e, "the [share] change was not recorded in the ledger");
+    }
+    Ok(agent)
+}
+
+/// Runs the agent for the life of the process: the admin page once, and the agent itself
+/// in generations. A reload (the page's "What InOrbit sees", `iohr agent share`) reads
+/// the policy and checks again; only when they are valid does the running generation
+/// stop and a new one start with them, opening a new session whose hello says what the
+/// new policy shares. A reload that fails leaves the agent as it was.
+///
+/// # Errors
+/// When the first start fails, or the agent is revoked.
+pub async fn supervise(
+    config: AgentConfig,
+    enrollment: Enrollment,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel::<Reload>(4);
+    let (mut policy, mut checks) = load_files(&config, &enrollment)?;
+    let mut agent = build(&config, policy.clone(), checks.clone(), &enrollment)?;
+    let admin = AdminListener::bind(&config).await?;
+    let token = admin.as_ref().map(|a| a.token.clone());
+    let (ctx_tx, ctx_rx) = watch::channel(Arc::new(
+        agent.admin_context(token.clone(), Some(reload_tx.clone())),
+    ));
+    if let Some(a) = admin {
+        tokio::spawn(crate::admin::serve_watch(
+            a.listener,
+            ctx_rx,
+            a.tls,
+            shutdown.clone(),
+        ));
+    }
+    loop {
+        ctx_tx.send_replace(Arc::new(
+            agent.admin_context(token.clone(), Some(reload_tx.clone())),
+        ));
+        let (gen_tx, gen_rx) = watch::channel(false);
+        let mut task = tokio::spawn(Arc::clone(&agent).run_core(gen_rx));
+        let next = loop {
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    let _ = gen_tx.send(true);
+                    return task.await.map_err(|e| Error::Session(e.to_string()))?;
+                }
+                ended = &mut task => {
+                    return ended.map_err(|e| Error::Session(e.to_string()))?;
+                }
+                Some(req) = reload_rx.recv() => {
+                    match load_files(&config, &enrollment) {
+                        Err(e) => {
+                            tracing::warn!(error = %e, "reload refused; the agent keeps its policy");
+                            let _ = req.reply.send(Err(e.to_string()));
+                        }
+                        Ok(files) => break (files, req),
+                    }
+                }
+            }
+        };
+        let ((new_policy, new_checks), req) = next;
+        let _ = gen_tx.send(true);
+        if let Ok(Err(e @ Error::Revoked(_))) = task.await {
+            let _ = req.reply.send(Err(e.to_string()));
+            return Err(e);
+        }
+        let before = agent.policy_hash.clone();
+        match build(&config, new_policy.clone(), new_checks.clone(), &enrollment) {
+            Ok(a) => {
+                let msg = if a.policy_hash == before {
+                    "reloaded; the policy is unchanged".to_owned()
+                } else {
+                    format!("reloaded with policy {}", a.policy_hash)
+                };
+                agent = a;
+                policy = new_policy;
+                checks = new_checks;
+                let _ = req.reply.send(Ok(msg));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "reload failed; starting again with the previous policy");
+                agent = build(&config, policy.clone(), checks.clone(), &enrollment)?;
+                let _ = req.reply.send(Err(e.to_string()));
+            }
+        }
     }
 }

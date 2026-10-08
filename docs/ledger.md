@@ -17,6 +17,7 @@ the payload.
 | `heartbeat` | every heartbeat | `contract.heartbeat` |
 | `result` | a job that ran, under the surface the policy turned on | `work.surfaces.<surface>` |
 | `result` | a refusal (the contract answers every job) | `contract.refusal` |
+| `share_set` | the agent starts with a `[share]` it did not run with before (set on the page, with `iohr agent share` or by hand); local, nothing is sent, the destination says so | `operator.policy.share` |
 
 WebSocket pings and the closing frame carry no payload and are counted on the page, not
 recorded. Enrollment happens once, before the agent has a ledger, and is not recorded.

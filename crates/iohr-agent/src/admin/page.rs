@@ -82,6 +82,20 @@ table.t{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
 .spark .ok{fill:var(--ok)}.spark .bad{fill:var(--alert)}.spark .ref{fill:var(--warn)}.spark .none{fill:var(--line)}
 .meter{display:block;width:100%;height:8px;margin:8px 0 2px}
 .meter .bg{fill:var(--raised)}.meter .fg{fill:var(--ink)}.meter .hot{fill:var(--alert)}
+.note.ok{border-left-color:var(--ok)}.note.bad{border-left-color:var(--alert)}
+.share{display:grid;gap:12px;margin:0 0 8px}
+.share fieldset{border:0;margin:0;padding:0;min-width:0}
+.share legend{font-size:13px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin:0 0 8px}
+.opts{display:grid;gap:8px;grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}
+.opt,.switch{display:flex;gap:10px;align-items:flex-start;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--surface);cursor:pointer}
+.opt:has(input:checked){border-color:var(--amber);box-shadow:inset 0 0 0 1px var(--amber)}
+.opt input,.switch input{margin-top:3px;accent-color:var(--amber)}
+.actions{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+button{font:inherit;padding:8px 16px;border-radius:8px;border:1px solid var(--line);background:var(--surface);color:var(--ink);cursor:pointer}
+button.primary{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+button:focus-visible,.opt:focus-within,.switch:focus-within{outline:2px solid var(--amber);outline-offset:2px}
+.gap{margin-top:20px}
+details summary{cursor:pointer;color:var(--muted);margin:0 0 8px}
 .note{border-left:3px solid var(--amber);padding:10px 14px;background:var(--surface);border-radius:0 8px 8px 0;margin:16px 0;color:var(--ink)}
 pre{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:14px;overflow-x:auto;margin:0;white-space:pre}
 .logs td{font-family:var(--mono);font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere}
@@ -117,7 +131,7 @@ pub(super) fn csp() -> &'static str {
     CSP.get_or_init(|| {
         let hash = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(CSS));
         format!(
-            "default-src 'none'; style-src 'sha256-{hash}'; img-src 'self'; script-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+            "default-src 'none'; style-src 'sha256-{hash}'; img-src 'self'; script-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
         )
     })
 }
@@ -126,11 +140,27 @@ pub(super) fn is_html_route(path: &str) -> bool {
     NAV.iter().any(|(p, _)| *p == path)
 }
 
+/// What a request brings to a page beyond its path.
+#[derive(Debug, Default)]
+pub(super) struct View {
+    /// The query string (the policy page's preview choice, `applied=1`).
+    pub query: String,
+    /// The form token, when the request is signed in.
+    pub csrf: Option<String>,
+    /// The request carries a valid session.
+    pub signed_in: bool,
+    /// Changes are possible from this client: both ends on loopback and a supervisor.
+    pub can_change: bool,
+    /// The outcome of a change, to show at the top.
+    pub flash: Option<(bool, String)>,
+}
+
 /// The body for a path, with its content type.
 pub(super) fn route(
     ctx: &Context,
     path: &str,
     local: Option<SocketAddr>,
+    view: &View,
 ) -> Option<(&'static str, String)> {
     const HTML: &str = "text/html; charset=utf-8";
     const JSON: &str = "application/json";
@@ -139,7 +169,7 @@ pub(super) fn route(
     Some(match path {
         "/" => (HTML, html("/", overview(ctx, &s))),
         "/checks" => (HTML, html("/checks", checks(ctx))),
-        "/policy" => (HTML, html("/policy", policy(ctx))),
+        "/policy" => (HTML, html("/policy", policy(ctx, view))),
         "/ledger" => (HTML, html("/ledger", ledger(ctx))),
         "/jobs" => (HTML, html("/jobs", jobs(&s))),
         "/host" => (HTML, html("/host", host(ctx, &s))),
@@ -163,7 +193,7 @@ pub fn render_all(ctx: &Context) -> String {
         .chain(API.iter().map(|(p, _)| *p))
         .chain(["/status.json"])
     {
-        if let Some((_, body)) = route(ctx, p, None) {
+        if let Some((_, body)) = route(ctx, p, None, &View::default()) {
             out.push_str(&crate::redact::redact(&body));
             out.push('\n');
         }
@@ -379,7 +409,7 @@ fn promises(ctx: &Context, s: &Snapshot) -> Vec<(&'static str, Status, String, &
                 Status::InPlace
             },
             format!(
-                "Checks only connect and read a bounded answer. Load is {}, faults are {} (and this version refuses both). No endpoint here changes anything.",
+                "Checks only connect and read a bounded answer. Load is {}, faults are {} (and this version refuses both). The one thing this page changes is what InOrbit sees, and only from this machine.",
                 if p.work.load { "on" } else { "off" },
                 if p.work.faults { "on" } else { "off" }
             ),
@@ -422,6 +452,7 @@ fn promises(ctx: &Context, s: &Snapshot) -> Vec<(&'static str, Status, String, &
 fn overview(ctx: &Context, s: &Snapshot) -> String {
     let p = &ctx.policy;
     let mut h = String::new();
+    ignored_warning(ctx, &mut h);
     let _ = write!(
         h,
         "<h1>{}</h1><p class=lede>{} in <b>{}</b>, talking to {}. This page is how you check what it does without taking our word for it.</p>",
@@ -872,59 +903,172 @@ pub(super) fn never(ctx: &Context) -> Vec<(String, &'static str)> {
     out
 }
 
-/// `[share]`: what the hello tells the platform, level by level, and check by check.
-fn share(ctx: &Context, h: &mut String) {
-    use crate::policy::TargetShare;
-    let sh = ctx.policy.share();
-    let explicit = ctx.policy.share.is_some();
-    let level = |l: TargetShare| match l {
-        TargetShare::Full => "the target itself (URL, or host and port)",
-        TargetShare::Hash => "a label and a keyed hash of the target; the target stays here",
-        TargetShare::Label => "a label only; nothing derived from the target leaves",
-    };
+/// A loud note when the policy has sections this version ignored.
+fn ignored_warning(ctx: &Context, h: &mut String) {
+    let ignored = ctx.policy.ignored_sections();
+    if ignored.is_empty() {
+        return;
+    }
+    let names: Vec<String> = ignored.iter().map(|s| format!("[{s}]")).collect();
     let _ = write!(
         h,
-        "<h2>What the platform is told</h2><p class=lede>Chosen in this policy's <code>[share]</code>{}. Whatever the level, every message that leaves is in the <a href=/ledger>ledger</a>.</p><div class=grid><div class=card><h3>Check targets</h3><div class=stat>{}</div><p class=muted>{}</p></div><div class=card><h3>Host name</h3><div class=stat>{}</div><p class=muted>{}</p></div><div class=card><h3>Metadata</h3><div class=stat>agent.toml</div><p class=muted>The reported part of agent.toml's [metadata] (site, country, owner team, data classes, trust domain), only what devops wrote there; <code>[metadata] report = false</code> sends none.</p></div></div>",
-        if explicit {
+        "<div class=\"note bad\"><b>The policy has sections this agent version does not know, and ignores: {}.</b> They were written for a later version. Upgrade the agent to have them apply, or remove them from <code>{}</code>.</div>",
+        esc(&names.join(", ")),
+        esc(&ctx.policy_path.display().to_string())
+    );
+}
+
+/// The choice the policy page shows: the one asked to preview, else the policy's own.
+fn chosen(ctx: &Context, view: &View) -> crate::policy::SharePolicy {
+    use crate::policy::{SharePolicy, TargetShare};
+    let q: std::collections::HashMap<String, String> =
+        url::form_urlencoded::parse(view.query.as_bytes())
+            .into_owned()
+            .collect();
+    let current = ctx.policy.share();
+    let targets = match q.get("targets").map(String::as_str) {
+        Some("full") => TargetShare::Full,
+        Some("hash") => TargetShare::Hash,
+        Some("label") => TargetShare::Label,
+        _ => return current,
+    };
+    SharePolicy {
+        targets,
+        hostname: matches!(
+            q.get("hostname").map(String::as_str),
+            Some("on" | "true" | "1")
+        ),
+    }
+}
+
+/// "What InOrbit sees": the `[share]` choice, the form that changes it (on this machine,
+/// signed in), and a preview of exactly what the next hello would carry.
+#[allow(clippy::too_many_lines)] // the form, then the preview
+fn share(ctx: &Context, view: &View, h: &mut String) {
+    use crate::policy::TargetShare;
+    let current = ctx.policy.share();
+    let pick = chosen(ctx, view);
+    let previewing = pick != current;
+    let _ = write!(
+        h,
+        "<h2 id=share>What InOrbit sees</h2><p class=lede>How much the platform learns about your checks and this machine. Chosen here or with <code>iohr agent share</code>, written to <code>[share]</code> in the policy{}. Whatever you choose, every message that leaves is in the <a href=/ledger>ledger</a>.</p>",
+        if ctx.policy.share.is_some() {
             ""
         } else {
-            " (not set, so the defaults)"
-        },
-        sh.targets.as_str(),
-        level(sh.targets),
-        if sh.hostname { "shared" } else { "kept here" },
-        if sh.hostname {
-            format!(
-                "The hello carries this machine's host name, {}.",
-                esc(&crate::host::sysfs::host_name())
-            )
-        } else {
-            "The console shows the agent's name instead.".into()
-        },
+            " (not set yet: these are the defaults)"
+        }
     );
-    let Some(declared) = &ctx.checks else {
-        return;
-    };
-    h.push_str("<div class=scroll><table class=t><tr><th>Check</th><th>Shown as</th><th>The platform gets</th></tr>");
-    for c in &declared.entries {
-        let l = crate::share::level_for(c, sh.targets);
-        let gets = match l {
-            TargetShare::Full if l != sh.targets => format!(
-                "{} <span class=muted>(a refusal the platform must make needs its target)</span>",
-                esc(&target_text(&c.spec.target))
-            ),
-            TargetShare::Full => esc(&target_text(&c.spec.target)),
-            TargetShare::Hash => "a keyed hash; the target stays on this agent".into(),
-            TargetShare::Label => "the label only; the target stays on this agent".into(),
-        };
+    match &view.flash {
+        Some((true, m)) => {
+            let _ = write!(h, "<div class=\"note ok\">{}</div>", esc(m));
+        }
+        Some((false, m)) => {
+            let _ = write!(h, "<div class=\"note bad\">{}</div>", esc(m));
+        }
+        None if view.query.contains("applied=1") => {
+            h.push_str("<div class=\"note ok\">Applied. The agent reloaded its policy and opened a new session; the change is in the ledger.</div>");
+        }
+        None => {}
+    }
+    let opts = [
+        (
+            TargetShare::Full,
+            "Everything",
+            "full",
+            "Each check's URL, or host and port, as you wrote it.",
+        ),
+        (
+            TargetShare::Hash,
+            "Fingerprint",
+            "hash",
+            "A label and a keyed hash: InOrbit sees when a target changes, never what it is. The default.",
+        ),
+        (
+            TargetShare::Label,
+            "Label only",
+            "label",
+            "Only the label you gave each check. Nothing derived from its target leaves.",
+        ),
+    ];
+    h.push_str("<form class=share method=get action=\"/policy#share\"><fieldset><legend>Check targets</legend><div class=opts>");
+    for (level, title, value, what) in opts {
         let _ = write!(
             h,
-            "<tr><td>{}</td><td>{}</td><td>{gets}</td></tr>",
-            esc(&c.key),
-            esc(crate::share::label(c))
+            "<label class=opt><input type=radio name=targets value={value}{}><span><b>{title}</b>{}<br><span class=muted>{what}</span></span></label>",
+            if pick.targets == level {
+                " checked"
+            } else {
+                ""
+            },
+            if current.targets == level {
+                " <span class=muted>(now)</span>"
+            } else {
+                ""
+            }
         );
     }
-    h.push_str("</table></div>");
+    let host = crate::host::sysfs::host_name();
+    let _ = write!(
+        h,
+        "</div></fieldset><label class=switch><input type=checkbox name=hostname value=on{}><span><b>Send host name</b> <span class=muted>({}; off, the console shows the agent's name, now {})</span></span></label>",
+        if pick.hostname { " checked" } else { "" },
+        esc(&host),
+        if current.hostname { "on" } else { "off" }
+    );
+    if let Some(c) = &view.csrf {
+        let _ = write!(h, "<input type=hidden name=csrf value=\"{}\">", esc(c));
+    }
+    h.push_str("<div class=actions><button type=submit>Preview</button>");
+    if view.can_change && view.signed_in {
+        h.push_str("<button class=primary type=submit formmethod=post formaction=/policy/share>Apply</button><span class=muted>Rewrites only <code>[share]</code> in the policy file (comments kept), reloads the agent and records the change in the ledger.</span>");
+    } else if view.can_change {
+        h.push_str("<span class=muted>To change it, open this page signed in: <code>iohr agent page --open</code> on this machine. Or run <code>iohr agent share full|hash|label</code>.</span>");
+    } else {
+        h.push_str("<span class=muted>Changed only on the agent's own machine: <code>iohr agent share full|hash|label</code>, or this page opened there.</span>");
+    }
+    h.push_str("</div></form>");
+
+    // The preview: exactly what the next hello would carry.
+    let preview = crate::share::preview(ctx.checks.as_deref(), &pick, &ctx.share_key);
+    let _ = write!(
+        h,
+        "<h3 class=gap>{}</h3>",
+        if previewing {
+            "Preview: the next hello, if you apply this"
+        } else {
+            "The next hello carries"
+        }
+    );
+    if let Some(declared) = &ctx.checks {
+        h.push_str("<div class=scroll><table class=t><tr><th>Check</th><th>Shown as</th><th>InOrbit gets</th></tr>");
+        for c in &declared.entries {
+            let l = crate::share::level_for(c, pick.targets);
+            let gets = match l {
+                TargetShare::Full if l != pick.targets => format!(
+                    "{} <span class=muted>(a refusal the platform must make needs its target)</span>",
+                    esc(&target_text(&c.spec.target))
+                ),
+                TargetShare::Full => esc(&target_text(&c.spec.target)),
+                TargetShare::Hash => "a keyed hash; the target stays on this agent".into(),
+                TargetShare::Label => "the label only; the target stays on this agent".into(),
+            };
+            let _ = write!(
+                h,
+                "<tr><td>{}</td><td>{}</td><td>{gets}</td></tr>",
+                esc(&c.key),
+                esc(crate::share::label(c))
+            );
+        }
+        h.push_str("</table></div>");
+    } else {
+        h.push_str("<p class=muted>No checks.toml: the hello declares no checks.</p>");
+    }
+    let _ = write!(
+        h,
+        "<details class=gap><summary>The JSON itself ({} bytes)</summary><pre>{}</pre></details><p class=muted>Metadata: the reported part of agent.toml's <code>[metadata]</code> (site, country, owner team, data classes, trust domain), only what devops wrote there; <code>[metadata] report = false</code> sends none.</p>",
+        serde_json::to_string(&preview).unwrap_or_default().len(),
+        esc(&serde_json::to_string_pretty(&preview).unwrap_or_default())
+    );
 }
 
 fn list(items: &[String]) -> String {
@@ -943,10 +1087,11 @@ fn on_off(b: bool) -> String {
     if b { pill("ok", "on") } else { pill("", "off") }
 }
 
-fn policy(ctx: &Context) -> String {
+fn policy(ctx: &Context, view: &View) -> String {
     let p = &ctx.policy;
     let s = ctx.state.snapshot();
     let mut h = String::new();
+    ignored_warning(ctx, &mut h);
     let _ = write!(
         h,
         "<h1>Policy</h1><p class=lede>The file on this machine that decides what this agent may reach and do. The platform cannot change it; work outside it is refused here and the refusal is shown in the console.</p><div class=grid><div class=card>{}</div></div>",
@@ -959,7 +1104,7 @@ fn policy(ctx: &Context) -> String {
             ("Environment", esc(&p.environment)),
         ])
     );
-    share(ctx, &mut h);
+    share(ctx, view, &mut h);
     h.push_str("<h2>What this agent can never do</h2><div class=card><ul class=\"list never\">");
     for (what, why) in never(ctx) {
         let _ = write!(
@@ -1459,6 +1604,8 @@ fn api(ctx: &Context, s: &Snapshot, name: &str) -> Value {
             "hash": s.policy.hash,
             "policy": serde_json::to_value(&*ctx.policy).unwrap_or_default(),
             "share": ctx.policy.share(),
+            "share_set": ctx.policy.share.is_some(),
+            "ignored_sections": ctx.policy.ignored_sections(),
             "never": never(ctx).into_iter().map(|(what, why)| json!({"what": what, "because": why})).collect::<Vec<_>>(),
         }),
         "ledger" => match &ctx.ledger {

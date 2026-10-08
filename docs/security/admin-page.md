@@ -26,8 +26,10 @@ request or response bodies.
 ## Assets and adversaries
 
 The asset is the page's content: it describes a company's network (targets, allowed
-ranges) and its agent's behaviour. The page is not a control surface: nothing reached
-through it changes the agent.
+ranges) and its agent's behaviour. The page is not a control surface, with one exception:
+"What InOrbit sees" sets `[share]` in the policy (`POST /policy/share`), and
+`POST /policy/reload` loads the files again. Both can only make the agent share the same or
+less unless the operator on this machine chooses more; neither reaches anything else.
 
 | Adversary | Can | Wants |
 |---|---|---|
@@ -49,6 +51,17 @@ through it changes the agent.
 | Secrets on the page | Values are redacted when recorded (log lines, errors, job fields) and every response body is redacted again on its way out ([`redact.rs`](../../crates/iohr-agent/src/redact.rs)): PEM private keys, values after secret-looking keys, bearer tokens, JWTs, enrollment tokens, cloud and Git tokens, long high-entropy words, and the page's own token. Check auth is shown as "a header from a secret", never the reference | `no_secret_in_any_page_or_api_answer` (a property test planting secrets in logs, errors, job fields and the ledger), `redact::tests` |
 | Path traversal | No file is served by path: the routes are a fixed list and the assets are compiled in | `every_answer_carries_the_security_headers_and_no_cors` |
 | Resource exhaustion | 8 KiB of request head, 64 header lines, 5 s to send it, 10 s per write, 64 connections at once, a token bucket per client address (40 burst, 10 per second, 1024 addresses tracked), 16 sessions; history, logs and the in-memory ledger are capped (60 runs per check, 300 log lines kept of 500, 1000 ledger entries in memory, the ledger on disk by `[ledger] retain_days` and `max_mb`) | `bounded_requests_and_rate`, `a_slow_client_is_cut_off`, `ledger::tests::bounded_in_memory`, `logbuf::tests::bounded_and_redacted` |
+
+### The one change
+
+| Threat | Control | Test |
+|---|---|---|
+| The platform, or anything off this machine, changes what is shared | The change endpoints answer only when the listener and the client are both on loopback; the platform has no path to them (the agent dials out, nothing dials in) | `a_change_is_refused_beyond_loopback` |
+| A web page makes the browser post the form (CSRF) | A session cookie (`HttpOnly`, `SameSite=Strict`) from `iohr agent page --open`; the request's `Origin` must be this page; a form token tied to the session, compared in constant time; `form-action 'self'` in the CSP | `what_inorbit_sees_changes_only_from_this_machine_signed_in` |
+| A local process without the token | 401: a session or the bearer token from `<state_dir>/admin.token` (0600) | same |
+| A large or malformed body | 512 bytes at most, form-encoded, only on the two paths; any other body is 413 | same |
+| A broken policy written | The file is edited in place, validated before it is written, written atomically with its permissions; a reload that fails keeps the agent on its previous policy | `share::tests`, `a_share_change_reloads_the_running_agent` |
+| A change nobody can see afterwards | Every change of `[share]` is a `share_set` entry in the ledger when the new policy starts | `a_change_is_noted_once_in_the_ledger` |
 
 ## Not covered
 
