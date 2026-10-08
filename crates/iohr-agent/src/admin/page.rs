@@ -813,6 +813,19 @@ pub(super) fn never(ctx: &Context) -> Vec<(String, &'static str)> {
     if !p.work.checks {
         out.push(("Run any check.".into(), "[work] checks = false"));
     }
+    let sh = p.share();
+    if sh.targets != crate::policy::TargetShare::Full {
+        out.push((
+            "Tell the platform a declared check's URL, host or address (except a refusal the platform itself must make).".into(),
+            if sh.targets == crate::policy::TargetShare::Hash { "[share] targets = \"hash\"" } else { "[share] targets = \"label\"" },
+        ));
+    }
+    if !sh.hostname {
+        out.push((
+            "Tell the platform this machine's host name.".into(),
+            "[share] hostname = false",
+        ));
+    }
     if !p.work.load {
         out.push(("Generate load.".into(), "[work] load = false"));
     }
@@ -859,6 +872,61 @@ pub(super) fn never(ctx: &Context) -> Vec<(String, &'static str)> {
     out
 }
 
+/// `[share]`: what the hello tells the platform, level by level, and check by check.
+fn share(ctx: &Context, h: &mut String) {
+    use crate::policy::TargetShare;
+    let sh = ctx.policy.share();
+    let explicit = ctx.policy.share.is_some();
+    let level = |l: TargetShare| match l {
+        TargetShare::Full => "the target itself (URL, or host and port)",
+        TargetShare::Hash => "a label and a keyed hash of the target; the target stays here",
+        TargetShare::Label => "a label only; nothing derived from the target leaves",
+    };
+    let _ = write!(
+        h,
+        "<h2>What the platform is told</h2><p class=lede>Chosen in this policy's <code>[share]</code>{}. Whatever the level, every message that leaves is in the <a href=/ledger>ledger</a>.</p><div class=grid><div class=card><h3>Check targets</h3><div class=stat>{}</div><p class=muted>{}</p></div><div class=card><h3>Host name</h3><div class=stat>{}</div><p class=muted>{}</p></div><div class=card><h3>Metadata</h3><div class=stat>agent.toml</div><p class=muted>The reported part of agent.toml's [metadata] (site, country, owner team, data classes, trust domain), only what devops wrote there; <code>[metadata] report = false</code> sends none.</p></div></div>",
+        if explicit {
+            ""
+        } else {
+            " (not set, so the defaults)"
+        },
+        sh.targets.as_str(),
+        level(sh.targets),
+        if sh.hostname { "shared" } else { "kept here" },
+        if sh.hostname {
+            format!(
+                "The hello carries this machine's host name, {}.",
+                esc(&crate::host::sysfs::host_name())
+            )
+        } else {
+            "The console shows the agent's name instead.".into()
+        },
+    );
+    let Some(declared) = &ctx.checks else {
+        return;
+    };
+    h.push_str("<div class=scroll><table class=t><tr><th>Check</th><th>Shown as</th><th>The platform gets</th></tr>");
+    for c in &declared.entries {
+        let l = crate::share::level_for(c, sh.targets);
+        let gets = match l {
+            TargetShare::Full if l != sh.targets => format!(
+                "{} <span class=muted>(a refusal the platform must make needs its target)</span>",
+                esc(&target_text(&c.spec.target))
+            ),
+            TargetShare::Full => esc(&target_text(&c.spec.target)),
+            TargetShare::Hash => "a keyed hash; the target stays on this agent".into(),
+            TargetShare::Label => "the label only; the target stays on this agent".into(),
+        };
+        let _ = write!(
+            h,
+            "<tr><td>{}</td><td>{}</td><td>{gets}</td></tr>",
+            esc(&c.key),
+            esc(crate::share::label(c))
+        );
+    }
+    h.push_str("</table></div>");
+}
+
 fn list(items: &[String]) -> String {
     if items.is_empty() {
         return "<span class=muted>none</span>".into();
@@ -891,6 +959,7 @@ fn policy(ctx: &Context) -> String {
             ("Environment", esc(&p.environment)),
         ])
     );
+    share(ctx, &mut h);
     h.push_str("<h2>What this agent can never do</h2><div class=card><ul class=\"list never\">");
     for (what, why) in never(ctx) {
         let _ = write!(
@@ -1389,6 +1458,7 @@ fn api(ctx: &Context, s: &Snapshot, name: &str) -> Value {
             "path": s.policy.path,
             "hash": s.policy.hash,
             "policy": serde_json::to_value(&*ctx.policy).unwrap_or_default(),
+            "share": ctx.policy.share(),
             "never": never(ctx).into_iter().map(|(what, why)| json!({"what": what, "because": why})).collect::<Vec<_>>(),
         }),
         "ledger" => match &ctx.ledger {

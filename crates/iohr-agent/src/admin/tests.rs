@@ -451,6 +451,14 @@ fn never_lists_what_the_policy_turns_off() {
         all.contains("journalctl") || all.contains("sensors"),
         "{all}"
     );
+    assert!(
+        all.contains("host name. ([share] hostname = false)"),
+        "{all}"
+    );
+    assert!(all.contains("[share] targets = \"hash\""), "{all}");
+    let page = render_all(&ctx);
+    assert!(page.contains("What the platform is told"));
+    assert!(page.contains("a keyed hash; the target stays on this agent"));
 }
 
 /// Shapes of secrets that could reach the agent's memory: a bearer token, a password in

@@ -207,12 +207,14 @@ async fn once(agent: &Arc<Agent>, shutdown: &mut watch::Receiver<bool>) -> Resul
         capabilities,
         domains: agent.policy.domains.bound.clone(),
         agent_time: now_utc_seconds(),
-        checks_hash: agent.checks.as_ref().map(|c| c.hash.clone()),
-        checks: agent
-            .checks
-            .as_ref()
-            .map(crate::checks_file::DeclaredChecks::wire),
+        checks_hash: agent.shared_checks.as_ref().map(|(_, h)| h.clone()),
+        checks: agent.shared_checks.as_ref().map(|(w, _)| w.clone()),
         metadata: agent.config.metadata.reported().map(Box::new),
+        hostname: agent
+            .policy
+            .share()
+            .hostname
+            .then(crate::host::sysfs::host_name),
     };
     send(agent, &mut sink, &hello, "contract.hello", None).await?;
 
@@ -279,7 +281,8 @@ async fn once(agent: &Arc<Agent>, shutdown: &mut watch::Receiver<bool>) -> Resul
                     .map_err(|e| Error::Session(format!("send failed: {e}")))?;
                 agent.state.ping();
             }
-            Some(done) = rx.recv() => {
+            Some(mut done) = rx.recv() => {
+                agent.executor.prepare_for_platform(&mut done);
                 running.remove(&done.result.job_id);
                 agent.state.job_finished();
                 let status = done.result.status;
@@ -301,7 +304,8 @@ async fn once(agent: &Arc<Agent>, shutdown: &mut watch::Receiver<bool>) -> Resul
                             agent.state.job_received();
                             match agent.executor.admit(&job) {
                                 Admission::Refuse(reason) => {
-                                    let done = Executor::refused(&job, reason);
+                                    let mut done = Executor::refused(&job, reason);
+                                    agent.executor.prepare_for_platform(&mut done);
                                     let status = done.result.status;
                                     let id = done.result.job_id.clone();
                                     send(agent, &mut sink, &AgentFrame::Result(done.result), "contract.refusal", Some(&id)).await?;

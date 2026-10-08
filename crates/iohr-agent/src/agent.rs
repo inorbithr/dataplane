@@ -121,6 +121,8 @@ pub struct Agent {
     pub ledger: Option<Arc<crate::ledger::Ledger>>,
     /// Where session frames go (`wss://…/v1/agents/session`), for the ledger.
     pub session_destination: String,
+    /// The declared checks as the hello carries them under `[share]`, and their hash.
+    pub shared_checks: Option<(Vec<serde_json::Value>, String)>,
 }
 
 impl Agent {
@@ -128,6 +130,7 @@ impl Agent {
     ///
     /// # Errors
     /// When they disagree, or TLS cannot be set up.
+    #[allow(clippy::too_many_lines)] // one check after another, then the parts
     pub fn new(
         config: AgentConfig,
         policy: Policy,
@@ -189,6 +192,20 @@ impl Agent {
         let tokens = TokenSource::new(http, Arc::clone(&enrollment), Arc::new(key))
             .with_ledger(ledger.clone());
         let secrets = SecretResolver::new(config.secrets.clone(), tls.clone());
+        let share = policy.share();
+        let share_key = crate::share::key(&config.state_dir)?;
+        let shared_checks = checks.as_ref().map(|c| {
+            let wire: Vec<serde_json::Value> = c
+                .entries
+                .iter()
+                .map(|e| crate::share::wire(e, share.targets, &share_key))
+                .collect();
+            let hash = crate::ledger::sha256_hex(
+                crate::checks_file::canonical_json(&serde_json::Value::Array(wire.clone()))
+                    .as_bytes(),
+            );
+            (wire, hash)
+        });
         let host = policy.host().map(|h| {
             Arc::new(std::sync::Mutex::new(crate::host::sampler::Sampler::new(
                 crate::host::sysfs::Root::host(),
@@ -198,7 +215,8 @@ impl Agent {
         let executor = Arc::new(
             Executor::new(Arc::clone(&policy), tls.clone(), secrets)
                 .with_checks(checks.clone().map(Arc::new))
-                .with_host(host.clone()),
+                .with_host(host.clone())
+                .with_share(share.targets, share_key),
         );
         let state = Arc::new(AgentState::new(
             AgentInfo {
@@ -214,7 +232,7 @@ impl Agent {
                 domains: policy.domains.bound.clone(),
                 capabilities: executor.capabilities(),
                 checks_path: config.checks.display().to_string(),
-                checks_hash: checks.as_ref().map(|c| c.hash.clone()),
+                checks_hash: shared_checks.as_ref().map(|(_, h)| h.clone()),
                 checks: checks.as_ref().map_or(0, |c| c.entries.len()),
             },
             how_to_stop(),
@@ -233,6 +251,7 @@ impl Agent {
             host,
             ledger,
             session_destination,
+            shared_checks,
         })
     }
 

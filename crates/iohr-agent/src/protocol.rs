@@ -30,6 +30,10 @@ pub enum AgentFrame {
         /// what binds it. Absent when nothing is set or `metadata.report = false`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         metadata: Option<Box<crate::metadata::Reported>>,
+        /// This machine's host name, only when the policy says `[share] hostname = true`
+        /// (RFC 0100 D11: off by default; the console shows the agent's name).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hostname: Option<String>,
     },
     /// Keep-alive.
     Heartbeat {
@@ -157,6 +161,7 @@ mod tests {
             checks_hash: None,
             checks: None,
             metadata: None,
+            hostname: None,
         };
         assert_eq!(
             serde_json::to_value(&hello).unwrap(),
@@ -173,6 +178,7 @@ mod tests {
             checks_hash: Some("sha256:11".into()),
             checks: Some(vec![]),
             metadata: None,
+            hostname: None,
         };
         let v = serde_json::to_value(&hello).unwrap();
         assert_eq!(v["checks_hash"], "sha256:11");

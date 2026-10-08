@@ -80,6 +80,7 @@ Unknown keys are errors, so a typo never silently changes what is checked.
 | `auth` | no | A secret reference (`env:NAME`, `file:/path`, `k8s:ns/name#key`, `vault:path#key`) sent as the `authorization` header of every surface but `tcp` and `tls` (on `ws` and `mqtt`, of the WebSocket upgrade; on `grpc`, as metadata). Never a value; the policy's `[secrets] allow` must permit it. |
 | `auth_scheme` | no | A word put before the secret's value, `"Bearer"`; without it the value is sent as it is. Stays on this machine. |
 | `category` | no | One of `availability`, `transport`, `contract`, `security`, `performance`, `synthetic`; the monitor's category. |
+| `label` | no | What the console calls the check when its target is not shared (`[share] targets` in the policy, the default); 1 to 128 characters. Default: the name. |
 | `tags` | no | Up to 10 labels, `{ transport = "ws" }`: keys `^[a-z][a-z0-9_.-]{0,31}$`, values `^[A-Za-z0-9_.:/-]{1,64}$`. They leave the machine with the check; never put customer data in them. |
 | `rfc` | no | The platform RFC this check proves (`"0029"`, `"0040.1"`); the RFC's page then shows "proved since". |
 | `by` | `[[refuse]]` | Who must refuse: `"policy"` or `"platform"`. Leave it out and give `expect` for a refusal the target answers. |
@@ -248,9 +249,16 @@ The normalized form of the example above starts:
 `kind` is `check` or `refuse`; `refuse_by` is `policy`, `platform` or `answer` (a refusal
 given with `expect`).
 
-So the targets and names you declare leave the machine: full URLs (path and query
-included), host names and ports, secret *references*, RFC numbers, categories and tags.
-A transport check's request (method, params, query, topic, tool, body, headers) and
+Every entry also carries `label` and `target_shared`. That example is the policy's
+`[share] targets = "full"`. By default (`"hash"`) an entry leaves without `target` and
+`auth`, with `target_hash` (`hmac-sha256:…`, keyed on this machine) and, when it reads a
+secret, `uses_secret: true`; with `"label"`, without the hash too
+([policy.md](policy.md#share)). `checks_hash` is over the entries exactly as sent.
+
+So at `"full"` the targets and names you declare leave the machine: full URLs (path and
+query included), host names and ports, secret *references*, RFC numbers, categories and
+tags. At the default only names, labels, keyed hashes, schedules, expectations, RFC
+numbers, categories and tags do. A transport check's request (method, params, query, topic, tool, body, headers) and
 `auth_scheme` do not. Secret values never
 do; neither do results beyond what any job reports. The platform answers what it accepted
 and why it rejected the rest; the agent's page in the console shows both.

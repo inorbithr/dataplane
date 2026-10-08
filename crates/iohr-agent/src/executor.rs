@@ -34,6 +34,8 @@ pub struct Executor {
     /// When each hwmon check last ran (sampler milliseconds): the next run judges the
     /// window since then, so a spike between runs is not missed.
     host_runs: Mutex<std::collections::HashMap<String, u64>>,
+    /// `[share] targets`, and the key target hashes are made with.
+    share: (crate::policy::TargetShare, Vec<u8>),
     slots: Arc<Semaphore>,
     window: Mutex<VecDeque<Instant>>,
     jobs: Counter<u64>,
@@ -81,6 +83,7 @@ impl Executor {
             checks: None,
             host: None,
             host_runs: Mutex::new(std::collections::HashMap::new()),
+            share: (crate::policy::TargetShare::Full, Vec::new()),
             slots,
             window: Mutex::new(VecDeque::new()),
             jobs: meter
@@ -100,6 +103,74 @@ impl Executor {
     pub fn with_checks(mut self, checks: Option<Arc<DeclaredChecks>>) -> Self {
         self.checks = checks;
         self
+    }
+
+    /// How much of a declared check's target the platform knows: below `full`, a job
+    /// names the check by its key (and may carry its `target_hash`); the target comes
+    /// from `checks.toml`, and refusal reasons leave without it.
+    #[must_use]
+    pub fn with_share(mut self, level: crate::policy::TargetShare, key: Vec<u8>) -> Self {
+        self.share = (level, key);
+        self
+    }
+
+    /// The declared check a job names, when its target is not shared with the platform.
+    fn hidden_entry(&self, job: &Job) -> Option<&crate::checks_file::DeclaredCheck> {
+        let key = job.spec.get("key")?.as_str()?;
+        let entry = self
+            .checks
+            .as_ref()?
+            .entries
+            .iter()
+            .find(|e| e.key == key)?;
+        (crate::share::level_for(entry, self.share.0) != crate::policy::TargetShare::Full)
+            .then_some(entry)
+    }
+
+    /// A job for a declared check whose target the platform does not know names it by key:
+    /// its target is filled in from `checks.toml`. A `target_hash` it carries must match.
+    fn fill_target(&self, job: &Job) -> Result<serde_json::Value, String> {
+        let mut spec = job.spec.clone();
+        let Some(entry) = self.hidden_entry(job) else {
+            return Ok(spec);
+        };
+        if let Some(h) = spec.get("target_hash").and_then(|h| h.as_str())
+            && h != crate::share::target_hash(entry, &self.share.1)
+        {
+            return Err(format!(
+                "the job's target_hash does not match the declared check {:?}",
+                entry.key
+            ));
+        }
+        if let Some(o) = spec.as_object_mut() {
+            o.remove("target_hash");
+            if !o.contains_key("target") {
+                o.insert("target".into(), entry.to_wire()["target"].clone());
+            }
+        }
+        Ok(spec)
+    }
+
+    /// What a refusal tells the platform: without the target when it is not shared.
+    #[must_use]
+    pub fn reason_for_platform(&self, key: Option<&str>, reason: &str) -> String {
+        let entry = key.and_then(|k| self.checks.as_ref()?.entries.iter().find(|e| e.key == k));
+        match entry {
+            Some(e)
+                if crate::share::level_for(e, self.share.0) != crate::policy::TargetShare::Full =>
+            {
+                crate::share::scrub(reason, e)
+            }
+            _ => reason.to_owned(),
+        }
+    }
+
+    /// Takes the target out of a result's refusal reason before it leaves, when the
+    /// policy does not share it. The local page keeps the full reason.
+    pub fn prepare_for_platform(&self, done: &mut Finished) {
+        if let Some(r) = &mut done.result.refusal {
+            r.reason = self.reason_for_platform(done.record.key.as_deref(), &r.reason);
+        }
     }
 
     /// The host sampler `hwmon` checks are judged on.
@@ -189,7 +260,11 @@ impl Executor {
                 "checks are not enabled by the local policy ([work] checks = false)".into(),
             );
         }
-        let mut spec: CheckSpec = match serde_json::from_value(job.spec.clone()) {
+        let filled = match self.fill_target(job) {
+            Ok(s) => s,
+            Err(reason) => return Admission::Refuse(reason),
+        };
+        let mut spec: CheckSpec = match serde_json::from_value(filled) {
             Ok(s) => s,
             Err(e) => {
                 return Admission::Refuse(format!(

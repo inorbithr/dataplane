@@ -113,7 +113,7 @@ async fn enroll_token_session_job_result() {
 
 #[tokio::test]
 async fn hello_declares_the_checks_file() {
-    let mut h = harness(KeyAlg::Es256).await;
+    let mut h = harness_with(KeyAlg::Es256, "[share]\ntargets = \"full\"\n").await;
     std::fs::write(
         &h.cfg.checks,
         r#"
@@ -143,7 +143,12 @@ every = "5m"
     let (agent, stop, task) = start(&h).await;
 
     let (_, hello) = next(&mut h.frames, "hello").await;
-    assert_eq!(hello["checks_hash"], declared.hash.as_str());
+    // The hash is over the checks exactly as sent.
+    let sent_hash = iohr_agent::ledger::sha256_hex(
+        iohr_agent::checks_file::canonical_json(&hello["checks"]).as_bytes(),
+    );
+    assert_eq!(hello["checks_hash"], sent_hash.as_str());
+    assert_eq!(declared.entries.len(), 3);
     assert!(
         hello["checks_hash"]
             .as_str()
@@ -160,22 +165,22 @@ every = "5m"
             {"key": "api", "kind": "check", "surface": "http",
              "target": {"url": "https://api.example.com/healthz"},
              "every_secs": 60, "fail_after": 2,
-             "expect": {"status": 200, "max_ms": 2000}, "rfc": "0029"},
+             "expect": {"status": 200, "max_ms": 2000}, "rfc": "0029",
+             "label": "api", "target_shared": "full"},
             {"key": "private-is-refused", "kind": "refuse", "refuse_by": "policy",
              "surface": "http", "target": {"url": "https://db.internal/"},
-             "every_secs": 300, "fail_after": 1},
+             "every_secs": 300, "fail_after": 1,
+             "label": "private-is-refused", "target_shared": "full"},
             {"key": "api-needs-a-token", "kind": "refuse", "refuse_by": "answer",
              "surface": "http", "target": {"url": "https://api.example.com/v1/me"},
-             "every_secs": 300, "fail_after": 1, "expect": {"status": 401}}
+             "every_secs": 300, "fail_after": 1, "expect": {"status": 401},
+             "label": "api-needs-a-token", "target_shared": "full"}
         ])
     );
     assert!(hello["agent_time"].as_str().unwrap().ends_with('Z'));
     let snap = agent.state.snapshot();
     assert_eq!(snap.policy.checks, 3);
-    assert_eq!(
-        snap.policy.checks_hash.as_deref(),
-        Some(declared.hash.as_str())
-    );
+    assert_eq!(snap.policy.checks_hash.as_deref(), Some(sent_hash.as_str()));
 
     // A job for a declared check is an ordinary job: the policy still decides.
     h.cmds
@@ -430,7 +435,7 @@ async fn start_on_fixture(
 async fn an_hwmon_check_runs_from_the_sampler_and_survives_a_restart() {
     let mut h = harness_with(
         KeyAlg::Es256,
-        "[work]\nhost = true\nsurfaces = [\"http\", \"hwmon\"]\n[host]\nsample_secs = 5\nwindow_secs = 60\n",
+        "[work]\nhost = true\nsurfaces = [\"http\", \"hwmon\"]\n[host]\nsample_secs = 5\nwindow_secs = 60\n[share]\ntargets = \"full\"\n",
     )
     .await;
     std::fs::write(
@@ -573,4 +578,109 @@ async fn every_upstream_frame_has_a_ledger_entry() {
     let (seq, head) = agent.ledger.as_ref().unwrap().head();
     assert_eq!(Some(seq), v.last_seq);
     assert_eq!(Some(head), v.head);
+}
+
+/// RFC 0100 D11 and D13: the hello carries only what `[share]` allows, at every level;
+/// a job names a hidden check by its key; a refusal leaves without the target; and the
+/// ledger records the hello that left.
+#[tokio::test]
+async fn the_hello_shares_only_what_the_policy_allows() {
+    let web = http_target().await;
+    for (share, level) in [
+        ("", "hash"),
+        ("[share]\ntargets = \"hash\"\n", "hash"),
+        ("[share]\ntargets = \"label\"\n", "label"),
+        ("[share]\ntargets = \"full\"\nhostname = true\n", "full"),
+    ] {
+        let mut h = harness_with(KeyAlg::Es256, share).await;
+        std::fs::write(
+            &h.cfg.checks,
+            format!(
+                r#"
+[[check]]
+name = "web"
+label = "the web tier"
+target = "http://{web}/healthz"
+every = "60s"
+
+[[refuse]]
+name = "orders-db-closed"
+surface = "tcp"
+target = "10.9.8.7:5432"
+by = "policy"
+every = "5m"
+"#
+            ),
+        )
+        .unwrap();
+        let (_agent, stop, task) = start(&h).await;
+        let (_, hello) = next(&mut h.frames, "hello").await;
+        let raw = h.fake.raw.lock().unwrap()[0].clone();
+        let hidden = level != "full";
+        assert_eq!(raw.contains(&web.to_string()), !hidden, "{level}: {raw}");
+        assert_eq!(raw.contains("10.9.8.7"), !hidden, "{level}: {raw}");
+        assert_eq!(
+            raw.contains("hmac-sha256:"),
+            level == "hash",
+            "{level}: {raw}"
+        );
+        assert_eq!(hello["checks"][0]["label"], "the web tier");
+        assert_eq!(hello["checks"][0]["target_shared"], level);
+        assert_eq!(hello.get("hostname").is_some(), level == "full", "{level}");
+        if level == "full" {
+            assert_eq!(hello["hostname"], iohr_agent::host::sysfs::host_name());
+        }
+
+        // A job by key alone: the target comes from checks.toml.
+        let mut spec = json!({"surface": "http", "key": "web"});
+        if level == "hash" {
+            spec["target_hash"] = hello["checks"][0]["target_hash"].clone();
+        }
+        if level == "full" {
+            spec["target"] = json!({"url": format!("http://{web}/healthz")});
+        }
+        h.cmds.send(job("j-web", "check", spec)).ok();
+        let r = results(&mut h.frames, 1).await;
+        assert_eq!(r["j-web"]["status"], "ok", "{level}: {}", r["j-web"]);
+        if level == "hash" {
+            // A hash that is not this check's is refused.
+            h.cmds
+                .send(job(
+                    "j-forged",
+                    "check",
+                    json!({"surface": "http", "key": "web", "target_hash": "hmac-sha256:00"}),
+                ))
+                .ok();
+            let r = results(&mut h.frames, 1).await;
+            assert_eq!(r["j-forged"]["status"], "refused");
+        }
+        // A refusal by policy leaves without the address the policy refused.
+        let mut spec = json!({"surface": "tcp", "key": "orders-db-closed"});
+        if level == "full" {
+            spec["target"] = json!({"host": "10.9.8.7", "port": 5432});
+        }
+        h.cmds.send(job("j-db", "check", spec)).ok();
+        let r = results(&mut h.frames, 1).await;
+        assert_eq!(r["j-db"]["status"], "refused", "{level}: {}", r["j-db"]);
+        let reason = r["j-db"]["refusal"]["reason"].as_str().unwrap().to_owned();
+        assert_eq!(reason.contains("10.9.8.7"), !hidden, "{level}: {reason}");
+
+        stop.send(true).unwrap();
+        task.await.unwrap().unwrap();
+        // The ledger recorded the hello exactly as it left.
+        let dir = iohr_agent::ledger::dir_in(&h.cfg.state_dir);
+        let mut out = Vec::new();
+        iohr_agent::ledger::export(&dir, &mut out).unwrap();
+        let hello_entry: iohr_agent::ledger::Entry = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<iohr_agent::ledger::Entry>(l).unwrap())
+            .find(|e| e.kind == "hello")
+            .unwrap();
+        assert_eq!(
+            hello_entry.sha256,
+            iohr_agent::ledger::sha256_hex(raw.as_bytes())
+        );
+        assert!(iohr_agent::ledger::verify(&dir).ok());
+    }
 }
