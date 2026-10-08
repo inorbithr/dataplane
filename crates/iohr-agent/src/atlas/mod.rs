@@ -8,6 +8,7 @@
 
 pub mod common;
 pub mod docs;
+pub mod host;
 pub mod k8s;
 pub mod kube;
 pub mod record;
@@ -36,6 +37,23 @@ pub struct ObserveRequest {
     pub kube_context: Option<String>,
     /// The namespaces to read (default: the context's, else `default`).
     pub namespaces: Vec<String>,
+    /// Read this host (needs a policy with `[work] host = true`).
+    pub host: Option<HostRequest>,
+}
+
+/// How to read the host.
+#[derive(Debug, Clone)]
+pub struct HostRequest {
+    /// A captured tree instead of `/` (tests, replays).
+    pub root: Option<PathBuf>,
+    /// `pci.ids` to name devices with (default: the host's).
+    pub pci_ids: Option<PathBuf>,
+    /// Samples to take (1: one reading; more: rates, peaks, correlations).
+    pub samples: u32,
+    /// Between samples.
+    pub interval: std::time::Duration,
+    /// The chipset threshold for the derived findings, milli-degrees.
+    pub chipset_warn: i64,
 }
 
 /// What a run found: counts only.
@@ -51,6 +69,8 @@ pub struct Summary {
     pub repository: Option<repo::Found>,
     /// Components in the manifest, and how many are known at a revision.
     pub components: Option<(usize, usize)>,
+    /// A human report of the host reading.
+    pub host_report: Option<String>,
 }
 
 /// Runs the observers and returns the records with a summary. A cluster is read only
@@ -59,12 +79,31 @@ pub struct Summary {
 /// # Errors
 /// Nothing to observe, a cluster asked for without a policy, the policy's refusal, or
 /// any read or record failure.
+#[allow(clippy::too_many_lines)] // repository, host, cluster, in order
 pub async fn observe(req: &ObserveRequest, policy: Option<&Policy>) -> Result<(Sink, Summary)> {
-    if req.repo.is_none() && req.kubeconfig.is_none() {
+    if req.repo.is_none() && req.kubeconfig.is_none() && req.host.is_none() {
         return Err(Error::Atlas(
-            "nothing to observe: pass --repo and/or --kubeconfig".into(),
+            "nothing to observe: pass host, --repo and/or --kubeconfig".into(),
         ));
     }
+    let host_policy = match &req.host {
+        None => None,
+        Some(_) => Some(
+            policy
+                .ok_or_else(|| {
+                    Error::Policy(
+                        "reading the host needs a policy: pass --policy or name one in agent.toml"
+                            .into(),
+                    )
+                })?
+                .host()
+                .ok_or_else(|| {
+                    Error::Policy(
+                        "the policy does not allow host observation ([work] host = true)".into(),
+                    )
+                })?,
+        ),
+    };
     let clock = ObservedNow::now();
     let mut sink = Sink::default();
     let mut summary = Summary::default();
@@ -99,7 +138,25 @@ pub async fn observe(req: &ObserveRequest, policy: Option<&Policy>) -> Result<(S
             namespaces: namespaces.clone(),
         }),
         docs: Vec::new(),
+        host: None,
     }));
+
+    if let (Some(h), Some(hp)) = (&req.host, &host_policy) {
+        let (snap, window) = read_host(h, hp).await?;
+        if let Some(Record::Run(run)) = sink.records().first().cloned() {
+            let mut run = run;
+            run.host = Some(record::HostRef {
+                name: snap.host.clone(),
+                boot_id: snap.boot.boot_id.clone(),
+                kernel: snap.kernel.clone(),
+                samples: h.samples,
+                interval_secs: h.interval.as_secs(),
+            });
+            sink.replace_first(Record::Run(run));
+        }
+        let findings = host::observe(&snap, window.as_ref(), h.chipset_warn, &mut sink, &clock)?;
+        summary.host_report = Some(crate::host::report::text(&snap, &findings, window.as_ref()));
+    }
 
     if let Some(r) = &repository {
         summary.repository = Some(repo::observe(r, &mut sink, &clock)?);
@@ -144,6 +201,38 @@ pub async fn observe(req: &ObserveRequest, policy: Option<&Policy>) -> Result<(S
         .count();
     summary.per_method = sink.per_method();
     Ok((sink, summary))
+}
+
+async fn read_host(
+    h: &HostRequest,
+    hp: &crate::policy::HostPolicy,
+) -> Result<(crate::host::Snapshot, Option<crate::host::sampler::Sampler>)> {
+    use crate::host::{Options, sampler::Sampler, snapshot, sysfs::Root};
+    let root = h.root.as_deref().map_or_else(Root::host, Root::at);
+    let ids = match &h.pci_ids {
+        Some(p) => Some(std::fs::read_to_string(p).map_err(|e| Error::io(p, e))?),
+        None => None,
+    };
+    let samples = h.samples.max(1);
+    let window = if samples > 1 {
+        let span = h.interval * (samples + 1);
+        let mut w = Sampler::new(root.clone(), span);
+        for i in 0..samples {
+            if i > 0 {
+                tokio::time::sleep(h.interval).await;
+            }
+            w.tick();
+        }
+        Some(w)
+    } else {
+        None
+    };
+    let snap = snapshot(&Options {
+        root,
+        journal: hp.journal,
+        ids,
+    });
+    Ok((snap, window))
 }
 
 #[cfg(test)]

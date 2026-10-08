@@ -54,6 +54,7 @@ pub(super) async fn check(tls: &TlsContext, p: &Prepared<'_>) -> CheckDetail {
         status_code: Some(101),
         error_class: outcome.err(),
         tls_expires_at: expires,
+        reading: None,
     }
 }
 

@@ -50,11 +50,14 @@ pub enum Surface {
     Mcp,
     /// A GraphQL query over `POST`; no `errors`.
     Graphql,
+    /// A hardware sensor on this host against thresholds in `checks.toml` (needs
+    /// `[work] host`); reports the reading and a level, nothing else.
+    Hwmon,
 }
 
 impl Surface {
     /// Every surface this version can check.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Http,
         Self::Tcp,
         Self::Tls,
@@ -65,6 +68,7 @@ impl Surface {
         Self::Mqtt,
         Self::Mcp,
         Self::Graphql,
+        Self::Hwmon,
     ];
 
     /// The surfaces on when the policy names none. The transport surfaces read an answer
@@ -85,6 +89,7 @@ impl Surface {
             Self::Mqtt => "mqtt",
             Self::Mcp => "mcp",
             Self::Graphql => "graphql",
+            Self::Hwmon => "hwmon",
         }
     }
 
@@ -101,13 +106,19 @@ impl Surface {
     /// `checks.toml`, never in a job.
     #[must_use]
     pub fn needs_declared(self) -> bool {
-        matches!(self, Self::Grpc | Self::Ws | Self::Mqtt)
+        matches!(self, Self::Grpc | Self::Ws | Self::Mqtt | Self::Hwmon)
+    }
+
+    /// Reads this host, never the network.
+    #[must_use]
+    pub fn is_host(self) -> bool {
+        matches!(self, Self::Hwmon)
     }
 
     /// Sends a credential when the check names one (everything but `tcp` and `tls`).
     #[must_use]
     pub fn takes_auth(self) -> bool {
-        !matches!(self, Self::Tcp | Self::Tls)
+        !matches!(self, Self::Tcp | Self::Tls | Self::Hwmon)
     }
 
     /// Has an HTTP status to expect.
@@ -178,6 +189,8 @@ pub struct Params {
     pub min_tools: Option<u32>,
     /// `mcp`: one tool to call.
     pub tool: Option<String>,
+    /// `hwmon`: the sensor's thresholds.
+    pub hwmon: Option<crate::host::check::HwmonSpec>,
     /// `mcp`: call a tool that is not annotated read-only.
     pub allow_side_effects: bool,
     /// `ws`, `mqtt`: the error code the call must end with (a refusal check).
@@ -186,10 +199,15 @@ pub struct Params {
     pub expect_code: Option<u32>,
 }
 
-/// A target: a URL, or a host and port.
+/// A target: a URL, a host and port, or (for `hwmon`) a sensor on this host.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum Target {
+    /// `{"sensor": "asusec/Chipset"}`.
+    Sensor {
+        /// `chip/label` or `chip/kind/label`.
+        sensor: String,
+    },
     /// `{"url": "https://api.internal/healthz"}`.
     Url {
         /// The URL.
@@ -279,6 +297,10 @@ pub enum ErrorClass {
     Dns,
     /// It answered with the wrong status.
     Status,
+    /// A sensor reading is at or past its critical threshold (or rate).
+    Threshold,
+    /// The sensor is not on this host, or has no reading yet.
+    Sensor,
     /// The local policy refused it.
     RefusedByPolicy,
     /// A transport answered, but not in the shape the check expects: a GraphQL `errors`,
@@ -302,6 +324,9 @@ pub struct CheckDetail {
     /// The leaf certificate's `notAfter`, RFC 3339.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls_expires_at: Option<String>,
+    /// `hwmon`: the reading, its peak since the previous run, its rate and its level.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reading: Option<crate::host::check::Reading>,
 }
 
 impl CheckDetail {
@@ -348,6 +373,17 @@ impl CheckSpec {
     /// A description of what is missing or wrong.
     pub fn endpoint(&self) -> Result<Endpoint, String> {
         match (&self.target, self.surface) {
+            (Target::Sensor { sensor }, Surface::Hwmon) => Ok(Endpoint {
+                host: format!("sensor:{sensor}"),
+                port: 0,
+                tls: false,
+                url: None,
+            }),
+            (Target::Sensor { .. }, s) => Err(format!(
+                "a sensor target is for hwmon checks, not {}",
+                s.as_str()
+            )),
+            (_, Surface::Hwmon) => Err("an hwmon check names a sensor target".into()),
             (Target::Url { url }, s) => {
                 let tls = match url.scheme() {
                     "https" => true,
@@ -415,6 +451,9 @@ pub async fn run(tls: &TlsContext, p: Prepared<'_>) -> Result<CheckDetail, Strin
         Surface::Mqtt => mqtt::check(tls, &p).await,
         Surface::Mcp => mcp::check(tls, &p).await?,
         Surface::Graphql => graphql::check(tls, &p).await,
+        Surface::Hwmon => {
+            return Err("an hwmon check reads the host sampler, not the network".into());
+        }
     };
     Ok(detail.apply_max_ms(&p.spec.expect))
 }
@@ -434,6 +473,7 @@ fn judged(started: Instant, status: Option<u16>, outcome: Result<(), ErrorClass>
         status_code: status,
         error_class: outcome.err(),
         tls_expires_at: None,
+        reading: None,
     }
 }
 
@@ -501,6 +541,7 @@ mod tests {
                         | Surface::Mqtt
                         | Surface::Mcp
                         | Surface::Graphql
+                        | Surface::Hwmon
                 )
             );
         }

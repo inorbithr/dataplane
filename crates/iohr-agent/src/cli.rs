@@ -125,9 +125,38 @@ pub struct AtlasDocsSyncArgs {
     pub out: Option<PathBuf>,
 }
 
+/// What `atlas observe` reads besides a checkout and a cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ObserveWhat {
+    /// This machine: sensors, PCI, storage, pressure, boots (`[work] host` in the policy).
+    Host,
+}
+
 /// `atlas observe`.
 #[derive(Debug, Args)]
 pub struct AtlasObserveArgs {
+    /// `host` reads this machine (needs `[work] host = true` in the policy).
+    #[arg(value_enum)]
+    pub what: Vec<ObserveWhat>,
+    /// host: samples to take (1 is one reading; more give rates, peaks and correlations).
+    #[arg(long, default_value_t = 1)]
+    pub samples: u32,
+    /// host: seconds between samples.
+    #[arg(long, default_value_t = 10)]
+    pub interval: u64,
+    /// host: the chipset temperature, °C, at which the derived findings call it hot
+    /// (default: the warn of an hwmon check on a `Chipset` sensor in checks.toml, else 100).
+    #[arg(long)]
+    pub chipset_warn: Option<f64>,
+    /// host: print a human report to standard error.
+    #[arg(long)]
+    pub report: bool,
+    /// host: read a captured tree instead of `/` (tests, replays).
+    #[arg(long, hide = true)]
+    pub host_root: Option<PathBuf>,
+    /// host: name PCI devices from this pci.ids (default: the host's).
+    #[arg(long, hide = true)]
+    pub pci_ids: Option<PathBuf>,
     /// A checkout to read (Cargo manifests, Kubernetes manifests, Envoy routes).
     #[arg(long)]
     pub repo: Option<PathBuf>,
@@ -419,7 +448,8 @@ async fn atlas_observe(args: &AtlasObserveArgs, config_path: &Path) -> Result<Ex
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".kube/config")))
     });
-    let policy = if kubeconfig.is_some() {
+    let wants_host = args.what.contains(&ObserveWhat::Host);
+    let policy = if kubeconfig.is_some() || wants_host {
         let path = match &args.policy {
             Some(p) => p.clone(),
             None => AgentConfig::load(config_path)?.policy,
@@ -433,6 +463,26 @@ async fn atlas_observe(args: &AtlasObserveArgs, config_path: &Path) -> Result<Ex
         kubeconfig,
         kube_context: args.kube_context.clone(),
         namespaces: args.namespaces.clone(),
+        host: if wants_host {
+            if !(1..=360).contains(&args.samples) || !(1..=300).contains(&args.interval) {
+                return Err(Error::Atlas(
+                    "--samples must be 1 to 360 and --interval 1 to 300 seconds".into(),
+                ));
+            }
+            let chipset_warn = match args.chipset_warn {
+                Some(c) => crate::host::check::to_raw(crate::host::hwmon::Kind::Temp, c),
+                None => chipset_warn_from_checks(config_path),
+            };
+            Some(crate::atlas::HostRequest {
+                root: args.host_root.clone(),
+                pci_ids: args.pci_ids.clone(),
+                samples: args.samples,
+                interval: Duration::from_secs(args.interval),
+                chipset_warn,
+            })
+        } else {
+            None
+        },
     };
     let (sink, summary) = crate::atlas::observe(&req, policy.as_ref()).await?;
     match &args.out {
@@ -459,7 +509,30 @@ async fn atlas_observe(args: &AtlasObserveArgs, config_path: &Path) -> Result<Ex
             "  manifest: {all} deployments, {known} known at a revision"
         );
     }
+    if args.report
+        && let Some(r) = &summary.host_report
+    {
+        let _ = writeln!(err, "\n{r}");
+    }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The warn of an hwmon check on a `Chipset` temperature in checks.toml, else RFC 0094's
+/// 100 °C.
+fn chipset_warn_from_checks(config_path: &Path) -> i64 {
+    let path = AgentConfig::load(config_path).map(|c| c.checks).ok();
+    path.and_then(|p| DeclaredChecks::load(&p).ok().flatten())
+        .and_then(|c| {
+            c.entries.iter().find_map(|e| {
+                let h = e.spec.params.hwmon.as_ref()?;
+                (h.sensor.kind == crate::host::hwmon::Kind::Temp
+                    && h.sensor.label.eq_ignore_ascii_case("chipset")
+                    && !h.below)
+                    .then_some(h.warn.or(h.crit))
+                    .flatten()
+            })
+        })
+        .unwrap_or(crate::host::derive::DEFAULT_CHIPSET_WARN)
 }
 
 async fn atlas_docs_sync(args: &AtlasDocsSyncArgs, config_path: &Path) -> Result<ExitCode> {
@@ -798,6 +871,7 @@ async fn enroll_cmd(args: &EnrollArgs, config_path: &Path) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+#[allow(clippy::too_many_lines)] // one line of output after another
 async fn status(args: &StatusArgs, config_path: &Path) -> Result<ExitCode> {
     let cfg = AgentConfig::load(config_path)?;
     let mut addr = cfg.admin.listen;
@@ -882,6 +956,20 @@ async fn status(args: &StatusArgs, config_path: &Path) -> Result<ExitCode> {
         out(&format!(
             "  checks       {} declared, {hash}",
             s.policy.checks
+        ));
+    }
+    if let Some(x) = &s.host {
+        out(&format!(
+            "  host         {} sensors, {} samples, last {} ({} µs){}",
+            x.sensors,
+            x.samples,
+            x.last_sample_at,
+            x.last_cost_us,
+            x.chipset_millicelsius.map_or_else(String::new, |c| format!(
+                ", chipset {}.{} °C",
+                c / 1000,
+                (c % 1000) / 100
+            ))
         ));
     }
     out(&format!("  page         http://{addr}/"));
@@ -1058,6 +1146,9 @@ async fn resolve_verdict(
     let Ok(e) = c.spec.endpoint() else {
         return offline;
     };
+    if c.spec.surface.is_host() {
+        return offline;
+    }
     let by_policy = c.kind == Kind::Refuse && c.refuse_by == Some(RefuseBy::Policy);
     let by_platform = c.refuse_by == Some(RefuseBy::Platform);
     if by_platform || matches!(offline, Verdict::Error(_)) {

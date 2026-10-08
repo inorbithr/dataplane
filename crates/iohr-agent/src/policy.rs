@@ -48,6 +48,10 @@ pub struct Policy {
     /// Left out of the hashed form while absent, so policies without it keep their hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture: Option<CapturePolicy>,
+    /// How the host observers read this machine (`[work] host` turns them on). Left out
+    /// of the hashed form while absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<HostPolicy>,
     #[serde(skip)]
     compiled: Compiled,
 }
@@ -118,6 +122,45 @@ pub struct Work {
     /// (`capture:*` in the hello). Off by default; left out of the hashed form while off.
     #[serde(default, skip_serializing_if = "is_false")]
     pub capture: bool,
+    /// Observe this host (`atlas observe host`, the `hwmon` check surface and its
+    /// sampler): sensors, PCI, storage, pressure and boots, read-only. Off by default;
+    /// left out of the hashed form while off.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub host: bool,
+}
+
+/// `[host]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostPolicy {
+    /// Run `journalctl --list-boots` (and read each earlier boot's last entries) to tell
+    /// which boots ended without a shutdown record. The only program the host observers
+    /// ever run. Off by default.
+    #[serde(default)]
+    pub journal: bool,
+    /// Seconds between sensor samples while the agent runs (5 to 300).
+    #[serde(default = "host_sample_secs")]
+    pub sample_secs: u64,
+    /// Seconds of samples kept for rates and peaks (60 to 3600).
+    #[serde(default = "host_window_secs")]
+    pub window_secs: u64,
+}
+
+impl Default for HostPolicy {
+    fn default() -> Self {
+        Self {
+            journal: false,
+            sample_secs: host_sample_secs(),
+            window_secs: host_window_secs(),
+        }
+    }
+}
+
+fn host_sample_secs() -> u64 {
+    10
+}
+fn host_window_secs() -> u64 {
+    900
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if passes a reference
@@ -215,6 +258,7 @@ impl Default for Work {
             faults: false,
             surfaces: all_surfaces(),
             capture: false,
+            host: false,
         }
     }
 }
@@ -415,6 +459,16 @@ impl Policy {
             }
             cap.layers = seen;
         }
+        if let Some(h) = &self.host {
+            if !(5..=300).contains(&h.sample_secs) {
+                return Err("host.sample_secs must be 5 to 300".into());
+            }
+            if !(60..=3600).contains(&h.window_secs) || h.window_secs < h.sample_secs * 2 {
+                return Err(
+                    "host.window_secs must be 60 to 3600 and hold at least two samples".into(),
+                );
+            }
+        }
         self.compiled = c;
         Ok(())
     }
@@ -454,10 +508,21 @@ impl Policy {
             .then(|| self.capture.clone().unwrap_or_default())
     }
 
-    /// Whether a surface is accepted.
+    /// The host settings in force: `Some` only when `[work] host = true` (the defaults
+    /// when there is no `[host]` section).
+    #[must_use]
+    pub fn host(&self) -> Option<HostPolicy> {
+        self.work
+            .host
+            .then(|| self.host.clone().unwrap_or_default())
+    }
+
+    /// Whether a surface is accepted. `hwmon` also needs `[work] host`.
     #[must_use]
     pub fn surface_allowed(&self, s: Surface) -> bool {
-        self.work.checks && self.work.surfaces.contains(&s)
+        self.work.checks
+            && self.work.surfaces.contains(&s)
+            && (s != Surface::Hwmon || self.work.host)
     }
 
     /// Checks an address against `networks`: deny first, then allow.

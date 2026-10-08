@@ -363,6 +363,7 @@ async fn a_checkout_and_a_cluster_give_one_linked_record_set() {
         kubeconfig: Some(kubeconfig(dir.path(), &server, TOKEN)),
         kube_context: None,
         namespaces: Vec::new(),
+        host: None,
     };
     let (sink, summary) = observe(&req, Some(&policy)).await.unwrap();
     let records = sink.records();
