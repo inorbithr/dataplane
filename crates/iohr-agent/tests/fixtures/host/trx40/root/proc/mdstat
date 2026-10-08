@@ -1,0 +1,9 @@
+Personalities : [raid0] [raid1] [linear] [raid6] [raid5] [raid4] [raid10] 
+md1 : active raid1 nvme6n1[0] nvme4n1[1]
+      1953382464 blocks super 1.2 [2/2] [UU]
+      bitmap: 5/15 pages [20KB], 65536KB chunk
+
+md0 : active raid0 nvme2n1[2] nvme3n1[3] nvme0n1[0] nvme1n1[1]
+      16002617344 blocks super 1.2 512k chunks
+      
+unused devices: <none>

@@ -1,0 +1,24 @@
+# A policy that lets the agent observe its own machine (docs/host.md) and run hwmon
+# checks (docs/checks.md#host-sensors-hwmon), next to ordinary checks. Read-only:
+# sensors, PCI, storage, pressure and boots from /sys and /proc.
+environment = "production"
+
+[domains]
+bound = ["example.com"]
+
+[networks]
+allow = ["example.com", "*.example.com"]
+
+[work]
+checks = true
+# hwmon must be listed for hwmon checks; host = true turns host observation on.
+surfaces = ["http", "tcp", "tls", "grpc_health", "hwmon"]
+host = true
+
+[host]
+# Run `journalctl --list-boots` to tell which boots ended without a shutdown record.
+# The agent's user needs journal access (group adm or systemd-journal).
+journal = true
+# Sample every sensor every 10 s; keep 15 minutes in memory for rates and peaks.
+sample_secs = 10
+window_secs = 900

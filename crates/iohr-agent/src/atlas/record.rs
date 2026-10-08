@@ -57,6 +57,24 @@ pub struct RunRecord {
     /// The documentation sources read, if any: their ids and providers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub docs: Vec<DocsSourceRef>,
+    /// The host read, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<HostRef>,
+}
+
+/// The host this run read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostRef {
+    /// Its name (`fixture` for a captured tree).
+    pub name: String,
+    /// The boot it was read in.
+    pub boot_id: Option<String>,
+    /// The kernel release.
+    pub kernel: Option<String>,
+    /// Samples taken (1 is a single reading; more give rates and correlations).
+    pub samples: u32,
+    /// Seconds between samples.
+    pub interval_secs: u64,
 }
 
 /// A documentation source this run read.
@@ -100,6 +118,13 @@ impl Sink {
     /// Adds a record.
     pub fn push(&mut self, r: Record) {
         self.records.push(r);
+    }
+
+    /// Replaces the first record (the run record, once the run knows what it read).
+    pub fn replace_first(&mut self, r: Record) {
+        if let Some(first) = self.records.first_mut() {
+            *first = r;
+        }
     }
 
     /// Puts a record first (the run record, written once the run knows what it read).
@@ -211,6 +236,7 @@ mod tests {
             }),
             cluster: None,
             docs: Vec::new(),
+            host: None,
         }));
         s.entity("deployment/tbd/labs");
         let mut out = Vec::new();

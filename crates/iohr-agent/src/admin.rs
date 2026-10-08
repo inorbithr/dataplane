@@ -365,6 +365,22 @@ table{{border-collapse:collapse;width:100%}}td,th{{text-align:left;padding:.25re
     if let Some(t) = &s.capture {
         traffic(&mut h, t);
     }
+    if let Some(x) = &s.host {
+        let _ = write!(
+            h,
+            "<h2>Host</h2><p>Sampled on this machine; only hwmon check results leave it.</p><table><tr><td>sensors</td><td>{}</td></tr><tr><td>samples in the window</td><td>{}</td></tr><tr><td>last sample</td><td>{} ({} µs; slowest {} µs)</td></tr>{}</table>",
+            x.sensors,
+            x.samples,
+            esc(&x.last_sample_at),
+            x.last_cost_us,
+            x.max_cost_us,
+            x.chipset_millicelsius.map_or_else(String::new, |c| format!(
+                "<tr><td>chipset</td><td>{}.{} °C</td></tr>",
+                c / 1000,
+                (c % 1000).abs() / 100
+            ))
+        );
+    }
     let _ = write!(
         h,
         "<h2>How to stop it</h2><p>{}</p><p><a href=/status.json>status.json</a></p></html>",

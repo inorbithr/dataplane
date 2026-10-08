@@ -147,6 +147,7 @@ impl DeclaredCheck {
         m.insert(
             "target",
             match &self.spec.target {
+                Target::Sensor { sensor } => json!({"sensor": sensor}),
                 Target::Url { url } => json!({"url": url.as_str()}),
                 Target::HostPort { host, port, tls } => match tls {
                     Some(t) => json!({"host": host, "port": port, "tls": t}),
@@ -183,6 +184,24 @@ impl DeclaredCheck {
         }
         if !self.tags.is_empty() {
             m.insert("tags", json!(self.tags));
+        }
+        if let Some(h) = &self.spec.params.hwmon {
+            let mut t = serde_json::Map::new();
+            t.insert("unit".into(), json!(h.sensor.kind.unit()));
+            for (k, v) in [
+                ("warn", h.warn),
+                ("crit", h.crit),
+                ("rate_warn_per_min", h.rate_warn),
+                ("rate_crit_per_min", h.rate_crit),
+            ] {
+                if let Some(v) = v {
+                    t.insert(k.into(), json!(v));
+                }
+            }
+            if h.below {
+                t.insert("below".into(), json!(true));
+            }
+            m.insert("thresholds", Value::Object(t));
         }
         // What a transport sends (a query, a method, a tool) stays here: the platform's
         // job names the check's key and the agent reads the rest from this file.
@@ -377,14 +396,40 @@ struct FileEntry {
     /// grpc.
     #[serde(default)]
     expect_code: Option<u32>,
+    // hwmon: thresholds in the sensor's human unit (°C, RPM, V, A, W).
+    /// hwmon: `temp` (default), `fan`, `in`, `curr`, `power`.
+    #[serde(default)]
+    kind: Option<String>,
+    /// hwmon.
+    #[serde(default)]
+    warn: Option<f64>,
+    /// hwmon.
+    #[serde(default)]
+    crit: Option<f64>,
+    /// hwmon: per minute.
+    #[serde(default)]
+    rate_warn: Option<f64>,
+    /// hwmon: per minute.
+    #[serde(default)]
+    rate_crit: Option<f64>,
+    /// hwmon: thresholds are lower bounds.
+    #[serde(default)]
+    below: Option<bool>,
 }
 
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum FileTarget {
     Text(String),
+    Sensor(SensorTarget),
     Url(UrlTarget),
     HostPort(HostPortTarget),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SensorTarget {
+    sensor: String,
 }
 
 #[derive(Deserialize)]
@@ -426,6 +471,14 @@ fn entry(kind: Kind, table: toml::Table) -> std::result::Result<DeclaredCheck, S
         .map_err(|e: toml::de::Error| e.message().to_owned())?;
     check_name(&e.name)?;
     let input = e.params_input();
+    let hwmon_input = (
+        e.kind.take(),
+        e.warn.take(),
+        e.crit.take(),
+        e.rate_warn.take(),
+        e.rate_crit.take(),
+        e.below.take(),
+    );
     let every_secs = parse_every(&e.every)?;
     let refuse_by = match (kind, e.by.as_deref(), &e.expect) {
         (Kind::Check, None, _) => None,
@@ -486,7 +539,7 @@ fn entry(kind: Kind, table: toml::Table) -> std::result::Result<DeclaredCheck, S
         Some(r) => {
             check_reference(&r)?;
             if !surface.takes_auth() {
-                return Err("auth is not used by tcp and tls checks".into());
+                return Err("auth is not used by tcp, tls and hwmon checks".into());
             }
             Some(AuthSpec {
                 header: None,
@@ -504,7 +557,14 @@ fn entry(kind: Kind, table: toml::Table) -> std::result::Result<DeclaredCheck, S
         return Err(format!("category must be one of {}", CATEGORIES.join(", ")));
     }
     check_tags(&e.tags)?;
-    let params = params(surface, &input)?;
+    let mut params = params(surface, &input)?;
+    params.hwmon = hwmon_params(surface, &target, hwmon_input)?;
+    let target = match (&target, &params.hwmon) {
+        (Target::Sensor { .. }, Some(h)) => Target::Sensor {
+            sensor: h.sensor.key(),
+        },
+        _ => target,
+    };
     let spec = CheckSpec {
         surface,
         target,
@@ -730,6 +790,7 @@ fn params(surface: Surface, i: &ParamsInput) -> std::result::Result<Params, Stri
         allow_side_effects: i.allow_side_effects.unwrap_or(false),
         expect_error: i.expect_error.clone(),
         expect_code: i.expect_code,
+        hwmon: None,
     })
 }
 
@@ -791,13 +852,110 @@ fn check_expect(x: &FileExpect, surface: Surface) -> std::result::Result<(), Str
     Ok(())
 }
 
+type HwmonInput = (
+    Option<String>,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    Option<bool>,
+);
+
+/// An hwmon entry's sensor and thresholds; `None` for other surfaces (which may not name
+/// them).
+fn hwmon_params(
+    surface: Surface,
+    target: &Target,
+    (kind, warn, crit, rate_warn, rate_crit, below): HwmonInput,
+) -> std::result::Result<Option<crate::host::check::HwmonSpec>, String> {
+    use crate::host::check::{HwmonSpec, to_raw};
+    use crate::host::hwmon::{Kind as SensorKind, SensorRef};
+    let any = kind.is_some()
+        || warn.is_some()
+        || crit.is_some()
+        || rate_warn.is_some()
+        || rate_crit.is_some()
+        || below.is_some();
+    if surface != Surface::Hwmon {
+        if any {
+            return Err(
+                "kind, warn, crit, rate_warn, rate_crit and below are for hwmon checks".into(),
+            );
+        }
+        return Ok(None);
+    }
+    let Target::Sensor { sensor } = target else {
+        return Err(
+            "an hwmon check names a sensor: target = { sensor = \"asusec/Chipset\" }".into(),
+        );
+    };
+    let kind = match kind.as_deref() {
+        None => SensorKind::Temp,
+        Some(k) => SensorKind::parse(k)
+            .ok_or_else(|| format!("kind = {k:?}: must be temp, fan, in, curr or power"))?,
+    };
+    let sensor = SensorRef::parse(sensor, kind)?;
+    for (name, v) in [
+        ("warn", warn),
+        ("crit", crit),
+        ("rate_warn", rate_warn),
+        ("rate_crit", rate_crit),
+    ] {
+        if let Some(v) = v
+            && (!v.is_finite() || v.abs() > 1.0e6)
+        {
+            return Err(format!("{name} must be a finite number"));
+        }
+    }
+    if warn.is_none() && crit.is_none() && rate_warn.is_none() && rate_crit.is_none() {
+        return Err("an hwmon check needs warn, crit, rate_warn or rate_crit".into());
+    }
+    let below = below.unwrap_or(false);
+    let raw = |v: Option<f64>| v.map(|v| to_raw(sensor.kind, v));
+    let (w, c) = (raw(warn), raw(crit));
+    if let (Some(w), Some(c)) = (w, c)
+        && ((!below && w > c) || (below && w < c))
+    {
+        return Err(if below {
+            "with below = true, warn must be at or above crit".into()
+        } else {
+            "warn must be at or below crit".into()
+        });
+    }
+    for (name, v) in [("rate_warn", rate_warn), ("rate_crit", rate_crit)] {
+        if v.is_some_and(|v| v <= 0.0) {
+            return Err(format!(
+                "{name} is a rate of change per minute and must be above 0"
+            ));
+        }
+    }
+    Ok(Some(HwmonSpec {
+        warn: w,
+        crit: c,
+        rate_warn: raw(rate_warn),
+        rate_crit: raw(rate_crit),
+        below,
+        sensor,
+    }))
+}
+
 /// The target and the surface it implies when none is named: `http` for a URL, `tcp`
-/// for a host and port.
+/// for a host and port, `hwmon` for a sensor.
 fn target(
     t: FileTarget,
     surface: Option<Surface>,
 ) -> std::result::Result<(Target, Surface), String> {
     match t {
+        FileTarget::Sensor(SensorTarget { sensor }) => {
+            Ok((Target::Sensor { sensor }, Surface::Hwmon))
+        }
+        FileTarget::Text(s) if surface == Some(Surface::Hwmon) && s.contains("://") => Err(
+            "an hwmon check names a sensor, not a URL: target = { sensor = \"asusec/Chipset\" }"
+                .into(),
+        ),
+        FileTarget::Text(s) if surface == Some(Surface::Hwmon) => {
+            Ok((Target::Sensor { sensor: s }, Surface::Hwmon))
+        }
         FileTarget::Url(UrlTarget { url }) => Ok((
             Target::Url {
                 url: parse_url(&url)?,
@@ -1088,10 +1246,21 @@ enum Refusal {
 /// What the agent's admission path would say before any DNS query.
 fn policy_refusal(c: &DeclaredCheck, policy: &Policy) -> Refusal {
     if !policy.surface_allowed(c.spec.surface) {
-        return Refusal::Refused(format!(
-            "the {} surface is not enabled ([work] checks, surfaces)",
-            c.spec.surface.as_str()
-        ));
+        return Refusal::Refused(if c.spec.surface.is_host() {
+            format!(
+                "the {} surface is not enabled ([work] host = true and surfaces)",
+                c.spec.surface.as_str()
+            )
+        } else {
+            format!(
+                "the {} surface is not enabled ([work] checks, surfaces)",
+                c.spec.surface.as_str()
+            )
+        });
+    }
+    if c.spec.surface.is_host() {
+        // Reads this host; no target to admit.
+        return Refusal::Allowed;
     }
     if let Some(r) = c.auth()
         && !policy.secret_allowed(r)
@@ -1171,6 +1340,94 @@ allow = ["10.0.0.0/8", "api.example.com", "cache.internal"]
 [secrets]
 allow = ["env:CHECK_*"]
 "#;
+
+    #[test]
+    fn hwmon_checks_parse_normalize_and_need_the_host_gate() {
+        let file = r#"
+[[check]]
+name = "chipset-temp"
+surface = "hwmon"
+target = { sensor = "asusec/Chipset" }
+every = "60s"
+warn = 100
+crit = 108
+rate_warn = 2.5
+fail_after = 1
+category = "availability"
+
+[[check]]
+name = "chipset-fan"
+target = { sensor = "asusec/Chipset" }
+kind = "fan"
+below = true
+warn = 3000
+crit = 1000
+every = "60s"
+"#;
+        let c = DeclaredChecks::from_toml(file).unwrap();
+        assert_eq!(
+            Value::Array(c.wire()),
+            json!([
+                {"key": "chipset-temp", "kind": "check", "surface": "hwmon",
+                 "target": {"sensor": "asusec/temp/Chipset"},
+                 "every_secs": 60, "fail_after": 1, "category": "availability",
+                 "thresholds": {"unit": "millicelsius", "warn": 100_000, "crit": 108_000,
+                                "rate_warn_per_min": 2_500}},
+                {"key": "chipset-fan", "kind": "check", "surface": "hwmon",
+                 "target": {"sensor": "asusec/fan/Chipset"},
+                 "every_secs": 60, "fail_after": 2,
+                 "thresholds": {"unit": "rpm", "warn": 3000, "crit": 1000, "below": true}}
+            ])
+        );
+        let h = c.entries[0].spec.params.hwmon.as_ref().unwrap();
+        assert_eq!((h.warn, h.crit), (Some(100_000), Some(108_000)));
+        // Not allowed until the policy turns host observation on and lists the surface.
+        let off = Policy::from_toml("environment = \"production\"\n").unwrap();
+        assert!(
+            matches!(lint_offline(&c.entries[0], &off), Verdict::Error(m) if m.contains("[work] host"))
+        );
+        let half =
+            Policy::from_toml("environment = \"production\"\n[work]\nhost = true\n").unwrap();
+        assert!(matches!(
+            lint_offline(&c.entries[0], &half),
+            Verdict::Error(_)
+        ));
+        let on = Policy::from_toml(
+            "environment = \"production\"\n[work]\nhost = true\nsurfaces = [\"http\", \"hwmon\"]\n",
+        )
+        .unwrap();
+        assert_eq!(lint_offline(&c.entries[0], &on), Verdict::Ok);
+        // Rules.
+        for (bad, why) in [
+            (
+                "surface = \"hwmon\"\ntarget = { sensor = \"asusec/Chipset\" }\nevery = \"60s\"",
+                "needs warn",
+            ),
+            (
+                "surface = \"hwmon\"\ntarget = { sensor = \"asusec/Chipset\" }\nevery = \"60s\"\nwarn = 110\ncrit = 100",
+                "at or below crit",
+            ),
+            (
+                "surface = \"hwmon\"\ntarget = \"https://a.example.com/\"\nevery = \"60s\"\nwarn = 1",
+                "names a sensor",
+            ),
+            (
+                "target = \"https://a.example.com/\"\nevery = \"60s\"\nwarn = 1",
+                "are for hwmon",
+            ),
+            (
+                "surface = \"hwmon\"\ntarget = { sensor = \"asusec/Chipset\" }\nevery = \"60s\"\nwarn = 1\nkind = \"x\"",
+                "kind",
+            ),
+            (
+                "surface = \"hwmon\"\ntarget = { sensor = \"asusec/Chipset\" }\nevery = \"60s\"\nrate_crit = -1",
+                "above 0",
+            ),
+        ] {
+            let e = one(&format!("[[check]]\nname = \"x\"\n{bad}\n")).unwrap_err();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
+    }
 
     fn one(toml: &str) -> std::result::Result<DeclaredCheck, String> {
         let parsed = parse(toml).map_err(|e| e.to_string())?;

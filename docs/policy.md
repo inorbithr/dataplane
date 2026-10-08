@@ -75,6 +75,7 @@ How a target is decided:
 | `faults` | `false` | Faults through the proxy. Not in this version: always refused. |
 | `surfaces` | `http`, `tcp`, `tls`, `grpc_health` | Which check surfaces are accepted. The transport surfaces `grpc`, `sse`, `ws`, `mqtt`, `mcp` and `graphql` read a bounded answer (never reported) and are accepted only when listed ([checks](checks.md#transport-surfaces)). |
 | `capture` | `false` | Read the capture companion's counts ([`[capture]`](#capture)) and announce `capture:*`. Needs an agent newer than 0.1.0-alpha.4. |
+| `host` | `false` | Observe this machine, read-only: `atlas observe host` and the `hwmon` check surface with its sampler ([`[host]`](#host), [host.md](host.md)). `hwmon` must also be listed in `surfaces` for checks. Needs an agent newer than 0.1.0-alpha.8. |
 
 The agent announces what it accepts (`check:http`, …) in its `hello`, so the console only
 offers what this policy allows.
@@ -98,6 +99,22 @@ At each session start the agent asks the socket for counts (1 s timeout). Only t
 route and owner the caller already knows (socket protocol version 2). Names, routes, paths,
 addresses and packets never reach the agent at all
 ([install guide](capture/install.md#what-capture-never-does)).
+
+## `[host]`
+
+Read only when `[work] host = true`; without that switch the section is accepted and does
+nothing. Older agents reject the unknown keys (`host` in `[work]`, the `[host]` section)
+and do not start, so upgrade the agent first. A policy without them keeps its hash.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `journal` | `false` | Run `journalctl --list-boots` and read each earlier boot's last entries to tell which boots ended without a shutdown record. The only program the host observers run (fixed arguments, empty environment, 10 s timeout, 1 MiB bound). The agent's user needs to read the journal (group `adm` or `systemd-journal`). |
+| `sample_secs` | `10` | 5–300. Seconds between sensor samples while the agent runs. |
+| `window_secs` | `900` | 60–3600, at least two samples. History kept in memory for rates and peaks; nothing is written to disk. |
+
+The host observers need no privilege. With `CAP_SYS_ADMIN` (and nothing else) they also
+read PCI config space past 64 bytes, which gives the per-link ASPM state; without it that
+state is reported as not observed. See [host.md](host.md#privileges).
 
 ## `[ceilings]`
 

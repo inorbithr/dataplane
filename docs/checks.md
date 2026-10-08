@@ -137,6 +137,57 @@ every = "15m"
 `grpc` sends an empty request only: a method whose request needs fields is checked by the
 status it refuses with. Requests built from server reflection are not in this version.
 
+## Host sensors: `hwmon`
+
+A sensor on the agent's own machine against thresholds. It needs `[work] host = true` and
+`hwmon` in `[work] surfaces` ([policy](policy.md#host)). The agent samples every hwmon
+sensor every `[host] sample_secs` (10 s) and judges a run on the window since the
+previous run, so a spike between two runs is not missed.
+
+```toml
+[[check]]
+name = "chipset-temp"
+surface = "hwmon"
+target = { sensor = "asusec/Chipset" }   # chip/label, or chip/kind/label
+every = "60s"
+warn = 100          # °C
+crit = 108
+rate_warn = 2       # °C per minute, rising
+fail_after = 1
+category = "availability"
+
+[[check]]
+name = "chipset-fan"
+target = { sensor = "asusec/Chipset" }
+kind = "fan"        # temp (default), fan, in, curr, power
+below = true        # thresholds are lower bounds: a fan that slows or stops
+warn = 3000         # RPM
+crit = 1000
+every = "60s"
+```
+
+| Field | Meaning |
+|---|---|
+| `target` | `{ sensor = "chip/label" }`. The chip is the hwmon name (`asusec`, `k10temp`), an NVMe controller (`nvme5`), or `name@<pci address>` when two chips share a name; `atlas observe host --report` and the evidence list every key. |
+| `kind` | What the label measures; the same label can name a temperature and a fan (`asusec` has both for `Chipset`). |
+| `warn`, `crit` | In °C, RPM, V, A or W. At or past `crit` the run fails (`error_class = "threshold"`); at or past `warn` it passes with `level = "warn"`. |
+| `rate_warn`, `rate_crit` | Change per minute over the last two minutes (least squares), rising (falling with `below`). |
+| `below` | Thresholds are lower bounds. |
+
+The result carries `detail.reading`: `sensor` (the key), `unit` (`millicelsius`, `rpm`,
+`millivolts`, `milliamps`, `microwatts`), `value` (newest), `peak` (worst since the last
+run), `rate_per_min` (when known), `level` (`ok`, `warn`, `crit`) and `samples`. A sensor
+that is not on the host, or has no sample yet, fails with `error_class = "sensor"`. The
+thresholds stay in this file: a job names the check's key, and a job for `hwmon` that does
+not name a declared check is refused. In the hello the entry carries
+`"target": {"sensor": "asusec/temp/Chipset"}` and
+`"thresholds": {"unit": "millicelsius", "warn": 100000, "crit": 108000, ...}` in the raw
+unit, so the platform can show them.
+
+A reading is a measurement of the agent's own machine, not of a target's answer: the
+sensor key, the numbers and the level leave the machine; nothing else about the host does
+(the topology, mounts and boots stay in local `atlas observe host` output).
+
 ## Tests that must fail: `[[refuse]]`
 
 A `[[refuse]]` entry passes when the target is refused. A guard that stops guarding then

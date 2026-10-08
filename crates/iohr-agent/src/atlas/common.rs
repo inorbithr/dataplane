@@ -191,6 +191,26 @@ impl Ctx {
         value: Value,
         derived_from: &[ArtifactObservationId],
     ) -> Result<ObservationId> {
+        let refs: Vec<EvidenceRef> = derived_from
+            .iter()
+            .map(|a| EvidenceRef::Artifact(*a))
+            .collect();
+        self.observe_from(sink, subject, predicate_name, value, &refs)
+    }
+
+    /// Like [`Self::observe`], derived from any evidence (artefacts or other
+    /// observations): what a derived finding cites.
+    ///
+    /// # Errors
+    /// The predicate name is malformed, or this observer's class cannot make observations.
+    pub fn observe_from(
+        &self,
+        sink: &mut Sink,
+        subject: &str,
+        predicate_name: &str,
+        value: Value,
+        derived_from: &[EvidenceRef],
+    ) -> Result<ObservationId> {
         let subject = sink.entity(subject);
         let o = Observation::new(
             self.observer.id,
@@ -210,8 +230,8 @@ impl Ctx {
             self.method.clone(),
         )
         .map_err(|e| Error::Atlas(e.to_string()))?;
-        for a in derived_from {
-            item = item.derived_from(EvidenceRef::Artifact(*a));
+        for r in derived_from {
+            item = item.derived_from(*r);
         }
         sink.push(Record::Observation(o));
         sink.push(Record::Evidence(item));

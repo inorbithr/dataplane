@@ -12,7 +12,9 @@ iohr-agent atlas observe --repo ../core \
 ```
 
 A company's documentation (Notion first) is read by `atlas docs sync` into the same
-records; see [docs-connectors.md](docs-connectors.md).
+records; see [docs-connectors.md](docs-connectors.md). The machine the agent runs on
+(sensors, PCI, storage, pressure, boots) is read by `atlas observe host`; see
+[host.md](host.md).
 
 Nothing is sent anywhere. The output is a local file (or standard output), and a summary
 of counts goes to standard error.

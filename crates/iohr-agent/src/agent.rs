@@ -58,6 +58,8 @@ pub struct Agent {
     pub executor: Arc<Executor>,
     /// TLS trust.
     pub tls: TlsContext,
+    /// The host sampler (`[work] host`), sampled while the agent runs.
+    pub host: Option<crate::host::sampler::Shared>,
 }
 
 impl Agent {
@@ -110,9 +112,16 @@ impl Agent {
         let enrollment = Arc::new(enrollment);
         let tokens = TokenSource::new(http, Arc::clone(&enrollment), Arc::new(key));
         let secrets = SecretResolver::new(config.secrets.clone(), tls.clone());
+        let host = policy.host().map(|h| {
+            Arc::new(std::sync::Mutex::new(crate::host::sampler::Sampler::new(
+                crate::host::sysfs::Root::host(),
+                std::time::Duration::from_secs(h.window_secs),
+            )))
+        });
         let executor = Arc::new(
             Executor::new(Arc::clone(&policy), tls.clone(), secrets)
-                .with_checks(checks.clone().map(Arc::new)),
+                .with_checks(checks.clone().map(Arc::new))
+                .with_host(host.clone()),
         );
         let state = Arc::new(AgentState::new(
             AgentInfo {
@@ -143,6 +152,7 @@ impl Agent {
             tokens,
             executor,
             tls,
+            host,
         })
     }
 
@@ -171,6 +181,26 @@ impl Agent {
                 policy,
                 Arc::clone(&self.state),
                 shutdown.clone(),
+            ));
+        }
+        if let (Some(h), Some(p)) = (&self.host, self.policy.host()) {
+            let state = Arc::clone(&self.state);
+            tokio::spawn(crate::host::sampler::run(
+                Arc::clone(h),
+                std::time::Duration::from_secs(p.sample_secs),
+                shutdown.clone(),
+                move |s| {
+                    let chipset = crate::host::derive::chipset_sensor(s.chips())
+                        .and_then(|(c, x)| s.latest(&c.key(x)));
+                    state.host_sampled(crate::state::HostInfo {
+                        sensors: s.sensor_count(),
+                        samples: s.samples().len(),
+                        last_sample_at: crate::enroll::now_rfc3339(),
+                        last_cost_us: u64::try_from(s.last_cost.as_micros()).unwrap_or(u64::MAX),
+                        max_cost_us: u64::try_from(s.max_cost.as_micros()).unwrap_or(u64::MAX),
+                        chipset_millicelsius: chipset,
+                    });
+                },
             ));
         }
         crate::session::run(self, shutdown).await

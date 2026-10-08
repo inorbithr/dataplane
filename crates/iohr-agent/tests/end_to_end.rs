@@ -388,3 +388,123 @@ async fn hello_carries_no_metadata_when_reporting_is_off_or_nothing_is_set() {
     stop.send(true).unwrap();
     task.await.unwrap().unwrap();
 }
+
+/// Starts the agent with its host sampler reading the captured TRX40 tree instead of `/`.
+async fn start_on_fixture(
+    h: &Harness,
+) -> (
+    Arc<iohr_agent::agent::Agent>,
+    tokio::sync::watch::Sender<bool>,
+    tokio::task::JoinHandle<iohr_agent::Result<()>>,
+) {
+    use iohr_agent::host::{sampler::Sampler, sysfs::Root};
+    let enrollment = match iohr_agent::enroll::Enrollment::load(&h.cfg.state_dir).unwrap() {
+        Some(e) => e,
+        None => enroll_agent(h).await,
+    };
+    let key = AgentKey::load(&h.cfg.key).unwrap();
+    let agent = Arc::new(
+        iohr_agent::agent::Agent::new(
+            h.cfg.clone(),
+            h.policy.clone(),
+            DeclaredChecks::load(&h.cfg.checks).unwrap(),
+            enrollment,
+            key,
+        )
+        .unwrap(),
+    );
+    let root =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/host/trx40/root");
+    *agent
+        .host
+        .as_ref()
+        .expect("[work] host builds a sampler")
+        .lock()
+        .unwrap() = Sampler::new(Root::at(&root), Duration::from_secs(60));
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(Arc::clone(&agent).run(rx));
+    (agent, tx, task)
+}
+
+#[tokio::test]
+async fn an_hwmon_check_runs_from_the_sampler_and_survives_a_restart() {
+    let mut h = harness_with(
+        KeyAlg::Es256,
+        "[work]\nhost = true\nsurfaces = [\"http\", \"hwmon\"]\n[host]\nsample_secs = 5\nwindow_secs = 60\n",
+    )
+    .await;
+    std::fs::write(
+        &h.cfg.checks,
+        r#"
+[[check]]
+name = "chipset-temp"
+surface = "hwmon"
+target = { sensor = "asusec/Chipset" }
+every = "60s"
+warn = 100
+crit = 108
+fail_after = 1
+"#,
+    )
+    .unwrap();
+    let (agent, stop, task) = start_on_fixture(&h).await;
+    let (_, hello) = next(&mut h.frames, "hello").await;
+    let caps: Vec<&str> = hello["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c.as_str())
+        .collect();
+    assert!(caps.contains(&"check:hwmon"), "{caps:?}");
+    assert_eq!(
+        hello["checks"][0]["target"],
+        json!({"sensor": "asusec/temp/Chipset"})
+    );
+    let first_hash = hello["checks_hash"].clone();
+
+    // Let the sampler take its first reading.
+    for _ in 0..50 {
+        if agent
+            .host
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .now_ms()
+            .is_some()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let spec = json!({"surface": "hwmon", "target": {"sensor": "asusec/temp/Chipset"}, "key": "chipset-temp"});
+    h.cmds.send(job("j-hw", "check", spec)).ok();
+    // A job that is not the declared check is refused: thresholds come from checks.toml only.
+    h.cmds
+        .send(job(
+            "j-hw-undeclared",
+            "check",
+            json!({"surface": "hwmon", "target": {"sensor": "asusec/temp/Chipset"}}),
+        ))
+        .ok();
+    let r = results(&mut h.frames, 2).await;
+    assert_eq!(r["j-hw"]["status"], "ok", "{}", r["j-hw"]);
+    let reading = &r["j-hw"]["detail"]["reading"];
+    assert_eq!(reading["sensor"], "asusec/temp/Chipset");
+    assert_eq!(reading["value"], 107_000);
+    assert_eq!(reading["level"], "warn");
+    assert_eq!(reading["unit"], "millicelsius");
+    assert_eq!(r["j-hw-undeclared"]["status"], "refused");
+    let sessions = h.fake.sessions.load(Ordering::SeqCst);
+    stop.send(true).unwrap();
+    task.await.unwrap().unwrap();
+
+    // Restart on the same state: the same identity (no new enrollment), the same declared
+    // checks under the same hash, so the platform keeps one monitor per key.
+    let (_agent, stop, task) = start_on_fixture(&h).await;
+    let (_, hello) = next(&mut h.frames, "hello").await;
+    assert_eq!(hello["checks_hash"], first_hash);
+    assert!(h.fake.sessions.load(Ordering::SeqCst) > sessions);
+    stop.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}

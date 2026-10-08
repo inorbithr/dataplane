@@ -29,6 +29,11 @@ pub struct Executor {
     secrets: SecretResolver,
     /// The declared checks: what a transport check sends comes from here, never a job.
     checks: Option<Arc<DeclaredChecks>>,
+    /// The host sampler, when the policy turns host observation on.
+    host: Option<crate::host::sampler::Shared>,
+    /// When each hwmon check last ran (sampler milliseconds): the next run judges the
+    /// window since then, so a spike between runs is not missed.
+    host_runs: Mutex<std::collections::HashMap<String, u64>>,
     slots: Arc<Semaphore>,
     window: Mutex<VecDeque<Instant>>,
     jobs: Counter<u64>,
@@ -74,6 +79,8 @@ impl Executor {
             tls,
             secrets,
             checks: None,
+            host: None,
+            host_runs: Mutex::new(std::collections::HashMap::new()),
             slots,
             window: Mutex::new(VecDeque::new()),
             jobs: meter
@@ -92,6 +99,13 @@ impl Executor {
     #[must_use]
     pub fn with_checks(mut self, checks: Option<Arc<DeclaredChecks>>) -> Self {
         self.checks = checks;
+        self
+    }
+
+    /// The host sampler `hwmon` checks are judged on.
+    #[must_use]
+    pub fn with_host(mut self, host: Option<crate::host::sampler::Shared>) -> Self {
+        self.host = host;
         self
     }
 
@@ -115,6 +129,7 @@ impl Executor {
             .ok_or_else(|| format!("no declared check named {key:?} in checks.toml"))?;
         let same_target = match (&entry.spec.target, &spec.target) {
             (Target::Url { url: a }, Target::Url { url: b }) => a == b,
+            (Target::Sensor { sensor: a }, Target::Sensor { sensor: b }) => a == b,
             (
                 Target::HostPort {
                     host: a, port: p, ..
@@ -357,7 +372,53 @@ impl Executor {
         }
     }
 
+    fn run_host(&self, a: &Admitted, started: Instant) -> Result<CheckDetail, String> {
+        use crate::host::check::{Level, NoReading, judge};
+        let spec = a
+            .spec
+            .params
+            .hwmon
+            .as_ref()
+            .ok_or("an hwmon check runs only as a declared check")?;
+        let shared = self
+            .host
+            .as_ref()
+            .ok_or("host observation is not enabled by the local policy ([work] host)")?;
+        let key = a.spec.key.clone().unwrap_or_default();
+        let g = match shared.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let mut runs = match self.host_runs.lock() {
+            Ok(r) => r,
+            Err(p) => p.into_inner(),
+        };
+        let since = runs.get(&key).copied();
+        let detail = match judge(&g, g.chips(), spec, since) {
+            Ok(r) => {
+                let level = r.level;
+                CheckDetail {
+                    ok: level != Level::Crit,
+                    latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(0),
+                    error_class: (level == Level::Crit).then_some(ErrorClass::Threshold),
+                    reading: Some(r),
+                    ..CheckDetail::default()
+                }
+            }
+            Err(NoReading::Missing(_) | NoReading::NotSampled) => {
+                CheckDetail::failed(ErrorClass::Sensor, started)
+            }
+        };
+        if let Some(now) = g.now_ms() {
+            runs.insert(key, now);
+        }
+        Ok(detail)
+    }
+
     async fn run(&self, a: &Admitted, started: Instant) -> Result<CheckDetail, String> {
+        if a.spec.surface.is_host() {
+            return self.run_host(a, started);
+        }
         let addr = match self
             .policy
             .resolve_target(

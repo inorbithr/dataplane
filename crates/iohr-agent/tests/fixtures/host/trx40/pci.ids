@@ -1,0 +1,38 @@
+# pci.ids excerpt (https://pci-ids.ucw.cz, BSD-3-Clause or GPL-2.0-or-later): the vendors and devices of the trx40 fixture only
+1022  Advanced Micro Devices, Inc. [AMD]
+	1480  Starship/Matisse Root Complex
+	1481  Starship/Matisse IOMMU
+	1482  Starship/Matisse PCIe Dummy Host Bridge
+	1483  Starship/Matisse GPP Bridge
+	1484  Starship/Matisse Internal PCIe GPP Bridge 0 to bus[E:B]
+	1485  Starship/Matisse Reserved SPP
+	1486  Starship/Matisse Cryptographic Coprocessor PSPCPP
+	1487  Starship/Matisse HD Audio Controller
+	148a  Starship/Matisse PCIe Dummy Function
+	148c  Starship USB 3.0 Host Controller
+	1490  Starship Device 24; Function 0
+	1491  Starship Device 24; Function 1
+	1492  Starship Device 24; Function 2
+	1493  Starship Device 24; Function 3
+	1494  Starship Device 24; Function 4
+	1495  Starship Device 24; Function 5
+	1496  Starship Device 24; Function 6
+	1497  Starship Device 24; Function 7
+	149c  Matisse USB 3.0 Host Controller
+	57a3  Matisse PCIe GPP Bridge
+	57a4  Matisse PCIe GPP Bridge
+	57ad  Matisse Switch Upstream
+	7901  FCH SATA Controller [AHCI mode]
+	790b  FCH SMBus Controller
+	790e  FCH LPC Bridge
+	b000  RAID Bottom Device
+10de  NVIDIA Corporation
+	2705  AD103 [GeForce RTX 4070 Ti SUPER]
+1b21  ASMedia Technology Inc.
+	0612  ASM1061/ASM1062 Serial ATA Controller
+	3242  ASM3242 USB 3.2 Host Controller
+1d6a  Aquantia Corp.
+	07b1  AQtion AQC107 NBase-T/IEEE 802.3an Ethernet Controller [Atlantic 10G]
+8086  Intel Corporation
+	1539  I211 Gigabit Network Connection
+	2723  Wi-Fi 6 AX200

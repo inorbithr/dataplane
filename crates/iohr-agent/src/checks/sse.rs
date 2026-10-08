@@ -39,6 +39,7 @@ pub(super) async fn check(tls: &TlsContext, p: &Prepared<'_>) -> CheckDetail {
         status_code: Some(status),
         error_class: None,
         tls_expires_at: expires,
+        reading: None,
     };
     let is_stream = resp
         .headers()

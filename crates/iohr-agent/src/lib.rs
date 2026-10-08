@@ -17,6 +17,7 @@ pub mod enroll;
 pub mod error;
 pub mod executor;
 pub mod extsock;
+pub mod host;
 pub mod keys;
 pub mod metadata;
 pub mod platform;

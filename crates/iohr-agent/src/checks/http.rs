@@ -81,6 +81,7 @@ pub(super) async fn check(tls: &TlsContext, p: &Prepared<'_>) -> CheckDetail {
                 status_code: Some(status),
                 error_class: (!ok).then_some(ErrorClass::Status),
                 tls_expires_at: expires,
+                reading: None,
             }
         }
         Err(e) => CheckDetail::failed(classify(&e), started),

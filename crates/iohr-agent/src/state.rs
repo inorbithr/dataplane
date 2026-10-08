@@ -46,6 +46,27 @@ pub struct Snapshot {
     /// The capture companion, when `[work] capture = true`: counts only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture: Option<crate::capture::TrafficInfo>,
+    /// The host sampler, when `[work] host = true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<HostInfo>,
+}
+
+/// The host sampler's state, for the admin page and `status`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HostInfo {
+    /// Sensors sampled.
+    pub sensors: usize,
+    /// Samples in the window.
+    pub samples: usize,
+    /// When the newest was taken, RFC 3339.
+    pub last_sample_at: String,
+    /// How long it took to read, microseconds.
+    pub last_cost_us: u64,
+    /// The slowest sample since the agent started, microseconds.
+    pub max_cost_us: u64,
+    /// The chipset temperature, when the board has a `Chipset` sensor (milli-degrees).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chipset_millicelsius: Option<i64>,
 }
 
 /// Identity.
@@ -193,6 +214,11 @@ impl AgentState {
             s.revoked = true;
             s.connected = false;
         });
+    }
+
+    /// The host sampler took a sample.
+    pub fn host_sampled(&self, info: HostInfo) {
+        self.with(|s| s.host = Some(info));
     }
 
     /// The latest answer from the capture companion.

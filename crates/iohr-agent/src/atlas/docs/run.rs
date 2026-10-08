@@ -102,6 +102,7 @@ pub async fn sync_configured(
         repository: None,
         cluster: None,
         docs: refs,
+        host: None,
     }));
     Ok((sink, outcomes))
 }
