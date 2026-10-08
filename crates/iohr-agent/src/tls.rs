@@ -4,8 +4,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, RootCertStore};
 
 use crate::error::{Error, Result};
@@ -62,6 +62,48 @@ impl TlsContext {
         Ok(Self {
             roots: Arc::new(roots),
         })
+    }
+
+    /// Only the certificates in `pem` (a kubeconfig's inline cluster CA).
+    ///
+    /// # Errors
+    /// When `pem` holds no certificate or a malformed one.
+    pub fn from_pem(pem: &[u8]) -> Result<Self> {
+        let mut roots = RootCertStore::empty();
+        for cert in CertificateDer::pem_slice_iter(pem) {
+            let cert = cert.map_err(|e| Error::Tls(format!("CA bundle: {e}")))?;
+            roots
+                .add(cert)
+                .map_err(|e| Error::Tls(format!("CA bundle: {e}")))?;
+        }
+        if roots.is_empty() {
+            return Err(Error::Tls("the CA bundle holds no certificate".into()));
+        }
+        Ok(Self {
+            roots: Arc::new(roots),
+        })
+    }
+
+    /// A client configuration offering the given ALPN protocols and presenting a client
+    /// certificate (a kubeconfig user's).
+    ///
+    /// # Errors
+    /// When the key does not fit the certificate or is of an unsupported kind.
+    pub fn client_config_with_identity(
+        &self,
+        alpn: &[&[u8]],
+        certs: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> Result<ClientConfig> {
+        let mut config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .map_err(|e| Error::Tls(e.to_string()))?
+                .with_root_certificates(self.roots.clone())
+                .with_client_auth_cert(certs, key)
+                .map_err(|e| Error::Tls(format!("client certificate: {e}")))?;
+        config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        Ok(config)
     }
 
     /// A client configuration offering the given ALPN protocols.

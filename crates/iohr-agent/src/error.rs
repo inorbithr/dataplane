@@ -55,6 +55,9 @@ pub enum Error {
     /// TLS could not be set up.
     #[error("tls: {0}")]
     Tls(String),
+    /// An Atlas observer could not read what it was asked to, or could not build a record.
+    #[error("atlas: {0}")]
+    Atlas(String),
 }
 
 impl Error {
