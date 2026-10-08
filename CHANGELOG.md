@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.1.0-alpha.8](https://github.com/inorbithr/dataplane/compare/v0.1.0-alpha.7...v0.1.0-alpha.8) (2026-10-08)
+
+
+### Features
+
+* **agent:** atlas observe, the first Atlas observers ([#26](https://github.com/inorbithr/dataplane/issues/26)) ([91424fc](https://github.com/inorbithr/dataplane/commit/91424fcc63eef1b28ea56eff9a429978e75da072))
+* **agent:** documentation connectors framework and Notion (atlas docs sync) ([#29](https://github.com/inorbithr/dataplane/issues/29)) ([f1e6e0d](https://github.com/inorbithr/dataplane/commit/f1e6e0df45a28df196c79aba1537825b8af453f0))
+* **agent:** enterprise metadata in agent.toml, config validate/show/schema (RFC 0088) ([#27](https://github.com/inorbithr/dataplane/issues/27)) ([40e2098](https://github.com/inorbithr/dataplane/commit/40e20983bffdc0d7279369a7d2e03ea1d87ea68d))
+* **agent:** host observers and the hwmon check (atlas observe host) ([#30](https://github.com/inorbithr/dataplane/issues/30)) ([7a4fbaf](https://github.com/inorbithr/dataplane/commit/7a4fbafb03e118131b41ec400a4b099f11b088c7))
+* **agent:** the local agent page, the egress ledger and the page's threat model ([#32](https://github.com/inorbithr/dataplane/issues/32)) ([0947cce](https://github.com/inorbithr/dataplane/commit/0947cce514636c2f6d81834cb4d365679a65bc95))
+* **evidence:** add iohr-evidence, the public half of Atlas core ([#25](https://github.com/inorbithr/dataplane/issues/25)) ([00a05ea](https://github.com/inorbithr/dataplane/commit/00a05eaaba67ffa4e5251ec1328cf26bb0d46147))
+* **packaging:** run the agent on macOS as a LaunchAgent ([#24](https://github.com/inorbithr/dataplane/issues/24)) ([775ca35](https://github.com/inorbithr/dataplane/commit/775ca35304dcc7068b1a041ac1a901c312ff3cc1))
+
 ## [0.1.0-alpha.7](https://github.com/inorbithr/dataplane/compare/v0.1.0-alpha.6...v0.1.0-alpha.7) (2026-10-06)
 
 
