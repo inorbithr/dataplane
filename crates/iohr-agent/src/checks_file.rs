@@ -125,6 +125,9 @@ pub struct DeclaredCheck {
     pub category: Option<String>,
     /// Up to [`limits::MAX_TAGS`] labels, `key = "value"`.
     pub tags: BTreeMap<String, String>,
+    /// What the console calls it when its target is not shared (`[share]` in the
+    /// policy); defaults to the name.
+    pub label: Option<String>,
 }
 
 impl DeclaredCheck {
@@ -184,6 +187,9 @@ impl DeclaredCheck {
         }
         if !self.tags.is_empty() {
             m.insert("tags", json!(self.tags));
+        }
+        if let Some(l) = &self.label {
+            m.insert("label", json!(l));
         }
         if let Some(h) = &self.spec.params.hwmon {
             let mut t = serde_json::Map::new();
@@ -353,6 +359,8 @@ struct FileEntry {
     category: Option<String>,
     #[serde(default)]
     tags: BTreeMap<String, String>,
+    #[serde(default)]
+    label: Option<String>,
     // The transport surfaces' requests (RFC 0040.2); each is for the surfaces named.
     /// http: the method; ws, grpc: the RPC's full name.
     #[serde(default)]
@@ -470,6 +478,11 @@ fn entry(kind: Kind, table: toml::Table) -> std::result::Result<DeclaredCheck, S
         .try_into()
         .map_err(|e: toml::de::Error| e.message().to_owned())?;
     check_name(&e.name)?;
+    if let Some(l) = &e.label
+        && (l.trim().is_empty() || l.chars().count() > 128 || l.chars().any(char::is_control))
+    {
+        return Err("label must be 1 to 128 characters, no control characters".into());
+    }
     let input = e.params_input();
     let hwmon_input = (
         e.kind.take(),
@@ -590,6 +603,7 @@ fn entry(kind: Kind, table: toml::Table) -> std::result::Result<DeclaredCheck, S
         rfc: e.rfc,
         category: e.category,
         tags: e.tags,
+        label: e.label,
     })
 }
 

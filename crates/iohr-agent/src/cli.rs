@@ -1483,6 +1483,14 @@ max_jobs_per_minute = 120
 [secrets]
 # Secret references a job may name (exact, or ending in *). Empty: no job may use one.
 allow = {secrets}
+
+[share]
+# What the hello tells the platform about your declared checks: "hash" (a label and a
+# keyed hash; the URL, host or address stays here), "label" (the label only) or "full"
+# (the target itself). Every message that leaves is in the agent's ledger either way.
+targets = "hash"
+# Send this machine's host name; false shows the agent's name instead.
+hostname = false
 "#,
         domains = toml_list(domains),
         allow = toml_list(allow),

@@ -52,8 +52,53 @@ pub struct Policy {
     /// of the hashed form while absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<HostPolicy>,
+    /// What the hello tells the platform about this agent's checks and host
+    /// (`docs/policy.md`). Left out of the hashed form while absent; absent means the
+    /// defaults: targets as a keyed hash and a label, no host name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share: Option<SharePolicy>,
     #[serde(skip)]
     compiled: Compiled,
+}
+
+/// How much of a declared check's target the platform is told.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetShare {
+    /// The label only (the check's `label`, or its name). Nothing derived from the
+    /// target leaves.
+    Label,
+    /// The label and a keyed hash of the target: the platform can tell when a target
+    /// changes, never what it is. The default.
+    #[default]
+    Hash,
+    /// The target itself (URL, or host and port), as before `[share]` existed.
+    Full,
+}
+
+impl TargetShare {
+    /// The policy's name for it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Label => "label",
+            Self::Hash => "hash",
+            Self::Full => "full",
+        }
+    }
+}
+
+/// `[share]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharePolicy {
+    /// Declared checks' targets: `label`, `hash` (default) or `full`.
+    #[serde(default)]
+    pub targets: TargetShare,
+    /// Send this machine's host name in the hello. Off by default: the console shows the
+    /// agent's name instead.
+    #[serde(default)]
+    pub hostname: bool,
 }
 
 /// `[domains]`.
@@ -517,6 +562,12 @@ impl Policy {
             .then(|| self.host.clone().unwrap_or_default())
     }
 
+    /// What the hello shares: `[share]`, or its defaults.
+    #[must_use]
+    pub fn share(&self) -> SharePolicy {
+        self.share.clone().unwrap_or_default()
+    }
+
     /// Whether a surface is accepted. `hwmon` also needs `[work] host`.
     #[must_use]
     pub fn surface_allowed(&self, s: Surface) -> bool {
@@ -888,6 +939,38 @@ allow = ["vault:kv/staging/*", "env:CHECK_TOKEN"]
             "environment = \"s\"\nextra = 1",
         ] {
             assert!(Policy::from_toml(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn share_defaults_to_hash_and_no_host_name_and_keeps_old_hashes() {
+        let base = "environment = \"staging\"\n";
+        let p = Policy::from_toml(base).unwrap();
+        assert_eq!(p.share(), SharePolicy::default());
+        assert_eq!(p.share().targets, TargetShare::Hash);
+        assert!(!p.share().hostname);
+        assert!(
+            !p.to_toml().unwrap().contains("share"),
+            "absent stays absent"
+        );
+        let full = Policy::from_toml(&format!(
+            "{base}[share]\ntargets = \"full\"\nhostname = true\n"
+        ))
+        .unwrap();
+        assert_eq!(full.share().targets, TargetShare::Full);
+        assert!(full.share().hostname);
+        assert_ne!(
+            full.hash(),
+            p.hash(),
+            "the choice is part of the policy hash"
+        );
+        let label = Policy::from_toml(&format!("{base}[share]\ntargets = \"label\"\n")).unwrap();
+        assert_eq!(label.share().targets, TargetShare::Label);
+        for bad in ["targets = \"all\"", "hostname = \"yes\"", "urls = true"] {
+            assert!(
+                Policy::from_toml(&format!("{base}[share]\n{bad}\n")).is_err(),
+                "{bad}"
+            );
         }
     }
 }

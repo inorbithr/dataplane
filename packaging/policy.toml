@@ -13,3 +13,11 @@ allow = []
 checks = true
 load = false
 faults = false
+
+[share]
+# What the hello tells the platform about your declared checks: "hash" (a label and a
+# keyed hash; the URL, host or address stays here), "label" (the label only) or "full"
+# (the target itself). Every message that leaves is in the agent's ledger either way.
+targets = "hash"
+# Send this machine's host name; false shows the agent's name instead.
+hostname = false

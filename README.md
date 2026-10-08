@@ -49,7 +49,7 @@ Status: pre-release (`0.1.0-alpha`). Before 1.0 only the latest release gets fix
 
 | Frame | Contents |
 |---|---|
-| `hello` | agent version, policy hash, capabilities, bound domains, the agent's clock; with a [`checks.toml`](docs/checks.md), the declared checks and their hash; the reported part of [`[metadata]`](docs/config.md#metadata) (site, country, owner team, data classes, trust domain; never rack, secrets backend or runbook) |
+| `hello` | agent version, policy hash, capabilities, bound domains, the agent's clock; with a [`checks.toml`](docs/checks.md), the declared checks and their hash (each target as a label and a keyed hash unless the policy's [`[share]`](docs/policy.md#share) says `full`); the host name only with `[share] hostname = true`; the reported part of [`[metadata]`](docs/config.md#metadata) (site, country, owner team, data classes, trust domain; never rack, secrets backend or runbook) |
 | `heartbeat` | a sequence number |
 | `result` | job id, `ok`/`failed`/`refused`, start and end time, latency, HTTP status code, error class, certificate expiry, refusal reason |
 

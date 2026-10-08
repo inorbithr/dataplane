@@ -28,6 +28,7 @@ pub mod protocol;
 pub mod redact;
 pub mod secrets;
 pub mod session;
+pub mod share;
 pub mod state;
 pub mod telemetry;
 pub mod tls;

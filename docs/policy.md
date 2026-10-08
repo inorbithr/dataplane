@@ -141,3 +141,27 @@ References are resolved on the agent at the moment of the call and dropped after
 
 A check uses a secret as one header (`auth: {header, scheme, secret}` in the job), marked
 sensitive; the value is never logged, reported or written anywhere.
+
+## `[share]`
+
+What the hello tells the platform about this agent (RFC 0100 D11 and D13 in
+inorbithr/core). Absent means the defaults, which keep targets and the host name on
+this machine.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `targets` | `"hash"` | How each declared check's target leaves: `"hash"` sends its label and an HMAC-SHA256 of the target under a key that never leaves the machine (`<state_dir>/share.key`), so the platform can tell when a target changes but not what it is, nor test a guess; `"label"` sends the label only; `"full"` sends the URL, or host and port, as before. |
+| `hostname` | `false` | Send this machine's host name (`hostname` in the hello). Off, the console shows the agent's name. |
+
+Below `"full"`:
+
+- a check's secret reference (`auth`) stays here too; the hello says `uses_secret: true`;
+- the platform names a check in a job by its key (and may add the `target_hash` it was
+  given, which must match); the agent takes the target from `checks.toml`;
+- a refusal's reason leaves with the target replaced by `the target of "<label>"` and
+  any address replaced too; the local page keeps the full reason;
+- a `[[refuse]]` entry with `by = "platform"` still sends its target: the platform cannot
+  refuse what it does not know. Such targets lie outside your domains by definition.
+
+The local page's Policy section shows the levels and, check by check, what the platform
+gets. Whatever the level, every message that leaves is in the [egress ledger](ledger.md).
