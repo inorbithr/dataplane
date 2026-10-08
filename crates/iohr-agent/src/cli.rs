@@ -1,6 +1,6 @@
 //! The command line: `init`, `enroll`, `run`, `status`, `policy check`, `checks lint`,
-//! `capture status`. As an iohr
-//! extension the same commands are `iohr agent …`.
+//! `config validate|show|schema`, `capture status`. As an iohr extension the same commands
+//! are `iohr agent …`.
 
 use std::io::{BufRead as _, IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -20,6 +20,7 @@ use crate::enroll::{self, EnrollParams, Enrollment};
 use crate::error::{Error, Result};
 use crate::extsock;
 use crate::keys::{self, AgentKey, KeyAlg};
+use crate::metadata;
 use crate::platform;
 use crate::policy::{Policy, TargetError};
 use crate::tls::{self, TlsContext};
@@ -61,6 +62,23 @@ pub enum Command {
     /// The capture companion (iohr-capture) on this host.
     #[command(subcommand)]
     Capture(CaptureCommand),
+    /// agent.toml tools: validate it, show the effective configuration, print its schema.
+    #[command(subcommand)]
+    Config(ConfigCommand),
+}
+
+/// `config …`.
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Check agent.toml with the environment overrides applied; every problem names its
+    /// line. Exit 2 on any error.
+    Validate,
+    /// Print the effective configuration (file plus environment overrides) as TOML, the
+    /// Vault token reference redacted.
+    Show,
+    /// Print the JSON Schema of agent.toml (the repository keeps it at
+    /// docs/schema/agent.schema.json).
+    Schema,
 }
 
 /// `capture …`.
@@ -312,6 +330,9 @@ async fn dispatch(cmd: Command, config_path: &Path) -> Result<ExitCode> {
         Command::Checks(ChecksCommand::Lint(a)) => checks_lint(&a, config_path).await,
         Command::Capture(CaptureCommand::Status(a)) => capture_status(&a, config_path).await,
         Command::Capture(CaptureCommand::Lookup(a)) => capture_lookup(&a, config_path).await,
+        Command::Config(ConfigCommand::Validate) => config_validate(config_path),
+        Command::Config(ConfigCommand::Show) => config_show(config_path),
+        Command::Config(ConfigCommand::Schema) => config_schema(),
         Command::Run(_) => Ok(ExitCode::SUCCESS),
     }
 }
@@ -1165,9 +1186,44 @@ async fn init(a: &InitArgs, config_path: &Path) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn config_validate(config_path: &Path) -> Result<ExitCode> {
+    let cfg = AgentConfig::load(config_path)?;
+    let overrides = std::env::vars_os()
+        .filter(|(k, _)| k.to_string_lossy().starts_with(metadata::ENV_PREFIX))
+        .count();
+    out(&format!("{}: valid", config_path.display()));
+    out(&format!("  api          {}", cfg.api));
+    out(&format!("  name         {}", cfg.name));
+    out(&format!("  environment  {}", cfg.environment));
+    out(&format!(
+        "  metadata     {} fields set ({overrides} from the environment), reported: {}",
+        cfg.metadata.set_fields(),
+        if cfg.metadata.reported().is_some() {
+            "yes"
+        } else {
+            "no"
+        }
+    ));
+    Ok(ExitCode::SUCCESS)
+}
+
+fn config_show(config_path: &Path) -> Result<ExitCode> {
+    let cfg = AgentConfig::load(config_path)?;
+    out(cfg.redacted().to_toml()?.trim_end());
+    Ok(ExitCode::SUCCESS)
+}
+
+fn config_schema() -> Result<ExitCode> {
+    let text = serde_json::to_string_pretty(&config::json_schema())
+        .map_err(|e| Error::Config(e.to_string()))?;
+    out(&text);
+    Ok(ExitCode::SUCCESS)
+}
+
 fn header_comment(body: &str) -> String {
     format!(
-        "# iohr-agent configuration, written by `iohr-agent init`. What the agent may do is in\n# the policy file, not here. Reference: https://github.com/inorbithr/dataplane\n\n{body}"
+        "# iohr-agent configuration, written by `iohr-agent init`. What the agent may do is in\n# the policy file, not here. Reference: https://github.com/inorbithr/dataplane\n\n{body}{}",
+        metadata::TEMPLATE
     )
 }
 
@@ -1194,5 +1250,23 @@ mod tests {
     fn cli_parses() {
         use clap::CommandFactory as _;
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn the_written_config_carries_the_metadata_template_and_loads() {
+        let cfg = AgentConfig::new(
+            Url::parse("https://api.inorbit.hr").unwrap(),
+            "a".into(),
+            "staging".into(),
+        );
+        let text = header_comment(&cfg.to_toml().unwrap());
+        assert!(text.contains("[metadata.placement]\n# provider ="));
+        let back = AgentConfig::parse(
+            &text,
+            Path::new("agent.toml"),
+            std::iter::empty::<(&str, &str)>(),
+        )
+        .unwrap();
+        assert!(back.metadata.is_default());
     }
 }

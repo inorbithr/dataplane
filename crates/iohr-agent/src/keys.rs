@@ -19,7 +19,18 @@ use zeroize::Zeroizing;
 use crate::error::{Error, Result};
 
 /// Which kind of key the agent makes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    Serialize,
+    Deserialize,
+    clap::ValueEnum,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum KeyAlg {
     /// EC P-256, signs ES256. Accepted by Hydra for `private_key_jwt`.

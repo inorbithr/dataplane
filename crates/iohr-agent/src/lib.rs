@@ -17,6 +17,7 @@ pub mod error;
 pub mod executor;
 pub mod extsock;
 pub mod keys;
+pub mod metadata;
 pub mod platform;
 pub mod policy;
 pub mod protocol;

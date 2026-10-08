@@ -44,7 +44,7 @@ Status: pre-release (`0.1.0-alpha`). Before 1.0 only the latest release gets fix
 
 | Frame | Contents |
 |---|---|
-| `hello` | agent version, policy hash, capabilities, bound domains, the agent's clock; with a [`checks.toml`](docs/checks.md), the declared checks and their hash |
+| `hello` | agent version, policy hash, capabilities, bound domains, the agent's clock; with a [`checks.toml`](docs/checks.md), the declared checks and their hash; the reported part of [`[metadata]`](docs/config.md#metadata) (site, country, owner team, data classes, trust domain; never rack, secrets backend or runbook) |
 | `heartbeat` | a sequence number |
 | `result` | job id, `ok`/`failed`/`refused`, start and end time, latency, HTTP status code, error class, certificate expiry, refusal reason |
 
@@ -111,6 +111,13 @@ Every artifact is an OCI artifact; copy them into your registry with their signa
 | `iohr-agent status` | running, connected, policy hash, what was sent |
 | `iohr-agent policy check [--target URL]` | validate the policy, test a target against it |
 | `iohr-agent checks lint [--resolve]` | validate `checks.toml` against the policy, offline; exit 1 on any error |
+| `iohr-agent config validate` | check `agent.toml` with `IOHR_AGENT_META_*` overrides applied; every problem names its line; exit 2 on any error |
+| `iohr-agent config show` | the effective configuration as TOML, the Vault token reference redacted |
+| `iohr-agent config schema` | the JSON Schema of `agent.toml` ([docs/schema/agent.schema.json](docs/schema/agent.schema.json)) |
+
+`agent.toml` is described in [docs/config.md](docs/config.md), including the `[metadata]`
+sections (where the agent runs, who owns it, what binds it) that devops fills so the
+platform can place its observations; full examples are in [packaging/examples](packaging/examples).
 
 The admin page at `http://127.0.0.1:7790/` (JSON at `/status.json`) is read-only and
 answers only on loopback. Telemetry goes to your OpenTelemetry collector when

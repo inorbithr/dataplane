@@ -1,15 +1,18 @@
 //! `agent.toml`: where the platform is, where the agent keeps its files, and the local
 //! services it runs (admin page, telemetry, secret stores). What the agent may *do* is in
-//! the policy file, not here.
+//! the policy file, not here. `[metadata]` (where it runs, who owns it, what binds it; RFC
+//! 0088) is in [`crate::metadata`]; `docs/config.md` describes the whole file.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::error::{Error, Result};
 use crate::keys::KeyAlg;
+use crate::metadata::{self, MetadataConfig};
 
 /// The environment variable that names the configuration file.
 pub const CONFIG_ENV: &str = "IOHR_AGENT_CONFIG";
@@ -21,8 +24,9 @@ pub const DEFAULT_API: &str = "https://api.inorbit.hr";
 pub const DEFAULT_ADMIN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7790);
 
 /// The parsed `agent.toml`. Relative paths are resolved against the file's directory.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(title = "agent.toml")]
 pub struct AgentConfig {
     /// The platform API base URL.
     pub api: Url,
@@ -60,10 +64,14 @@ pub struct AgentConfig {
     /// Session tuning.
     #[serde(default)]
     pub session: SessionConfig,
+    /// Where this agent runs, who owns it, what binds it and what it can be trusted for
+    /// (RFC 0088; `docs/config.md`). `IOHR_AGENT_META_<SECTION>_<FIELD>` overrides a field.
+    #[serde(default, skip_serializing_if = "MetadataConfig::is_default")]
+    pub metadata: MetadataConfig,
 }
 
 /// The read-only admin page.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AdminConfig {
     /// Serve it at all.
@@ -88,7 +96,7 @@ impl Default for AdminConfig {
 }
 
 /// OpenTelemetry export over OTLP/HTTP. Off unless enabled.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TelemetryConfig {
     /// Export traces, metrics and logs.
@@ -113,7 +121,7 @@ impl Default for TelemetryConfig {
 }
 
 /// Secret stores. A reference is resolved at the moment of the call and dropped after.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SecretsConfig {
     /// HashiCorp Vault (KV version 2).
@@ -124,7 +132,7 @@ pub struct SecretsConfig {
 }
 
 /// HashiCorp Vault.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct VaultConfig {
     /// The address of Vault, e.g. `https://vault.internal:8200`.
@@ -137,7 +145,7 @@ pub struct VaultConfig {
 }
 
 /// Kubernetes API access for `k8s:` references.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct KubernetesConfig {
     /// API server; defaults to the in-cluster address from `KUBERNETES_SERVICE_HOST`.
@@ -161,7 +169,7 @@ impl Default for KubernetesConfig {
 }
 
 /// TLS trust beyond the system's roots.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     /// A PEM bundle of extra CA certificates (a company CA).
@@ -169,7 +177,7 @@ pub struct TlsConfig {
 }
 
 /// Reconnect timing.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SessionConfig {
     /// First reconnect delay ceiling, in milliseconds.
@@ -247,6 +255,7 @@ impl AgentConfig {
             secrets: SecretsConfig::default(),
             tls: TlsConfig::default(),
             session: SessionConfig::default(),
+            metadata: MetadataConfig::default(),
         }
     }
 
@@ -256,12 +265,46 @@ impl AgentConfig {
     /// When the file is missing or invalid.
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).map_err(|e| Error::io(path, e))?;
+        Self::parse(&text, path, std::env::vars())
+    }
+
+    /// Parses `text` as the file at `path`: metadata overrides from `env`
+    /// (`IOHR_AGENT_META_<SECTION>_<FIELD>`) are applied over it, relative paths are
+    /// resolved against the file's directory, and every rule is checked. A problem names
+    /// its line and column when the field is in the text, the variable when it came from
+    /// the environment.
+    ///
+    /// # Errors
+    /// Every problem found, one per line.
+    pub fn parse<I, K, V>(text: &str, path: &Path, env: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
         let mut cfg: Self =
-            toml::from_str(&text).map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
+            toml::from_str(text).map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
+        cfg.metadata
+            .apply_env(env)
+            .map_err(|problems| Error::Config(describe(path, text, &problems)))?;
         let base = path.parent().unwrap_or_else(|| Path::new("."));
         cfg.resolve_paths(base);
+        let problems = cfg.metadata.problems();
+        if !problems.is_empty() {
+            return Err(Error::Config(describe(path, text, &problems)));
+        }
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// A copy for printing: the Vault token reference keeps only its scheme.
+    #[must_use]
+    pub fn redacted(&self) -> Self {
+        let mut copy = self.clone();
+        if let Some(v) = &mut copy.secrets.vault {
+            v.token = format!("{}:<redacted>", v.token.split(':').next().unwrap_or("env"));
+        }
+        copy
     }
 
     /// Makes every relative path absolute against `base`.
@@ -306,6 +349,9 @@ impl AgentConfig {
         if let Err(e) = Url::parse(&self.telemetry.endpoint) {
             return Err(Error::Config(format!("telemetry.endpoint: {e}")));
         }
+        if let Some(p) = self.metadata.problems().first() {
+            return Err(Error::Config(p.to_string()));
+        }
         if let Some(v) = &self.secrets.vault {
             check_platform_url(&v.addr)
                 .map_err(|e| Error::Config(format!("secrets.vault.addr: {e}")))?;
@@ -325,6 +371,26 @@ impl AgentConfig {
     pub fn to_toml(&self) -> Result<String> {
         toml::to_string_pretty(self).map_err(|e| Error::Config(e.to_string()))
     }
+}
+
+/// Problems as `path:line:column: field: message`, one per line; a problem whose field is
+/// not in the text (an environment override) has no position.
+fn describe(path: &Path, text: &str, problems: &[metadata::Problem]) -> String {
+    problems
+        .iter()
+        .map(|p| match metadata::locate(text, &p.path) {
+            Some((line, column)) => format!("{}:{line}:{column}: {p}", path.display()),
+            None => format!("{}: {p}", path.display()),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The JSON Schema of `agent.toml`, generated from these types. The copy in the
+/// repository (`docs/schema/agent.schema.json`) is tested to be this.
+#[must_use]
+pub fn json_schema() -> serde_json::Value {
+    serde_json::to_value(schemars::schema_for!(AgentConfig)).unwrap_or_default()
 }
 
 /// `https`, or `http` to a loopback address (tests and local development only).
@@ -422,5 +488,158 @@ mod tests {
         let r: std::result::Result<AgentConfig, _> =
             toml::from_str("api = \"https://a.b\"\nname = \"a\"\nenvironment = \"s\"\nadmn = {}\n");
         assert!(r.is_err());
+    }
+
+    const HEAD: &str =
+        "api = \"https://api.inorbit.hr\"\nname = \"a\"\nenvironment = \"staging\"\n";
+
+    fn no_env() -> std::iter::Empty<(&'static str, &'static str)> {
+        std::iter::empty()
+    }
+
+    fn parse(text: &str) -> Result<AgentConfig> {
+        AgentConfig::parse(text, Path::new("/etc/iohr-agent/agent.toml"), no_env())
+    }
+
+    #[test]
+    fn metadata_problems_name_their_line() {
+        let err = parse(&format!(
+            "{HEAD}\n[metadata.placement]\nresidency_zone = \"eu\"\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("agent.toml:6:1: metadata.placement.residency_zone: a residency zone needs placement.country"),
+            "{err}"
+        );
+        let err = parse(&format!("{HEAD}[metadata.placement]\ncountry = \"XX\"\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("line 5") && err.contains("ISO 3166"), "{err}");
+        let err = parse(&format!("{HEAD}[metadata.placement]\ncontinent = \"EU\"\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("line 5") && err.contains("unknown field"),
+            "{err}"
+        );
+        let err = parse(&format!(
+            "{HEAD}[metadata.compliance]\ndata_classes_allowed = [\"public\"]\nmay_leave_jurisdiction = [\"public\"]\nexternal_models_may_see = [\"restricted\"]\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("agent.toml:7:1: metadata.compliance.external_models_may_see"),
+            "{err}"
+        );
+        assert!(
+            err.contains("restricted data never reaches a third-party model"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn environment_overrides_win_over_the_file_and_are_checked() {
+        let text = format!("{HEAD}[metadata.placement]\ncountry = \"DE\"\n");
+        let path = Path::new("agent.toml");
+        let cfg = AgentConfig::parse(
+            &text,
+            path,
+            [
+                ("IOHR_AGENT_META_PLACEMENT_COUNTRY", "HR"),
+                ("IOHR_AGENT_META_SECURITY_TRUST_DOMAIN", "example/zg/edge"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.metadata
+                .placement
+                .country
+                .as_ref()
+                .map(metadata::CountryCode::as_str),
+            Some("HR")
+        );
+        assert_eq!(
+            cfg.metadata.security.trust_domain.as_deref(),
+            Some("example/zg/edge")
+        );
+        let err = AgentConfig::parse(
+            &text,
+            path,
+            [("IOHR_AGENT_META_PLACEMENT_COUNTRY", "Germany")],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("IOHR_AGENT_META_PLACEMENT_COUNTRY"), "{err}");
+    }
+
+    #[test]
+    fn the_full_template_loads_round_trips_and_prints_redacted() {
+        let mut cfg = parse(&format!("{HEAD}{}", metadata::full_template())).unwrap();
+        assert_eq!(cfg.metadata.set_fields(), 54);
+        assert!(cfg.metadata.reported().is_some());
+        cfg.secrets.vault = Some(VaultConfig {
+            addr: Url::parse("https://vault.example:8200").unwrap(),
+            token: "env:VAULT_TOKEN".into(),
+            namespace: None,
+        });
+        let again = parse(&cfg.to_toml().unwrap()).unwrap();
+        assert_eq!(again.metadata, cfg.metadata);
+        let shown = cfg.redacted().to_toml().unwrap();
+        assert!(
+            shown.contains("[metadata.placement]") && shown.contains("country = \"DE\""),
+            "{shown}"
+        );
+        assert!(shown.contains("token = \"env:<redacted>\""), "{shown}");
+        assert!(!shown.contains("VAULT_TOKEN"), "{shown}");
+        assert!(
+            !AgentConfig::new(cfg.api.clone(), "a".into(), "staging".into())
+                .to_toml()
+                .unwrap()
+                .contains("metadata")
+        );
+    }
+
+    #[test]
+    fn the_packaged_examples_are_valid() {
+        let examples = [
+            (
+                "packaging/agent.toml",
+                include_str!("../../../packaging/agent.toml"),
+                0,
+            ),
+            (
+                "packaging/examples/agent.enterprise.toml",
+                include_str!("../../../packaging/examples/agent.enterprise.toml"),
+                54,
+            ),
+            (
+                "packaging/examples/agent.macos.toml",
+                include_str!("../../../packaging/examples/agent.macos.toml"),
+                54,
+            ),
+        ];
+        for (name, text, fields) in examples {
+            let cfg = AgentConfig::parse(text, Path::new(name), no_env())
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(cfg.metadata.set_fields(), fields, "{name}");
+            assert!(fields == 0 || cfg.metadata.reported().is_some(), "{name}");
+        }
+        let text = include_str!("../../../packaging/agent.toml");
+        assert!(
+            text.contains(metadata::TEMPLATE.trim_end()),
+            "packaging/agent.toml carries the metadata template"
+        );
+    }
+
+    #[test]
+    fn the_published_schema_is_current() {
+        let published: serde_json::Value =
+            serde_json::from_str(include_str!("../../../docs/schema/agent.schema.json")).unwrap();
+        assert_eq!(
+            published,
+            json_schema(),
+            "docs/schema/agent.schema.json is stale: run `cargo run -p iohr-agent -- config schema > docs/schema/agent.schema.json`"
+        );
     }
 }

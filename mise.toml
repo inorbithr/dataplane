@@ -104,6 +104,8 @@ run = """
 helm lint charts/iohr-agent --strict --set environment=staging
 helm template t charts/iohr-agent --set environment=staging,enrollment.existingSecret=t,secrets.kubernetes.secretNames={a},secrets.vault.addr=https://vault.example:8200,secrets.vault.tokenSecret.name=v,networkPolicy.enabled=true,networkPolicy.egressCIDRs={10.0.0.0/8} > /dev/null
 helm template t charts/iohr-agent --set environment=staging,checks.existingConfigMap=c > /dev/null
+rendered=$(helm template t charts/iohr-agent --set environment=staging,metadata.placement.country=DE,metadata.environment.tier=production,metadata.compliance.regimes={gdpr})
+grep -qF '    [metadata.placement]' <<<"$rendered" && grep -qF '    country = \"DE\"' <<<"$rendered" || { echo "metadata values do not render into agent.toml" >&2; exit 1; }
 if helm template t charts/iohr-agent > /dev/null 2>&1; then echo "environment must be required" >&2; exit 1; fi
 """
 

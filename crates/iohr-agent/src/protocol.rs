@@ -26,6 +26,10 @@ pub enum AgentFrame {
         /// The declared checks, normalized (RFC 0040.1); absent without a checks file.
         #[serde(skip_serializing_if = "Option::is_none")]
         checks: Option<Vec<serde_json::Value>>,
+        /// The reported subset of `[metadata]` (RFC 0088): where it runs, who owns it,
+        /// what binds it. Absent when nothing is set or `metadata.report = false`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<Box<crate::metadata::Reported>>,
     },
     /// Keep-alive.
     Heartbeat {
@@ -152,6 +156,7 @@ mod tests {
             agent_time: "2026-10-03T21:00:00Z".into(),
             checks_hash: None,
             checks: None,
+            metadata: None,
         };
         assert_eq!(
             serde_json::to_value(&hello).unwrap(),
@@ -167,6 +172,7 @@ mod tests {
             agent_time: "t".into(),
             checks_hash: Some("sha256:11".into()),
             checks: Some(vec![]),
+            metadata: None,
         };
         let v = serde_json::to_value(&hello).unwrap();
         assert_eq!(v["checks_hash"], "sha256:11");

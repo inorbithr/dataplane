@@ -29,6 +29,9 @@ data:
     addr = {{ .Values.secrets.vault.addr | quote }}
     token = "env:VAULT_TOKEN"
     {{- end }}
+    {{- if .Values.metadata }}
+    {{- dict "metadata" .Values.metadata | toToml | nindent 4 }}
+    {{- end }}
 {{- if not .Values.policy.existingConfigMap }}
 ---
 apiVersion: v1
