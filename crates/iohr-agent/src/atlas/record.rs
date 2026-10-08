@@ -54,6 +54,21 @@ pub struct RunRecord {
     pub repository: Option<RepositoryRef>,
     /// The cluster read, if any: the kubeconfig context's name and the namespaces.
     pub cluster: Option<ClusterRef>,
+    /// The documentation sources read, if any: their ids and providers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub docs: Vec<DocsSourceRef>,
+}
+
+/// A documentation source this run read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocsSourceRef {
+    /// Its id in `agent.toml`.
+    pub id: String,
+    /// The provider.
+    pub provider: String,
+    /// The workspace or site, by name, as the provider reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
 }
 
 /// A repository this run read.
@@ -85,6 +100,11 @@ impl Sink {
     /// Adds a record.
     pub fn push(&mut self, r: Record) {
         self.records.push(r);
+    }
+
+    /// Puts a record first (the run record, written once the run knows what it read).
+    pub fn prepend(&mut self, r: Record) {
+        self.records.insert(0, r);
     }
 
     /// The entity for `key`, recorded on first use. Keys are `kind/name` and the id is a
@@ -190,6 +210,7 @@ mod tests {
                 commit: Some("0b708ed1".into()),
             }),
             cluster: None,
+            docs: Vec::new(),
         }));
         s.entity("deployment/tbd/labs");
         let mut out = Vec::new();

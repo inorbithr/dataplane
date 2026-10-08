@@ -38,7 +38,8 @@ or `ed25519`).
 
 `[admin]` the loopback status page; `[telemetry]` OTLP export, off by default;
 `[secrets]` the Vault and Kubernetes stores references may resolve from; `[tls]` an extra
-CA bundle; `[session]` reconnect backoff.
+CA bundle; `[session]` reconnect backoff; `[docs]` the documentation sources
+`atlas docs sync` reads, each credential a secret reference ([docs-connectors.md](docs-connectors.md)).
 
 ## Metadata
 

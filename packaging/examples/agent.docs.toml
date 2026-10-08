@@ -1,0 +1,35 @@
+# iohr-agent reading a company's documentation for Atlas (docs/docs-connectors.md).
+# Credentials are secret references, never values; policy.toml must allow each reference
+# under [secrets] allow and each provider host under [networks] allow, for example:
+#
+#   [networks]
+#   allow = ["api.notion.com"]
+#   [secrets]
+#   allow = ["vault:kv/iohr/notion#token"]
+#
+# Run `iohr-agent config validate`, then `iohr-agent atlas docs sync --out docs.jsonl`
+# (incremental) and `--full` once a day (finds deletions). Nothing is sent anywhere.
+api = "https://api.inorbit.hr"
+name = "docs-reader-01"
+environment = "production"
+policy = "/etc/iohr-agent/policy.toml"
+key = "/var/lib/iohr-agent/agent.key"
+state_dir = "/var/lib/iohr-agent"
+
+[secrets.vault]
+addr = "https://vault.example.internal:8200"
+token = "file:/etc/iohr-agent/vault-token"
+
+[docs]
+# Normalized copies, one directory per source, readable by the agent's user only.
+content_dir = "/var/lib/iohr-agent/docs"
+
+# Notion: an internal integration with "Read content" (and "Read comments"), no insert or
+# update capability, "No user information", shared with the pages Atlas may read.
+[[docs.sources]]
+id = "acme-notion"
+provider = "notion"
+token = "vault:kv/iohr/notion#token"
+comments = true
+# requests_per_minute = 180   # Notion's average of three a second
+# max_items = 5000            # per run; the next run continues
