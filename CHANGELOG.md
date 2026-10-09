@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.1.0-alpha.9](https://github.com/inorbithr/dataplane/compare/v0.1.0-alpha.8...v0.1.0-alpha.9) (2026-10-09)
+
+
+### Features
+
+* **agent:** [share] in the policy decides what the hello tells the platform ([#35](https://github.com/inorbithr/dataplane/issues/35)) ([9507c6b](https://github.com/inorbithr/dataplane/commit/9507c6b9fa289af44663df6dfafd6f0354d06174))
+* **agent:** Confluence Cloud documentation connector (REST v2, ADF) ([#31](https://github.com/inorbithr/dataplane/issues/31)) ([920ec2b](https://github.com/inorbithr/dataplane/commit/920ec2bf837107ee9cfad10ad8be2a5074616805))
+* **agent:** static documentation sites through robots.txt and the sitemap ([#37](https://github.com/inorbithr/dataplane/issues/37)) ([b935ffb](https://github.com/inorbithr/dataplane/commit/b935ffb098b8a306a468326548c580d3f1fd840e))
+* **agent:** the decided world, PRDs, ADRs and RFCs read as evidence (atlas observe --decided) ([#39](https://github.com/inorbithr/dataplane/issues/39)) ([378549d](https://github.com/inorbithr/dataplane/commit/378549d8c8bdd571e7caaafcc013e63de25a8575))
+* **agent:** what InOrbit sees, set on the local page or with `iohr agent share` ([#36](https://github.com/inorbithr/dataplane/issues/36)) ([286d5ef](https://github.com/inorbithr/dataplane/commit/286d5ef2f8f67ea0add424f5780c44e1211840fa))
+
+
+### Documentation
+
+* **checks:** an authenticated socket heartbeat calls an RPC its key may call ([#38](https://github.com/inorbithr/dataplane/issues/38)) ([286b329](https://github.com/inorbithr/dataplane/commit/286b32974717f17cd925ecb7a22e4fdf4f449e7b))
+* **readme:** the repository's banner in today's brand, dark and light ([61d7f30](https://github.com/inorbithr/dataplane/commit/61d7f307138cf1ded3c3562f59c271d4f6e3c22e))
+
 ## [0.1.0-alpha.8](https://github.com/inorbithr/dataplane/compare/v0.1.0-alpha.7...v0.1.0-alpha.8) (2026-10-08)
 
 
