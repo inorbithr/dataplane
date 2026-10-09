@@ -7,6 +7,7 @@
 //! documentation sources the same way ([`docs`]).
 
 pub mod common;
+pub mod decided;
 pub mod docs;
 pub mod host;
 pub mod k8s;

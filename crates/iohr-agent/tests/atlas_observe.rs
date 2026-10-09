@@ -217,6 +217,12 @@ fn write(root: &Path, rel: &str, text: &str) {
 fn checkout(root: &Path) {
     write(
         root,
+        "docs/adrs/0067-paging-reaches-only-apple.md",
+        "---\ntitle: Paging reaches only Apple's push service\nkind: adr\nstatus: proposed\npublic: false\n---\n\n## Decision\n\nThe paging service must reach only Apple's push service.\n\n```decided\n[[decided]]\nsubject = \"deployment/tbd/labs\"\npredicate = \"egress_only\"\ntext = \"api.push.apple.com:443\"\n```\n",
+    );
+    write(root, "docs/adrs/README.md", "# ADRs\n\nMust not be read.\n");
+    write(
+        root,
         "Cargo.toml",
         "[workspace]\nmembers = [\"crates/*\"]\n",
     );
@@ -387,6 +393,7 @@ async fn a_checkout_and_a_cluster_give_one_linked_record_set() {
         "k8s.manifest",
         "k8s.networkpolicy",
         "envoy.route",
+        "docs.decided",
         "k8s.api.read",
     ] {
         assert!(
@@ -398,6 +405,10 @@ async fn a_checkout_and_a_cluster_give_one_linked_record_set() {
     let found = summary.repository.unwrap();
     assert_eq!(found.cargo_manifests, 3);
     assert_eq!(found.envoy_routes, 1);
+    assert_eq!(found.decided.documents, 1, "the README is not a document");
+    assert_eq!(found.decided.decided, 1);
+    assert_eq!(found.decided.constraints, 1);
+    assert!(found.decided.refused.is_empty(), "{:?}", found.decided.refused);
     assert_eq!(summary.components, Some((1, 1)));
     let f = facts(records);
     assert!(has(

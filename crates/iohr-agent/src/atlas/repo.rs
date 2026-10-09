@@ -46,6 +46,8 @@ pub mod methods {
     pub const NETPOL: &str = "k8s.networkpolicy";
     /// Envoy routes and clusters.
     pub const ENVOY: &str = "envoy.route";
+    /// PRDs, ADRs and RFCs: what they decide.
+    pub const DECIDED: &str = "docs.decided";
 }
 
 /// A checkout.
@@ -200,6 +202,8 @@ pub struct Found {
     pub k8s_objects: BTreeMap<String, usize>,
     /// Envoy routes read.
     pub envoy_routes: usize,
+    /// The decided world: documents, typed facts, constraint sentences, refusals.
+    pub decided: super::decided::Found,
 }
 
 /// A parsed Kubernetes object with the artefact it came from.
@@ -309,6 +313,33 @@ pub fn observe(repo: &Repo, sink: &mut Sink, clock: &ObservedNow) -> Result<Foun
     observe_k8s(&k8s_ctx, &netpol_ctx, &objects, sink)?;
     for (doc, artifact) in &envoy {
         found.envoy_routes += observe_envoy(&envoy_ctx, doc, *artifact, &objects, sink)?;
+    }
+
+    let decided_ctx = Ctx::new(
+        sink,
+        "decided-document-reader",
+        ObserverClass::DeterministicExtractor,
+        method(methods::DECIDED, MethodCategory::Configuration)?,
+        &principal,
+        &["read"],
+        clock,
+    )?;
+    for rel in repo.files(&["md"]) {
+        let Some(kind) = super::decided::kind_for(&rel) else {
+            continue;
+        };
+        let Some((bytes, artifact)) = repo.read(&decided_ctx, sink, &rel)? else {
+            continue;
+        };
+        super::decided::observe_document(
+            &decided_ctx,
+            sink,
+            &rel,
+            kind,
+            &bytes,
+            artifact,
+            &mut found.decided,
+        )?;
     }
     Ok(found)
 }
