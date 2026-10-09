@@ -128,12 +128,31 @@ tags = { transport = "graphql" }
 name = "ws-heartbeat"
 surface = "ws"
 target = "https://api.example.com/v1/ws"
-method = "iohr.ledger.v1.LedgerService/Ping"
-params = { message = "hi" }
+method = "iohr.events.v1.EventsService/ListEventTypes"
+params = { page_size = 1 }
+auth = "env:PROBE_KEY"
+auth_scheme = "Bearer"
+every = "15m"
+
+[[check]]
+name = "mqtt-heartbeat"
+surface = "mqtt"
+target = "https://api.example.com/v1/mqtt"
+topic = "rpc/events/ListEventTypes"
+params = { page_size = 1 }
 auth = "env:PROBE_KEY"
 auth_scheme = "Bearer"
 every = "15m"
 ```
+
+An authenticated heartbeat calls something its key may call. A key with catalogue scopes
+(`events:read`, `mcp:read`, …; not `iohr.api`) gets past the socket upgrade on `/v1/ws` and
+`/v1/mqtt`, and then the gateway checks every call against the same scope table as REST: a
+method whose route no scope of the key names is refused (`forbidden`, which this agent reports
+as `answer` on `ws` and `status` on `mqtt`). `EventsService/ListEventTypes` is the route of
+`GET /v1/events/types`, which `events:read` admits, and it reads nothing of the account. The
+earlier example, `LedgerService/Ping`, is named by no scope: it passes only with a full API
+token, and a probe key never passes it (found live on 2026-10-08, the outside-in heartbeats).
 
 `grpc` sends an empty request only: a method whose request needs fields is checked by the
 status it refuses with. Requests built from server reflection are not in this version.
