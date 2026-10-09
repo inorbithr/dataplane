@@ -86,6 +86,20 @@ The trial store (`<state_dir>/store/agent.sqlite`, mode 0600 in a 0700 directory
 the same fields the page shows: verdicts, timings, status codes, classes of error and host
 names, never a path, query, body or secret. Nothing in it leaves the machine.
 
+### People, roles and changes (RFC 0100.2, slice 2)
+
+| Threat | Control | Test |
+|---|---|---|
+| Anyone with the URL changes the agent | Every write names a person with a role: the machine's token (owner, `machine`) or a session from the company's identity provider; `viewer` changes nothing, `member` checks, `admin` the policy and extensions | `people_sign_in_with_the_company_idp_and_their_role_decides` |
+| A forged or replayed sign-in | Authorization code with PKCE (S256), a random `state` kept server-side for ten minutes and used once, a `nonce` checked in the ID token; the ID token comes from the token endpoint over TLS (OIDC Core 3.1.3.7), with `iss`, `aud` and `exp` checked; the client secret is a secret reference | `people_sign_in…`, `admin::auth::tests` |
+| Groups misconfigured to give a role | No group named in `[console.oidc] roles` means no session at all; the role is shown on every page and on every audit line | `people_sign_in…` |
+| A web page makes the browser write (CSRF) | A browser's write needs the session's own form token in `X-CSRF-Token` and this page's `Origin`; the CLI's bearer cannot be sent cross-site | `a_browser_write_needs_the_sessions_csrf_token` |
+| A broken file stops the agent | Every file is checked with the agent's own rules before it is written; a file the agent then refuses on reload is put back, and the running agent never left the previous one | `a_config_change_is_checked_applied_versioned_and_rolled_back` |
+| Two people overwrite each other | A change names the version it started from (`base_sha`); a stale one is refused with 409 | same |
+| A change nobody can trace | Every write, sign-in and sign-out is a line in `<state_dir>/audit/audit.jsonl`, hash-chained like the egress ledger, with the reason given; versions keep who, when and why; a policy change is also a `policy_set` ledger entry (hashes only) | `audit::tests`, same |
+| The console widens what the policy forbids | Checks are judged against the policy in force; extensions need the licence and the policy before the lock; only an admin edits the policy itself | `extensions_need_three_yeses_and_an_admin` |
+| Sessions that never end | 30 minutes idle, 12 hours at most, ended on sign-out | `a_browser_write_needs…` |
+
 ## Not covered
 
 - **Root, or the agent's own user.** Either can read the state directory, the token and

@@ -64,6 +64,23 @@ pub struct HostRow {
     pub cost_us: i64,
 }
 
+/// One version of a managed file (`text` only when asked for one version).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ConfigVersion {
+    pub id: i64,
+    pub file: String,
+    pub sha: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    pub who: String,
+    pub name: String,
+    pub role: String,
+    /// `found` (on disk before the console saw it), `apply`, `restore`.
+    pub action: String,
+    pub reason: String,
+    pub at: String,
+}
+
 /// The trial store. Cheap to share; one connection behind a lock (the writes are a few a
 /// minute, the reads are a person looking at a page).
 #[derive(Debug)]
@@ -115,6 +132,19 @@ impl Store {
              );
              CREATE INDEX IF NOT EXISTS runs_key_id ON runs (key, id);
              CREATE INDEX IF NOT EXISTS runs_at ON runs (at);
+             CREATE TABLE IF NOT EXISTS config_versions (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               file TEXT NOT NULL,
+               sha TEXT NOT NULL,
+               text TEXT NOT NULL,
+               who TEXT NOT NULL,
+               name TEXT NOT NULL,
+               role TEXT NOT NULL,
+               action TEXT NOT NULL,
+               reason TEXT NOT NULL,
+               at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS config_versions_file ON config_versions (file, id);
              CREATE TABLE IF NOT EXISTS host (
                at TEXT PRIMARY KEY,
                sensors INTEGER NOT NULL,
@@ -342,6 +372,94 @@ impl Store {
                 "SELECT at FROM runs WHERE key = ?1 ORDER BY id DESC LIMIT 1",
                 params![key],
                 |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql)
+    }
+
+    /// Keeps a version of a managed file; versions are never pruned (they are small and
+    /// they are the history).
+    ///
+    /// # Errors
+    /// SQLite refused the write.
+    pub fn record_version(&self, v: &ConfigVersion) -> Result<i64> {
+        let c = self.conn();
+        c.execute(
+            "INSERT INTO config_versions (file, sha, text, who, name, role, action, reason, at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                v.file,
+                v.sha,
+                v.text.as_deref().unwrap_or(""),
+                v.who,
+                v.name,
+                v.role,
+                v.action,
+                v.reason,
+                v.at
+            ],
+        )
+        .map_err(sql)?;
+        Ok(c.last_insert_rowid())
+    }
+
+    /// A file's versions, newest first, without their text.
+    ///
+    /// # Errors
+    /// SQLite refused the read.
+    pub fn versions(&self, file: &str, limit: usize) -> Result<Vec<ConfigVersion>> {
+        let limit = i64::try_from(limit.clamp(1, MAX_PAGE)).unwrap_or(50);
+        let c = self.conn();
+        let mut stmt = c
+            .prepare(
+                "SELECT id, file, sha, who, name, role, action, reason, at FROM config_versions
+                 WHERE file = ?1 ORDER BY id DESC LIMIT ?2",
+            )
+            .map_err(sql)?;
+        let rows = stmt
+            .query_map(params![file, limit], |r| {
+                Ok(ConfigVersion {
+                    id: r.get(0)?,
+                    file: r.get(1)?,
+                    sha: r.get(2)?,
+                    text: None,
+                    who: r.get(3)?,
+                    name: r.get(4)?,
+                    role: r.get(5)?,
+                    action: r.get(6)?,
+                    reason: r.get(7)?,
+                    at: r.get(8)?,
+                })
+            })
+            .map_err(sql)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(sql)
+    }
+
+    /// One version, with its text.
+    ///
+    /// # Errors
+    /// SQLite refused the read.
+    pub fn version(&self, file: &str, id: i64) -> Result<Option<ConfigVersion>> {
+        self.conn()
+            .query_row(
+                "SELECT id, file, sha, text, who, name, role, action, reason, at FROM config_versions
+                 WHERE file = ?1 AND id = ?2",
+                params![file, id],
+                |r| {
+                    Ok(ConfigVersion {
+                        id: r.get(0)?,
+                        file: r.get(1)?,
+                        sha: r.get(2)?,
+                        text: Some(r.get(3)?),
+                        who: r.get(4)?,
+                        name: r.get(5)?,
+                        role: r.get(6)?,
+                        action: r.get(7)?,
+                        reason: r.get(8)?,
+                        at: r.get(9)?,
+                    })
+                },
             )
             .optional()
             .map_err(sql)

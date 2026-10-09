@@ -125,6 +125,12 @@ pub struct Agent {
     pub shared_checks: Option<(Vec<serde_json::Value>, String)>,
     /// The key target hashes are made with (never sent).
     pub share_key: Vec<u8>,
+    /// The extensions lock this generation runs with (RFC 0073.1).
+    pub lock: crate::extensions::Lock,
+    /// The local console's audit log (RFC 0100.2).
+    pub audit: Option<Arc<crate::audit::Audit>>,
+    /// Secret references, for the console's sign-in client secret.
+    pub secrets: SecretResolver,
 }
 
 impl Agent {
@@ -194,6 +200,7 @@ impl Agent {
         let tokens = TokenSource::new(http, Arc::clone(&enrollment), Arc::new(key))
             .with_ledger(ledger.clone());
         let secrets = SecretResolver::new(config.secrets.clone(), tls.clone());
+        let console_secrets = secrets.clone();
         let share = policy.share();
         let share_key = crate::share::key(&config.state_dir)?;
         let shared_checks = checks.as_ref().map(|c| {
@@ -208,7 +215,18 @@ impl Agent {
             );
             (wire, hash)
         });
-        let host = policy.host().map(|h| {
+        let audit = match crate::audit::Audit::open(&crate::audit::dir_in(&config.state_dir)) {
+            Ok(a) => Some(Arc::new(a)),
+            Err(e) => {
+                tracing::warn!(error = %e, "the local audit log could not be opened: console changes are refused");
+                None
+            }
+        };
+        // The extensions this generation runs (RFC 0073.1): licence, policy and lock.
+        let lock = crate::extensions::Lock::load_or_init(&config.state_dir)?;
+        let host_on = crate::extensions::running("inorbit/host", &policy, &lock);
+        let monitors_on = crate::extensions::running("inorbit/monitors", &policy, &lock);
+        let host = policy.host().filter(|_| host_on).map(|h| {
             Arc::new(std::sync::Mutex::new(crate::host::sampler::Sampler::new(
                 crate::host::sysfs::Root::host(),
                 std::time::Duration::from_secs(h.window_secs),
@@ -218,7 +236,8 @@ impl Agent {
             Executor::new(Arc::clone(&policy), tls.clone(), secrets)
                 .with_checks(checks.clone().map(Arc::new))
                 .with_host(host.clone())
-                .with_share(share.targets, share_key.clone()),
+                .with_share(share.targets, share_key.clone())
+                .with_monitors(monitors_on),
         );
         let state = Arc::new(AgentState::new(
             AgentInfo {
@@ -269,6 +288,9 @@ impl Agent {
             session_destination,
             shared_checks,
             share_key,
+            lock,
+            audit,
+            secrets: console_secrets,
         })
     }
 
@@ -304,6 +326,16 @@ impl Agent {
             state_dir: self.config.state_dir.display().to_string(),
             token,
             account_id: self.enrollment.account_id.clone(),
+            checks_path: self.config.checks.clone(),
+            audit: self.audit.clone(),
+            http: self
+                .tls
+                .reqwest_builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .ok(),
+            secrets: Some(self.secrets.clone()),
+            lock: self.lock.clone(),
         }
     }
 

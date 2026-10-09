@@ -27,7 +27,10 @@ use std::fmt::Write as _;
 use serde_json::{Value, json};
 
 use super::Context;
+use super::auth::Person;
+use super::configs;
 use crate::checks_file::{DeclaredCheck, Kind, RefuseBy};
+use crate::policy::Role;
 use crate::state::JobRecord;
 
 /// Runs per page by default, and the most.
@@ -50,12 +53,18 @@ pub(super) fn is_api(path: &str) -> bool {
 
 /// The local API's answer for a GET, or a 404 in the response contract.
 #[must_use]
-pub(super) fn route(ctx: &Context, path: &str, query: &str) -> Answer {
+pub(super) fn route(
+    ctx: &Context,
+    path: &str,
+    query: &str,
+    person: &Person,
+    csrf: Option<&str>,
+) -> Answer {
     let parts: Vec<&str> = path.trim_end_matches('/').split('/').skip(1).collect();
     let q = Query::parse(query);
     let agent_id = ctx.state.snapshot().agent.agent_id.unwrap_or_default();
     match parts.as_slice() {
-        ["v1", "agents", "self"] => self_doc(ctx, &agent_id),
+        ["v1", "agents", "self"] => self_doc(ctx, &agent_id, person, csrf),
         ["v1", "agents", agent, "ledger"] => {
             if *agent != agent_id {
                 return not_found("agent");
@@ -67,6 +76,11 @@ pub(super) fn route(ctx: &Context, path: &str, query: &str) -> Answer {
                 return not_found("account");
             }
             match rest {
+                ["monitors", ..]
+                    if !crate::extensions::running("inorbit/monitors", &ctx.policy, &ctx.lock) =>
+                {
+                    not_found("monitor (inorbit/monitors is not installed on this agent)")
+                }
                 ["monitors"] => list_monitors(ctx, &q, &agent_id),
                 ["monitors", id] => match monitor(ctx, id, &agent_id) {
                     Some(m) => ok(&json!({"monitor": m})),
@@ -76,7 +90,26 @@ pub(super) fn route(ctx: &Context, path: &str, query: &str) -> Answer {
                 ["agents", agent] if *agent == agent_id => agent_doc(ctx),
                 ["agents", agent, "host"] if *agent == agent_id => host(ctx),
                 ["agents", agent, "share"] if *agent == agent_id => share(ctx),
-                ["agents", _] | ["agents", _, "host" | "share"] => not_found("agent"),
+                ["agents", agent, "config", "files"] if *agent == agent_id => {
+                    config_files(ctx, person)
+                }
+                ["agents", agent, "config", "files", name] if *agent == agent_id => {
+                    config_file(ctx, person, name)
+                }
+                ["agents", agent, "config", "files", name, "versions"] if *agent == agent_id => {
+                    config_versions(ctx, name)
+                }
+                ["agents", agent, "config", "files", name, "versions", id]
+                    if *agent == agent_id =>
+                {
+                    config_version(ctx, name, id)
+                }
+                ["agents", agent, "config", "export"] if *agent == agent_id => {
+                    ok(&json!({"text": configs::export(ctx), "where": "agent"}))
+                }
+                ["agents", agent, "extensions"] if *agent == agent_id => extensions(ctx, person),
+                ["agents", agent, "audit"] if *agent == agent_id => audit(ctx, person),
+                ["agents", ..] => not_found("agent"),
                 _ => not_found("route"),
             }
         }
@@ -94,13 +127,19 @@ pub(super) fn unauthenticated() -> Answer {
     )
 }
 
-/// `405`: the local API is read-only in phase 1.
+/// `403` in the response contract.
+#[must_use]
+pub(super) fn forbidden(msg: &str) -> Answer {
+    error(403, "permission_denied", msg)
+}
+
+/// `405`: what the local API does not change.
 #[must_use]
 pub(super) fn read_only() -> Answer {
     error(
         405,
         "unimplemented",
-        "the local API is read-only in this version; change checks in checks.toml",
+        "this route of the local API is read-only",
     )
 }
 
@@ -340,9 +379,22 @@ fn agent_doc(ctx: &Context) -> Answer {
 
 /// `GET /v1/agents/self` (agent only): who answers here, so a console that opens on this
 /// agent knows which `{org_id}` and `{agent_id}` to ask for.
-fn self_doc(ctx: &Context, agent_id: &str) -> Answer {
+fn self_doc(ctx: &Context, agent_id: &str, person: &Person, csrf: Option<&str>) -> Answer {
     let s = ctx.state.snapshot();
+    let running: Vec<&str> = crate::extensions::builtins()
+        .iter()
+        .filter(|m| crate::extensions::running(m.id, &ctx.policy, &ctx.lock))
+        .map(|m| m.id)
+        .collect();
     ok(&json!({
+        "viewer": {
+            "who": person.who,
+            "name": person.name,
+            "role": person.role.as_str(),
+            "mode": person.mode,
+        },
+        "csrf": csrf,
+        "extensions": running,
         "account_id": ctx.account_id,
         "agent_id": agent_id,
         "name": s.agent.name,
@@ -404,6 +456,557 @@ fn ledger(ctx: &Context, q: &Query) -> Answer {
         "kept": true,
         "where": "agent",
     }))
+}
+
+// ---- configuration management (configs.rs) --------------------------------------------
+
+fn file_of(ctx: &Context, name: &str) -> Option<configs::Managed> {
+    configs::managed(ctx).into_iter().find(|f| f.name == name)
+}
+
+fn config_files(ctx: &Context, person: &Person) -> Answer {
+    let files: Vec<Value> = configs::managed(ctx)
+        .iter()
+        .map(|f| {
+            let text = configs::read(&f.path).unwrap_or_default();
+            let versions = ctx
+                .state
+                .store()
+                .and_then(|s| s.versions(f.name, 1).ok())
+                .and_then(|v| v.into_iter().next());
+            json!({
+                "name": f.name,
+                "what": f.what,
+                "sha": configs::sha(&text),
+                "lines": text.lines().count(),
+                "edit_role": f.edit.as_str(),
+                "can_edit": person.role >= f.edit,
+                "last_change": versions,
+            })
+        })
+        .collect();
+    ok(&json!({"files": files, "where": "agent"}))
+}
+
+fn config_file(ctx: &Context, person: &Person, name: &str) -> Answer {
+    let Some(f) = file_of(ctx, name) else {
+        return not_found("file");
+    };
+    match configs::read(&f.path) {
+        Ok(text) => ok(&json!({
+            "name": f.name,
+            "what": f.what,
+            "sha": configs::sha(&text),
+            "text": text,
+            "edit_role": f.edit.as_str(),
+            "can_edit": person.role >= f.edit,
+            "where": "agent",
+        })),
+        Err(e) => error(500, "internal", &format!("{name}: {e}")),
+    }
+}
+
+fn config_versions(ctx: &Context, name: &str) -> Answer {
+    if file_of(ctx, name).is_none() {
+        return not_found("file");
+    }
+    let versions = ctx
+        .state
+        .store()
+        .and_then(|s| s.versions(name, 200).ok())
+        .unwrap_or_default();
+    ok(&json!({"versions": versions, "kept": ctx.state.store().is_some(), "where": "agent"}))
+}
+
+fn config_version(ctx: &Context, name: &str, id: &str) -> Answer {
+    let Some(f) = file_of(ctx, name) else {
+        return not_found("file");
+    };
+    let Some(v) = id
+        .parse::<i64>()
+        .ok()
+        .and_then(|id| ctx.state.store()?.version(name, id).ok().flatten())
+    else {
+        return not_found("version");
+    };
+    let now = configs::read(&f.path).unwrap_or_default();
+    let diff = configs::diff_json(&now, v.text.as_deref().unwrap_or(""));
+    ok(&json!({"version": v, "diff_from_current": diff, "where": "agent"}))
+}
+
+// ---- extensions ------------------------------------------------------------------------
+
+fn extensions(ctx: &Context, person: &Person) -> Answer {
+    let list: Vec<Value> = crate::extensions::builtins()
+        .iter()
+        .map(|m| {
+            json!({
+                "manifest": m,
+                "state": crate::extensions::state(m, &ctx.policy, &ctx.lock),
+                "can_change": person.role >= Role::Admin && !m.required,
+            })
+        })
+        .collect();
+    ok(&json!({
+        "extensions": list,
+        "catalogue": {
+            "available": false,
+            "why": "the full catalogue is read with your own InOrbit sign-in, which the local console does not have yet; it is at https://console.inorbit.hr/extensions/",
+        },
+        "where": "agent",
+    }))
+}
+
+// ---- the audit log ---------------------------------------------------------------------
+
+fn audit(ctx: &Context, person: &Person) -> Answer {
+    if person.role < Role::Member {
+        return forbidden("the audit log is for members and above");
+    }
+    let Some(a) = &ctx.audit else {
+        return ok(&json!({"entries": [], "kept": false, "where": "agent"}));
+    };
+    let chain = match a.verify() {
+        Ok(n) => json!({"ok": true, "entries": n}),
+        Err(e) => json!({"ok": false, "problem": e}),
+    };
+    ok(&json!({"entries": a.recent(200), "chain": chain, "kept": true, "where": "agent"}))
+}
+
+// ---- writes ----------------------------------------------------------------------------
+
+/// What a write asks the server to note in the audit log.
+#[derive(Debug, Default)]
+pub(super) struct AuditNote {
+    pub action: String,
+    pub target: String,
+    pub outcome: String,
+    pub reason: String,
+}
+
+/// A write's answer, and what the audit log gets.
+#[derive(Debug, Default)]
+pub(super) struct WriteOut {
+    pub body: String,
+    pub audit: Option<AuditNote>,
+}
+
+fn out(a: Answer) -> (u16, WriteOut) {
+    (
+        a.0,
+        WriteOut {
+            body: a.1,
+            audit: None,
+        },
+    )
+}
+
+fn noted(a: Answer, action: &str, target: &str, outcome: &str, reason: &str) -> (u16, WriteOut) {
+    (
+        a.0,
+        WriteOut {
+            body: a.1,
+            audit: Some(AuditNote {
+                action: action.into(),
+                target: target.into(),
+                outcome: outcome.into(),
+                reason: reason.into(),
+            }),
+        },
+    )
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ApplyBody {
+    text: String,
+    #[serde(default)]
+    base_sha: Option<String>,
+    #[serde(default)]
+    reason: String,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct ReasonBody {
+    #[serde(default)]
+    reason: String,
+}
+
+/// A POST or PUT on the local API, by `person`.
+pub(super) async fn write(
+    ctx: &Context,
+    person: &Person,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> (u16, WriteOut) {
+    let parts: Vec<&str> = path.trim_end_matches('/').split('/').skip(1).collect();
+    let agent_id = ctx.state.snapshot().agent.agent_id.unwrap_or_default();
+    let ["v1", "accounts", "orgs", org, "agents", agent, rest @ ..] = parts.as_slice() else {
+        return out(read_only());
+    };
+    if *org != ctx.account_id || *agent != agent_id || ctx.account_id.is_empty() {
+        return out(not_found("agent"));
+    }
+    match (method, rest) {
+        ("POST", ["config", "files", name, "validate"]) => {
+            let Ok(b) = serde_json::from_slice::<ApplyBody>(body) else {
+                return out(error(400, "invalid_argument", "send {\"text\": …}"));
+            };
+            let Some(f) = file_of(ctx, name) else {
+                return out(not_found("file"));
+            };
+            let now = configs::read(&f.path).unwrap_or_default();
+            let problems = configs::validate(ctx, name, &b.text);
+            out(ok(&json!({
+                "problems": problems,
+                "valid": problems.iter().all(|p| p.level != "error"),
+                "diff": configs::diff_json(&now, &b.text),
+                "sha": configs::sha(&now),
+            })))
+        }
+        ("PUT", ["config", "files", name]) => {
+            let Ok(b) = serde_json::from_slice::<ApplyBody>(body) else {
+                return out(error(
+                    400,
+                    "invalid_argument",
+                    "send {\"text\": …, \"base_sha\": …, \"reason\": …}",
+                ));
+            };
+            apply(
+                ctx,
+                person,
+                name,
+                &b.text,
+                b.base_sha.as_deref(),
+                &b.reason,
+                "apply",
+            )
+            .await
+        }
+        ("POST", ["config", "files", name, "versions", id, "restore"]) => {
+            let b: ReasonBody = serde_json::from_slice(body).unwrap_or_default();
+            let Some(v) = id
+                .parse::<i64>()
+                .ok()
+                .and_then(|id| ctx.state.store()?.version(name, id).ok().flatten())
+            else {
+                return out(not_found("version"));
+            };
+            let reason = if b.reason.trim().is_empty() {
+                format!("restore version {}", v.id)
+            } else {
+                b.reason
+            };
+            apply(
+                ctx,
+                person,
+                name,
+                v.text.as_deref().unwrap_or(""),
+                None,
+                &reason,
+                "restore",
+            )
+            .await
+        }
+        (
+            "POST",
+            [
+                "extensions",
+                publisher,
+                ext,
+                action @ ("enable" | "disable"),
+            ],
+        ) => {
+            let b: ReasonBody = serde_json::from_slice(body).unwrap_or_default();
+            toggle(
+                ctx,
+                person,
+                &format!("{publisher}/{ext}"),
+                *action == "enable",
+                &b.reason,
+            )
+            .await
+        }
+        _ => out(read_only()),
+    }
+}
+
+/// Validates, writes atomically, reloads the agent, and rolls back when it refuses.
+#[allow(clippy::too_many_lines)] // the steps of one change, in order
+async fn apply(
+    ctx: &Context,
+    person: &Person,
+    name: &str,
+    text: &str,
+    base_sha: Option<&str>,
+    reason: &str,
+    action: &str,
+) -> (u16, WriteOut) {
+    let Some(f) = file_of(ctx, name) else {
+        return out(not_found("file"));
+    };
+    let audit_action = format!("config.{action}");
+    if person.role < f.edit {
+        return noted(
+            forbidden(&format!(
+                "changing {name} needs the {} role",
+                f.edit.as_str()
+            )),
+            &audit_action,
+            name,
+            "refused: role",
+            reason,
+        );
+    }
+    let problems = configs::validate(ctx, name, text);
+    if problems.iter().any(|p| p.level == "error") {
+        return out((
+            422,
+            json!({
+                "code": "failed_precondition",
+                "error": format!("{name} has errors; nothing was changed"),
+                "problems": problems,
+                "details": [],
+                "request_id": uuid::Uuid::now_v7().to_string(),
+            })
+            .to_string(),
+        ));
+    }
+    let before = match configs::read(&f.path) {
+        Ok(t) => t,
+        Err(e) => return out(error(500, "internal", &format!("{name}: {e}"))),
+    };
+    if base_sha.is_some_and(|b| b != configs::sha(&before)) {
+        return out(error(
+            409,
+            "aborted",
+            &format!("{name} changed since you opened it; load it again and redo your change"),
+        ));
+    }
+    if before == text {
+        return out(ok(
+            &json!({"applied": false, "message": "nothing changed", "sha": configs::sha(text)}),
+        ));
+    }
+    let store = ctx.state.store();
+    let record = |text: &str, who: &str, name_: &str, role: &str, act: &str, why: &str| {
+        store.and_then(|s| {
+            s.record_version(&crate::store::ConfigVersion {
+                id: 0,
+                file: f.name.into(),
+                sha: configs::sha(text),
+                text: Some(text.into()),
+                who: who.into(),
+                name: name_.into(),
+                role: role.into(),
+                action: act.into(),
+                reason: why.into(),
+                at: crate::enroll::now_rfc3339(),
+            })
+            .ok()
+        })
+    };
+    // The text as found, so the first change can be rolled back to it too.
+    if store.is_some_and(|s| s.versions(f.name, 1).is_ok_and(|v| v.is_empty())) {
+        record(
+            &before,
+            "file",
+            "The file on disk",
+            "-",
+            "found",
+            "as found before the first change from the console",
+        );
+    }
+    if let Err(e) = configs::write_atomic(&f.path, text) {
+        return out(error(500, "internal", &format!("{name}: {e}")));
+    }
+    // Reload: a new generation with the new files, in this process.
+    let reloaded = match &ctx.reload {
+        None => Ok("written (no running agent to reload)".to_owned()),
+        Some(tx) => {
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            if tx.send(crate::agent::Reload { reply }).await.is_err() {
+                Err("the agent did not take the reload".to_owned())
+            } else {
+                match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+                    Ok(Ok(r)) => r,
+                    _ => Err("the agent did not answer the reload in time".to_owned()),
+                }
+            }
+        }
+    };
+    match reloaded {
+        Err(e) => {
+            // Back to what was there: the agent never left it.
+            let _ = configs::write_atomic(&f.path, &before);
+            noted(
+                (
+                    422,
+                    json!({
+                        "code": "failed_precondition",
+                        "error": format!("the agent refused the new {name}, so it was put back: {e}"),
+                        "rolled_back": true,
+                        "details": [],
+                        "request_id": uuid::Uuid::now_v7().to_string(),
+                    })
+                    .to_string(),
+                ),
+                &audit_action,
+                name,
+                "rolled back",
+                reason,
+            )
+        }
+        Ok(msg) => {
+            let id = record(
+                text,
+                &person.who,
+                &person.name,
+                person.role.as_str(),
+                action,
+                reason,
+            );
+            if name == "policy.toml"
+                && let Some(l) = &ctx.ledger
+            {
+                let payload = crate::checks_file::canonical_json(&json!({
+                    "from": configs::sha(&before),
+                    "to": configs::sha(text),
+                    "by": person.who,
+                }));
+                if let Err(e) = l.record(crate::ledger::Record {
+                    kind: "policy_set",
+                    payload: payload.as_bytes(),
+                    rule: "operator.console.policy",
+                    destination: "local: policy.toml (nothing sent)",
+                    job_id: None,
+                }) {
+                    tracing::warn!(error = %e, "the policy change was not noted in the ledger");
+                }
+            }
+            noted(
+                ok(&json!({
+                    "applied": true,
+                    "message": msg,
+                    "version": id,
+                    "sha": configs::sha(text),
+                    "problems": problems,
+                })),
+                &audit_action,
+                name,
+                "ok",
+                reason,
+            )
+        }
+    }
+}
+
+/// Installs (adds to the lock) or removes an extension, then reloads. The licence and the
+/// policy are not the console's to change: an extension they do not admit is refused.
+async fn toggle(
+    ctx: &Context,
+    person: &Person,
+    id: &str,
+    enable: bool,
+    reason: &str,
+) -> (u16, WriteOut) {
+    let action = if enable {
+        "extension.enable"
+    } else {
+        "extension.disable"
+    };
+    let Some(m) = crate::extensions::builtins()
+        .into_iter()
+        .find(|m| m.id == id)
+    else {
+        return out(not_found("extension"));
+    };
+    if person.role < Role::Admin {
+        return noted(
+            forbidden("installing and removing extensions needs the admin role"),
+            action,
+            id,
+            "refused: role",
+            reason,
+        );
+    }
+    if m.required && !enable {
+        return out(error(
+            412,
+            "failed_precondition",
+            &format!("{id} is what the agent runs on; it cannot be removed"),
+        ));
+    }
+    let st = crate::extensions::state(&m, &ctx.policy, &ctx.lock);
+    if enable && (!st.licence.ok || !st.policy.ok) {
+        let why = if st.licence.ok {
+            st.policy.why
+        } else {
+            st.licence.why
+        };
+        return noted(
+            error(412, "failed_precondition", &why),
+            action,
+            id,
+            "refused: not admitted",
+            reason,
+        );
+    }
+    let dir = std::path::Path::new(&ctx.state_dir);
+    let mut lock = match crate::extensions::Lock::load_or_init(dir) {
+        Ok(l) => l,
+        Err(e) => return out(error(500, "internal", &e.to_string())),
+    };
+    if enable == lock.has(id) {
+        return out(ok(&json!({"changed": false})));
+    }
+    let before = lock.clone();
+    if enable {
+        lock.extensions.push(crate::extensions::LockEntry {
+            id: id.into(),
+            version: m.version.into(),
+            installed_by: format!("{} ({})", person.name, person.role.as_str()),
+            at: crate::enroll::now_rfc3339(),
+        });
+    } else {
+        lock.extensions.retain(|e| e.id != id);
+    }
+    if let Err(e) = lock.save(dir) {
+        return out(error(500, "internal", &e.to_string()));
+    }
+    if let Some(tx) = &ctx.reload {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let r = if tx.send(crate::agent::Reload { reply }).await.is_ok() {
+            tokio::time::timeout(std::time::Duration::from_secs(30), rx)
+                .await
+                .ok()
+                .and_then(std::result::Result::ok)
+                .unwrap_or_else(|| Err("no answer".into()))
+        } else {
+            Err("the agent did not take the reload".into())
+        };
+        if let Err(e) = r {
+            let _ = before.save(dir);
+            return noted(
+                error(
+                    422,
+                    "failed_precondition",
+                    &format!("the agent refused it, so nothing changed: {e}"),
+                ),
+                action,
+                id,
+                "rolled back",
+                reason,
+            );
+        }
+    }
+    noted(
+        ok(&json!({"changed": true, "installed": enable})),
+        action,
+        id,
+        "ok",
+        reason,
+    )
 }
 
 #[cfg(test)]
