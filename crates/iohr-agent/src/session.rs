@@ -51,6 +51,27 @@ pub fn session_url(api: &Url) -> Result<Url> {
     Ok(url)
 }
 
+/// The heartbeat carries the host summary every this many beats (a minute at the
+/// platform's 15 s), and on the first.
+pub const HOST_EVERY: u64 = 4;
+
+/// The host summary for heartbeat `seq`, when the policy shares it (`[share] host`) and
+/// observes the host (`[work] host`), on the first beat and every [`HOST_EVERY`]th.
+fn host_summary(agent: &Agent, seq: u64) -> Option<serde_json::Value> {
+    if !agent.policy.share().host || (seq != 1 && !seq.is_multiple_of(HOST_EVERY)) {
+        return None;
+    }
+    let sampler = agent.host.as_ref()?;
+    let (root, chips) = match sampler.lock() {
+        Ok(g) => (g.root().clone(), g.chips().to_vec()),
+        Err(p) => {
+            let g = p.into_inner();
+            (g.root().clone(), g.chips().to_vec())
+        }
+    };
+    Some(crate::host::summary::summary(&root, &chips))
+}
+
 /// Exponential backoff with full jitter.
 #[derive(Debug)]
 pub struct Backoff {
@@ -271,7 +292,8 @@ async fn once(agent: &Arc<Agent>, shutdown: &mut watch::Receiver<bool>) -> Resul
             }
             _ = heartbeat.tick() => {
                 seq += 1;
-                send(agent, &mut sink, &AgentFrame::Heartbeat { seq }, "contract.heartbeat", None).await?;
+                let host = host_summary(agent, seq);
+                send(agent, &mut sink, &AgentFrame::Heartbeat { seq, host }, "contract.heartbeat", None).await?;
                 agent.state.heartbeat();
                 // The contract has no frame from the platform between jobs; a WebSocket
                 // ping makes any server answer with a pong, so a half-open connection is

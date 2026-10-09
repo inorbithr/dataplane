@@ -564,6 +564,8 @@ async fn share_cmd(args: &ShareArgs, config_path: &Path) -> Result<ExitCode> {
             _ => TargetShare::Hash,
         },
         hostname: args.hostname.as_deref().map_or(now.hostname, |h| h == "on"),
+        // Set in the policy file; `share` keeps it.
+        host: now.host,
     };
     let changed = crate::share::write_policy(&cfg.policy, &want).map_err(|e| match e {
         Error::Io { .. } => Error::Config(format!(
@@ -1589,7 +1591,11 @@ fn ask_share(p: &Prompter, a: &InitArgs) -> Result<crate::policy::SharePolicy> {
             "yes" | "y" | "on"
         ),
     };
-    Ok(SharePolicy { targets, hostname })
+    Ok(SharePolicy {
+        targets,
+        hostname,
+        host: false,
+    })
 }
 
 fn toml_list(items: &[String]) -> String {

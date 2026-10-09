@@ -11,7 +11,8 @@
 //! - [`boot`]: boots and whether each ended with a recorded shutdown, watchdog;
 //! - [`derive`]: deterministic findings over the above, with honest verdicts;
 //! - [`sampler`]: a rolling window of sensor readings and disk counters;
-//! - [`check`]: the `hwmon` threshold check judged on that window.
+//! - [`check`]: the `hwmon` threshold check judged on that window;
+//! - [`summary`]: the coarse host summary the heartbeat carries under `[share] host`.
 
 pub mod boot;
 pub mod check;
@@ -22,6 +23,7 @@ pub mod pressure;
 pub mod report;
 pub mod sampler;
 pub mod storage;
+pub mod summary;
 pub mod sysfs;
 
 use std::time::Instant;

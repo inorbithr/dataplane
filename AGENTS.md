@@ -29,7 +29,7 @@ change: change core in step, and say so in the PR.
 ## Rules
 
 - Read `CONTRIBUTING.md`. The policy wins; only timings, codes, classes and counts leave
-  the machine (plus the targets, categories and tags a company declares in `checks.toml` and the `capture:*` capability strings, sent in the hello; an `hwmon` check's result adds the sensor key, its numbers and level, only when the policy sets `[work] host` and lists `hwmon`; a transport check's request stays in `checks.toml`, the job names its key); capture data never leaves the host (`crates/iohr-agent/tests/capture_privacy.rs`, control DAT-10); no new listener; small dependency set.
+  the machine (plus the targets, categories and tags a company declares in `checks.toml` and the `capture:*` capability strings, sent in the hello; an `hwmon` check's result adds the sensor key, its numbers and level, only when the policy sets `[work] host` and lists `hwmon`; the heartbeat's coarse host summary (mount points, free space, temperatures, `md` and NVMe states) only with `[share] host = true`; a transport check's request stays in `checks.toml`, the job names its key); capture data never leaves the host (`crates/iohr-agent/tests/capture_privacy.rs`, control DAT-10); no new listener; small dependency set.
 - Hydra (the platform's identity provider) accepts only RS/PS/ES algorithms for
   `private_key_jwt`; the default key is ES256 for that reason.
 - Capture (ADR 0002): `unsafe` only in `crates/iohr-capture-ebpf` and the `aya::Pod` impls

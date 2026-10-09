@@ -58,6 +58,12 @@ pub struct Sampler {
 pub type Shared = Arc<Mutex<Sampler>>;
 
 impl Sampler {
+    /// The tree it reads (`/`, or a captured one).
+    #[must_use]
+    pub fn root(&self) -> &Root {
+        &self.root
+    }
+
     /// A sampler over `root`, keeping `window` of history.
     #[must_use]
     pub fn new(root: Root, window: Duration) -> Self {

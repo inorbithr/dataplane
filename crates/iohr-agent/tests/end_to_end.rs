@@ -431,6 +431,49 @@ async fn start_on_fixture(
     (agent, tx, task)
 }
 
+/// RFC 0102: the heartbeat carries the host summary only when `[share] host` says so,
+/// and then only coarse numbers and labels: here the captured TRX40, whose arrays and
+/// NVMe controllers the platform can show.
+#[tokio::test]
+async fn the_heartbeat_carries_the_host_only_when_shared() {
+    for (share, carried) in [("", false), ("host = true\n", true)] {
+        let mut h = harness_with(
+            KeyAlg::Es256,
+            &format!(
+                "[work]\nhost = true\nsurfaces = [\"http\", \"hwmon\"]\n[host]\nsample_secs = 5\nwindow_secs = 60\n[share]\ntargets = \"full\"\n{share}"
+            ),
+        )
+        .await;
+        let (_agent, stop, task) = start_on_fixture(&h).await;
+        next(&mut h.frames, "hello").await;
+        let (_, hb) = next(&mut h.frames, "heartbeat").await;
+        assert_eq!(hb["seq"], 1);
+        assert_eq!(hb.get("host").is_some(), carried, "{share:?}: {hb}");
+        if carried {
+            let host = &hb["host"];
+            let md0 = host["arrays"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["name"] == "md0")
+                .unwrap();
+            assert_eq!(md0["level"], "raid0");
+            assert!(host["controllers"].as_array().unwrap().len() >= 4);
+            assert!(
+                host["temperatures"]
+                    .as_array()
+                    .is_some_and(|t| !t.is_empty())
+            );
+            let text = host.to_string();
+            for never in ["serial", "model", "firmware", "Samsung", "KINGSTON"] {
+                assert!(!text.contains(never), "{never} left the machine: {text}");
+            }
+        }
+        stop.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+}
+
 #[tokio::test]
 async fn an_hwmon_check_runs_from_the_sampler_and_survives_a_restart() {
     let mut h = harness_with(
