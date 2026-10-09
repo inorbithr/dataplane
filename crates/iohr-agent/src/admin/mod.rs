@@ -21,7 +21,9 @@
 //!   403 (a cross-site top-level navigation to an HTML page is let through: it cannot read
 //!   the answer); no CORS header is ever sent.
 //! - **Headers**: a CSP with `default-src 'none'`, the one stylesheet by hash, no script
-//!   at all; `frame-ancestors 'none'`, `nosniff`, `no-referrer`, `no-store`.
+//!   at all; `frame-ancestors 'none'`, `nosniff`, `Referrer-Policy: same-origin` (no referrer to
+//!   any other site; `no-referrer` would make browsers send `Origin: null` on the page's own
+//!   form), `no-store`.
 //! - **Never shown**: the private key, enrollment tokens, secret values, check auth
 //!   headers; every body passes through [`crate::redact`] last.
 //! - **Bounded**: 8 KiB of request headers, no bodies, 5 s to send them, 10 s per write,
@@ -971,7 +973,7 @@ fn headers(srv: &Server, status: u16, ctype: &str, len: u64, extra: &[(&str, &st
     let mut h = format!(
         "HTTP/1.1 {status} {}\r\nContent-Type: {ctype}\r\nContent-Length: {len}\r\n\
 Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\n\
-Referrer-Policy: no-referrer\r\nContent-Security-Policy: {}\r\n\
+Referrer-Policy: same-origin\r\nContent-Security-Policy: {}\r\n\
 Cross-Origin-Opener-Policy: same-origin\r\nCross-Origin-Resource-Policy: same-origin\r\n\
 Permissions-Policy: camera=(), microphone=(), geolocation=(), interest-cohort=()\r\n",
         reason(status),

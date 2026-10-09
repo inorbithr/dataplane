@@ -508,7 +508,9 @@ async fn every_answer_carries_the_security_headers_and_no_cors() {
             assert!(head.contains("frame-ancestors 'none'"), "{path}");
             assert!(head.contains("script-src 'none'"), "{path}");
             assert!(head.contains("X-Content-Type-Options: nosniff"), "{path}");
-            assert!(head.contains("Referrer-Policy: no-referrer"), "{path}");
+            // same-origin, not no-referrer: with no-referrer a browser posts the page's own
+            // form with `Origin: null`, which the origin check refuses.
+            assert!(head.contains("Referrer-Policy: same-origin"), "{path}");
             assert!(head.contains("Cache-Control: no-store"), "{path}");
             assert!(
                 !head.to_ascii_lowercase().contains("access-control-"),

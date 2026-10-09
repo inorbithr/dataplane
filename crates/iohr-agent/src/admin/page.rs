@@ -348,10 +348,10 @@ fn layout(
     let served = local.map_or_else(String::new, |l| format!(" on {l}"));
     let _ = ctx;
     format!(
-        "<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\"><meta name=referrer content=no-referrer><title>{title} · {name} · InOrbit agent</title><link rel=icon href=/favicon.svg type=\"image/svg+xml\"><style>{CSS}</style></head><body>\
+        "<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\"><meta name=referrer content=same-origin><title>{title} · {name} · InOrbit agent</title><link rel=icon href=/favicon.svg type=\"image/svg+xml\"><style>{CSS}</style></head><body>\
 <header class=top><div class=brand>{LOGO}<span>InOrbit agent <small>local page</small></span></div><div class=who><b>{name}</b>{conn}</div></header>\
 <nav aria-label=Sections>{nav}</nav><main>{body}</main>\
-<footer>Served by this agent{served}, read-only. Nothing on this page is sent anywhere; secrets are redacted before it is shown. This section as JSON: <a href=\"{api}\">{api}</a>.</footer></body></html>",
+<footer>Served by this agent{served}; read-only but for <a href=\"/policy#share\">What InOrbit sees</a>, changed only on this machine. Nothing on this page is sent anywhere; secrets are redacted before it is shown. This section as JSON: <a href=\"{api}\">{api}</a>.</footer></body></html>",
         name = esc(&s.agent.name),
     )
 }
