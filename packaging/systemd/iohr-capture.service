@@ -1,6 +1,6 @@
 # iohr-capture: the privileged capture companion of iohr-agent (docs/adr/0002).
 # Installed by the iohr-capture package, never enabled or started by it:
-#   echo IOHR_CAPTURE_INTERFACE=eth0 | sudo tee /etc/iohr-capture/capture.env
+#   set IOHR_CAPTURE_INTERFACES=eth0 (a list) or IOHR_CAPTURE_ALL_INTERFACES=true in /etc/iohr-capture/capture.env
 #   sudo systemctl enable --now iohr-capture
 # It holds CAP_BPF, CAP_PERFMON and CAP_NET_ADMIN only to load and attach its TC
 # classifiers, then drops them (on kernels before 6.6 it keeps CAP_NET_ADMIN to remove its

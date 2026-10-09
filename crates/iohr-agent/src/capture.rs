@@ -43,6 +43,8 @@ pub const WIRE_VERSION_2: u64 = 2;
 pub const CONTROL_SOCKET_NAME: &str = "control.sock";
 /// How long the hello waits for the companion.
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(1);
+/// Most interfaces one companion reports.
+pub const MAX_INTERFACES: usize = 16;
 /// Largest answer read.
 const MAX_ANSWER: u64 = 1024 * 1024;
 
@@ -246,6 +248,10 @@ pub struct Counts {
     /// Layer 1.
     #[serde(default)]
     pub headers: Headers,
+    /// Layer 1 per attached interface, by slot (numbers only; names stay in the
+    /// companion's tables, for a person on the host).
+    #[serde(default)]
+    pub interfaces: Vec<Headers>,
     /// Drops.
     #[serde(default)]
     pub drops: Drops,
@@ -284,6 +290,7 @@ impl Counts {
         if c.version != WIRE_VERSION {
             return Err(format!("unsupported protocol version {}", c.version));
         }
+        c.interfaces.truncate(MAX_INTERFACES);
         c.layers.retain(|l| {
             crate::policy::CaptureLayer::ALL
                 .iter()
@@ -649,6 +656,8 @@ mod tests {
             "version": 1, "companion_version": "0.1.0", "interface": "eth0",
             "updated_unix_ms": updated, "layers": ["headers", "protocols", "owners", "tcp", "packets", "timing", "payloads"],
             "headers": {"ingress": {"packets": 10, "bytes": 1000}, "egress": {"packets": 5, "bytes": 500}},
+            "interfaces": [{"slot": 0, "name": "eth0", "ingress": {"packets": 6, "bytes": 600}, "egress": {"packets": 1, "bytes": 100}},
+                           {"slot": 1, "name": "bond0", "ingress": {"packets": 4, "bytes": 400}, "egress": {"packets": 4, "bytes": 400}}],
             "protocols": {"http1_requests": 3, "tls_client_hellos": 2},
             "tables": {"tls": {"sni": [{"key": "secret.example", "count": 2}]}},
         }))
@@ -659,6 +668,12 @@ mod tests {
     fn keeps_numbers_only() {
         let c = Counts::parse(&answer(now_ms())).unwrap();
         assert_eq!(c.headers.ingress.packets, 10);
+        assert_eq!(c.interfaces.len(), 2);
+        assert_eq!(c.interfaces[1].egress.bytes, 400);
+        assert!(
+            !serde_json::to_string(&c).unwrap().contains("bond0"),
+            "names never kept"
+        );
         assert_eq!(c.protocols.http1_requests, 3);
         assert_eq!(
             c.layers,

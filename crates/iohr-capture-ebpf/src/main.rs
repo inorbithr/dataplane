@@ -30,7 +30,7 @@ use aya_ebpf::{
     bindings::TC_ACT_OK,
     helpers::{bpf_ktime_get_ns, bpf_skb_load_bytes},
     macros::{classifier, map},
-    maps::{Array, LruHashMap, LruPerCpuHashMap, PerCpuArray, RingBuf},
+    maps::{Array, HashMap, LruHashMap, LruPerCpuHashMap, PerCpuArray, RingBuf},
     programs::TcContext,
 };
 use iohr_capture_common::{
@@ -38,10 +38,10 @@ use iohr_capture_common::{
     CLASS_TCP6, CLASS_UDP4, CLASS_UDP6, CONFIG_HEADERS, CONFIG_PACKETS, CONFIG_PROTOCOLS,
     CONFIG_TIMING, Config, Counters, DEFAULT_PACKETS_RING_BYTES, DEFAULT_RING_BYTES, DIRECTIONS,
     EGRESS, FLAG_FIN, FLAG_RST, FLAG_SLOTS, FLAG_SYN, FLAG_SYN_ACK, FLOW_ENTRIES, FlowKey,
-    HEADER_BYTES, INGRESS, KIND_LIFECYCLE, KIND_PAYLOAD, PACKET_TIERS, PAYLOAD_BYTES, PORT_ENTRIES,
-    PacketRecord, PortCounters, PortKey, RECORD_DATA, Record, STAT_COPIED, STAT_PAYLOAD,
-    STAT_PKT_BYTES, STAT_PKT_COPIED, STAT_PKT_RATE_LIMITED, STAT_PKT_RINGBUF_FULL,
-    STAT_RATE_LIMITED, STAT_RINGBUF_FULL, STAT_SHORT, STATS,
+    HEADER_BYTES, INGRESS, Interface, KIND_LIFECYCLE, KIND_PAYLOAD, MAX_INTERFACES, PACKET_TIERS,
+    PAYLOAD_BYTES, PORT_ENTRIES, PacketRecord, PortCounters, PortKey, RECORD_DATA, Record,
+    STAT_COPIED, STAT_PAYLOAD, STAT_PKT_BYTES, STAT_PKT_COPIED, STAT_PKT_RATE_LIMITED,
+    STAT_PKT_RINGBUF_FULL, STAT_RATE_LIMITED, STAT_RINGBUF_FULL, STAT_SHORT, STATS,
 };
 
 #[map(name = "IOHR_COUNTERS")]
@@ -65,6 +65,11 @@ const BUCKET_COPIES: u32 = 0;
 const BUCKET_PACKETS: u32 = 1;
 #[map(name = "IOHR_CONFIG")]
 static CONFIG: Array<Config> = Array::with_max_entries(1, 0);
+#[map(name = "IOHR_INTERFACES")]
+static INTERFACES: HashMap<u32, Interface> = HashMap::with_max_entries(MAX_INTERFACES, 0);
+#[map(name = "IOHR_INTERFACE_COUNTERS")]
+static INTERFACE_COUNTERS: PerCpuArray<Counters> =
+    PerCpuArray::with_max_entries(MAX_INTERFACES * DIRECTIONS, 0);
 #[map(name = "IOHR_EVENTS")]
 static EVENTS: RingBuf = RingBuf::with_byte_size(DEFAULT_RING_BYTES, 0);
 /// Layer 3: whole packets. User space sets its size (a page when packets are off).
@@ -128,11 +133,23 @@ fn handle(ctx: &TcContext, direction: u32) {
     let len = ctx.len();
     add_counters(&COUNTERS, direction, len);
     let Some(cfg) = CONFIG.get(0) else { return };
+    // SAFETY: the context's socket buffer pointer is valid for the program's run.
+    let ifindex = unsafe { (*ctx.skb.skb).ifindex };
+    // SAFETY: a plain read of a value user space wrote before attaching.
+    let l2_len = match unsafe { INTERFACES.get(ifindex) } {
+        Some(i) => {
+            if i.slot < MAX_INTERFACES {
+                add_counters(&INTERFACE_COUNTERS, i.slot * DIRECTIONS + direction, len);
+            }
+            i.l2_len
+        }
+        None => cfg.l2_len,
+    };
     let ethertype = u16::from_be(ctx.skb.protocol() as u16);
     if cfg.flags & CONFIG_PACKETS != 0 {
-        copy_packet(ctx, direction, ethertype, cfg);
+        copy_packet(ctx, direction, ethertype, cfg, l2_len);
     }
-    let Some(p) = parse(ctx, ethertype, cfg.l2_len) else {
+    let Some(p) = parse(ctx, ethertype, l2_len) else {
         add_counters(&CLASSES, direction * CLASS_SLOTS + CLASS_NON_IP, len);
         return;
     };
@@ -195,7 +212,7 @@ fn handle(ctx: &TcContext, direction: u32) {
     } else {
         KIND_LIFECYCLE
     };
-    copy(ctx, direction, ethertype, cfg.l2_len, want, kind);
+    copy(ctx, direction, ethertype, l2_len, want, kind);
 }
 
 #[inline(always)]
@@ -458,7 +475,7 @@ fn copy(ctx: &TcContext, direction: u32, ethertype: u16, l2_len: u32, want: u32,
 /// Layer 3: the whole packet, up to `snaplen` bytes, into the packets ring buffer.
 #[inline(always)]
 #[allow(clippy::cast_possible_truncation)] // the tiers are constants far below u32::MAX
-fn copy_packet(ctx: &TcContext, direction: u32, ethertype: u16, cfg: &Config) {
+fn copy_packet(ctx: &TcContext, direction: u32, ethertype: u16, cfg: &Config, l2_len: u32) {
     if !take_token(BUCKET_PACKETS, cfg.pkt_interval_ns, cfg.pkt_burst_ns) {
         bump(&STATS_MAP, STAT_PKT_RATE_LIMITED);
         return;
@@ -470,13 +487,13 @@ fn copy_packet(ctx: &TcContext, direction: u32, ethertype: u16, cfg: &Config) {
         skb_len
     };
     if n <= PACKET_TIERS[0] as u32 {
-        copy_tier::<{ PACKET_TIERS[0] }>(ctx, direction, ethertype, cfg.l2_len, n);
+        copy_tier::<{ PACKET_TIERS[0] }>(ctx, direction, ethertype, l2_len, n);
     } else if n <= PACKET_TIERS[1] as u32 {
-        copy_tier::<{ PACKET_TIERS[1] }>(ctx, direction, ethertype, cfg.l2_len, n);
+        copy_tier::<{ PACKET_TIERS[1] }>(ctx, direction, ethertype, l2_len, n);
     } else if n <= PACKET_TIERS[2] as u32 {
-        copy_tier::<{ PACKET_TIERS[2] }>(ctx, direction, ethertype, cfg.l2_len, n);
+        copy_tier::<{ PACKET_TIERS[2] }>(ctx, direction, ethertype, l2_len, n);
     } else {
-        copy_tier::<{ PACKET_TIERS[3] }>(ctx, direction, ethertype, cfg.l2_len, n);
+        copy_tier::<{ PACKET_TIERS[3] }>(ctx, direction, ethertype, l2_len, n);
     }
 }
 

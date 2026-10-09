@@ -12,6 +12,7 @@
 //! Nothing leaves the host; pcap files are kept on it for a retention and deleted.
 
 mod doctor;
+mod ifaces;
 mod kernel;
 
 #[cfg(target_os = "linux")]
@@ -67,6 +68,12 @@ enum Command {
     /// `iohr ext install inorbit/capture` instead of the package (root only).
     #[command(subcommand)]
     Service(ServiceCommand),
+    /// The interfaces on this host and what --all would pick, with the reason for each.
+    Interfaces {
+        /// Print them as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Attach to an interface, count and recognise until the time is up or a signal
     /// arrives, answer the agent on the aggregates socket, print totals (counts) as JSON.
     Run(Box<RunArgs>),
@@ -95,9 +102,8 @@ enum Command {
     },
     /// Check whether this host can run capture; one line per requirement, with the fix.
     Doctor {
-        /// Also check that this interface exists.
-        #[arg(long, short = 'i', env = "IOHR_CAPTURE_INTERFACE")]
-        interface: Option<String>,
+        #[command(flatten)]
+        interfaces: InterfaceArgs,
         /// Print the checks as JSON.
         #[arg(long)]
         json: bool,
@@ -121,9 +127,8 @@ enum Command {
     },
     /// Remove TC filters a previous run left on an interface (netlink mode; for `ExecStopPost`).
     Cleanup {
-        /// Interface to clean.
-        #[arg(long, short = 'i', env = "IOHR_CAPTURE_INTERFACE")]
-        interface: String,
+        #[command(flatten)]
+        interfaces: InterfaceArgs,
         /// The pcap directory: the companion's own files in it are deleted too (it stopped,
         /// so nothing would expire them; copies made with `pcap --out` are elsewhere).
         #[arg(
@@ -211,13 +216,64 @@ struct DissectArgs {
     args: Vec<String>,
 }
 
+/// Which interfaces: `--interface` (repeatable, or a comma separated list), else
+/// `IOHR_CAPTURE_INTERFACES` (comma or space separated), else `IOHR_CAPTURE_INTERFACE` (the
+/// older single name), else `--all` / `IOHR_CAPTURE_ALL_INTERFACES=true`.
+#[derive(Debug, Clone, clap::Args)]
+struct InterfaceArgs {
+    /// An interface to attach to (ingress and egress); repeatable.
+    #[arg(long = "interface", short = 'i', value_name = "NAME")]
+    named: Vec<String>,
+    /// Every interface that is up and physical, a bond or a VLAN; loopback, bond members
+    /// and container, Kubernetes and VPN devices are skipped (`iohr-capture interfaces`).
+    #[arg(long, env = "IOHR_CAPTURE_ALL_INTERFACES")]
+    all: bool,
+}
+
+impl InterfaceArgs {
+    fn env(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    /// The interfaces, checked to exist; an error says why there are none.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn resolve(&self) -> Result<Vec<String>, String> {
+        ifaces::resolve(
+            std::path::Path::new("/"),
+            &self.named,
+            Self::env("IOHR_CAPTURE_INTERFACES").as_deref(),
+            Self::env("IOHR_CAPTURE_INTERFACE").as_deref(),
+            self.all,
+            ifaces::MAX,
+        )
+    }
+
+    /// The names as given (for doctor, which checks them itself); `--all`'s pick if none.
+    fn given(&self) -> Vec<String> {
+        let mut n: Vec<String> = self
+            .named
+            .iter()
+            .flat_map(|v| ifaces::parse_list(v))
+            .collect();
+        if n.is_empty() {
+            n = Self::env("IOHR_CAPTURE_INTERFACES")
+                .or_else(|| Self::env("IOHR_CAPTURE_INTERFACE"))
+                .map(|v| ifaces::parse_list(&v))
+                .unwrap_or_default();
+        }
+        if n.is_empty() && self.all {
+            n = ifaces::select_all(&ifaces::all_facts(std::path::Path::new("/"))).1;
+        }
+        n
+    }
+}
+
 /// `run`.
 #[derive(Debug, clap::Args)]
 #[allow(clippy::struct_field_names)]
 struct RunArgs {
-    /// Interface to attach to (ingress and egress).
-    #[arg(long, short = 'i', env = "IOHR_CAPTURE_INTERFACE")]
-    interface: String,
+    #[command(flatten)]
+    interfaces: InterfaceArgs,
     /// Seconds to run for; without it, until SIGINT or SIGTERM.
     #[arg(long = "for", value_name = "SECS")]
     for_secs: Option<u64>,
@@ -329,9 +385,12 @@ enum ServiceCommand {
     /// The same service the packages install: the program at /usr/local/bin, the system
     /// user and read group, /etc/iohr-capture/capture.env, the unit; then enable and start.
     Install {
-        /// The interface to attach to (default: the one the default route uses).
-        #[arg(long, short = 'i')]
-        interface: Option<String>,
+        /// An interface to attach to; repeatable (default: the one the default route uses).
+        #[arg(long = "interface", short = 'i', value_name = "NAME")]
+        interfaces: Vec<String>,
+        /// Every interface `iohr-capture interfaces` picks, chosen again at each start.
+        #[arg(long, conflicts_with = "interfaces")]
+        all: bool,
         /// A user that may read the counts (the agent's user); repeatable. `iohr-agent`
         /// joins too when it exists.
         #[arg(long = "agent-user")]
@@ -359,15 +418,16 @@ fn main() -> ExitCode {
         .init();
     let cli = Cli::parse();
     match cli.command {
+        Command::Interfaces { json } => interfaces_cmd(json),
         Command::Doctor {
-            interface,
+            interfaces,
             json,
             socket_group,
             packets,
             pcap_dir,
         } => {
             let checks = doctor::evaluate(&doctor::Facts::gather(
-                interface.as_deref(),
+                &interfaces.given(),
                 &socket_group,
                 packets.then_some(pcap_dir.as_path()),
             ));
@@ -392,9 +452,9 @@ fn main() -> ExitCode {
             json,
         } => stats(&socket, tables, json),
         Command::Cleanup {
-            interface,
+            interfaces,
             pcap_dir,
-        } => cleanup(&interface, &pcap_dir),
+        } => cleanup(&interfaces.given(), &pcap_dir),
         Command::Pcap(args) => pcap_cmd(&args),
         Command::Dissect(args) => dissect(&args),
         Command::Lookup {
@@ -409,11 +469,13 @@ fn main() -> ExitCode {
 fn service_cmd(cmd: ServiceCommand) -> ExitCode {
     let result = match cmd {
         ServiceCommand::Install {
-            interface,
+            interfaces,
+            all,
             agent_users,
             no_start,
         } => service::install(&service::InstallArgs {
-            interface,
+            interfaces,
+            all,
             agent_users,
             no_start,
         })
@@ -442,6 +504,44 @@ fn service_cmd(_cmd: ServiceCommand) -> ExitCode {
     ExitCode::from(1)
 }
 
+/// `interfaces`: every interface, whether --all picks it and why, and the suggestion.
+fn interfaces_cmd(json: bool) -> ExitCode {
+    use std::fmt::Write as _;
+    let (decisions, picked) = ifaces::select_all(&ifaces::all_facts(std::path::Path::new("/")));
+    if json {
+        emit(
+            &serde_json::to_string_pretty(&serde_json::json!({
+                "interfaces": decisions,
+                "suggested": picked,
+            }))
+            .unwrap_or_default(),
+        );
+    } else {
+        let w = decisions.iter().map(|d| d.name.len()).max().unwrap_or(0);
+        let mut text = String::new();
+        for d in &decisions {
+            let _ = writeln!(
+                text,
+                "{} {:w$}  {}",
+                if d.picked { "+" } else { "-" },
+                d.name,
+                d.why
+            );
+        }
+        let _ = write!(
+            text,
+            "\n--all picks: {}",
+            if picked.is_empty() {
+                "nothing".to_owned()
+            } else {
+                picked.join(" ")
+            }
+        );
+        emit(&text);
+    }
+    ExitCode::SUCCESS
+}
+
 fn emit(text: &str) {
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{text}");
@@ -456,8 +556,15 @@ fn run(a: &RunArgs) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let interfaces = match a.interfaces.resolve() {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::error!(error = %e, "--interface");
+            return ExitCode::from(2);
+        }
+    };
     let opts = capture::Options {
-        interface: a.interface.clone(),
+        interfaces,
         duration: a.for_secs.map(Duration::from_secs),
         mode: a.attach,
         layers,
@@ -555,6 +662,35 @@ fn stats(socket: &std::path::Path, tables: bool, json: bool) -> ExitCode {
     }
 }
 
+/// One line per interface (named when the answer has the tables) when there are several.
+#[cfg(target_os = "linux")]
+fn interface_lines(v: &serde_json::Value, s: &mut String) {
+    use std::fmt::Write as _;
+    if let Some(list) = v
+        .get("interfaces")
+        .and_then(|l| l.as_array())
+        .filter(|l| l.len() > 1 || v.pointer("/tables/interfaces").is_some())
+    {
+        let names = v.pointer("/tables/interfaces").and_then(|t| t.as_array());
+        for (i, row) in list.iter().enumerate() {
+            let name = names
+                .and_then(|t| t.get(i))
+                .and_then(|r| r.get("name"))
+                .and_then(|x| x.as_str())
+                .map_or_else(|| format!("#{i}"), str::to_owned);
+            let g = |p: &str| row.pointer(p).cloned().unwrap_or_default();
+            let _ = writeln!(
+                s,
+                "  {name:<12} ingress {} skb / {} B, egress {} skb / {} B",
+                g("/ingress/packets"),
+                g("/ingress/bytes"),
+                g("/egress/packets"),
+                g("/egress/bytes")
+            );
+        }
+    }
+}
+
 /// A short text view of an answer.
 #[cfg(target_os = "linux")]
 fn render_stats(v: &serde_json::Value) -> String {
@@ -577,6 +713,7 @@ fn render_stats(v: &serde_json::Value) -> String {
         n("/headers/egress/packets"),
         n("/headers/egress/bytes")
     );
+    interface_lines(v, &mut s);
     let _ = writeln!(
         s,
         "drops     rate limited {}, ring buffer full {}, flows evicted {}",
@@ -659,21 +796,30 @@ fn render_stats(v: &serde_json::Value) -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn cleanup(interface: &str, pcap_dir: &std::path::Path) -> ExitCode {
+fn cleanup(interfaces: &[String], pcap_dir: &std::path::Path) -> ExitCode {
     let gone = pcap::remove_all(pcap_dir);
     if gone > 0 {
         tracing::info!(files = gone, "pcap files removed: the companion stopped");
     }
-    match capture::cleanup(interface) {
-        Ok(removed) => {
-            tracing::info!(interface, removed, "stale filters removed");
-            ExitCode::SUCCESS
+    let mut code = ExitCode::SUCCESS;
+    for interface in interfaces {
+        // One that went away took its filters with it.
+        if !std::path::Path::new("/sys/class/net")
+            .join(interface)
+            .exists()
+        {
+            tracing::info!(interface, "interface gone; nothing to clean there");
+            continue;
         }
-        Err(err) => {
-            tracing::error!(error = %err, "cleanup failed");
-            ExitCode::from(1)
+        match capture::cleanup(interface) {
+            Ok(removed) => tracing::info!(interface, removed, "stale filters removed"),
+            Err(err) => {
+                tracing::error!(interface, error = %err, "cleanup failed");
+                code = ExitCode::from(1);
+            }
         }
     }
+    code
 }
 
 #[cfg(target_os = "linux")]
@@ -920,7 +1066,7 @@ fn stats(_: &std::path::Path, _: bool, _: bool) -> ExitCode {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn cleanup(_: &str, _: &std::path::Path) -> ExitCode {
+fn cleanup(_: &[String], _: &std::path::Path) -> ExitCode {
     tracing::error!("iohr-capture runs on Linux only");
     ExitCode::from(2)
 }

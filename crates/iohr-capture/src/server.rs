@@ -581,6 +581,7 @@ mod tests {
         Arc::new(Mutex::new(Engine::new(
             Settings {
                 interface: "lo".into(),
+                interfaces: vec!["lo".into()],
                 layers: Layers::parse("headers,protocols").unwrap(),
                 max_flows: 16,
                 idle: Duration::from_secs(60),

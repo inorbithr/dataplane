@@ -39,8 +39,10 @@ pub(crate) const READ_GROUP: &str = "iohr-capture-read";
 /// What `install` was asked for.
 #[derive(Debug, Clone)]
 pub(crate) struct InstallArgs {
-    /// The interface to attach to; `None` picks the one the default route uses.
-    pub(crate) interface: Option<String>,
+    /// The interfaces to attach to; none (and not `all`) picks the one the default route uses.
+    pub(crate) interfaces: Vec<String>,
+    /// Every interface `iohr-capture interfaces` picks, chosen again at each start.
+    pub(crate) all: bool,
     /// Users that may read the counts (the agent's user); `iohr-agent` joins too if it exists.
     pub(crate) agent_users: Vec<String>,
     /// Write everything but don't enable or start the service.
@@ -53,26 +55,55 @@ pub(crate) fn unit() -> String {
     UNIT.replace(PACKAGED_BIN, BIN)
 }
 
-/// A settings file with `IOHR_CAPTURE_INTERFACE` set: an existing file keeps every other
-/// line; a new one starts from the packaged template.
+/// Which interfaces the settings file names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Selection {
+    /// These, in this order.
+    List(Vec<String>),
+    /// `--all`, chosen again at each start.
+    All,
+}
+
+/// A settings file with the interfaces set: `IOHR_CAPTURE_INTERFACES` (a list) or
+/// `IOHR_CAPTURE_ALL_INTERFACES=true`, the other one and the older
+/// `IOHR_CAPTURE_INTERFACE` commented out. An existing file keeps every other line; a new
+/// one starts from the packaged template.
 #[must_use]
-pub(crate) fn settings(existing: Option<&str>, interface: &str) -> String {
+pub(crate) fn settings(existing: Option<&str>, selection: &Selection) -> String {
     let base = existing.unwrap_or(ENV);
-    let line = format!("IOHR_CAPTURE_INTERFACE={interface}");
+    let (list, all) = match selection {
+        Selection::List(names) => (format!("IOHR_CAPTURE_INTERFACES={}", names.join(",")), None),
+        Selection::All => (
+            "#IOHR_CAPTURE_INTERFACES=".to_owned(),
+            Some("IOHR_CAPTURE_ALL_INTERFACES=true"),
+        ),
+    };
     let mut out = String::new();
-    let mut set = false;
+    let (mut list_set, mut all_set) = (false, false);
     for l in base.lines() {
         let uncommented = l.trim_start_matches('#').trim_start();
-        if !set && uncommented.starts_with("IOHR_CAPTURE_INTERFACE=") {
-            out.push_str(&line);
-            set = true;
+        if uncommented.starts_with("IOHR_CAPTURE_INTERFACES=") {
+            if !list_set {
+                out.push_str(&list);
+                list_set = true;
+            }
+        } else if uncommented.starts_with("IOHR_CAPTURE_ALL_INTERFACES=") {
+            if !all_set {
+                out.push_str(all.unwrap_or("#IOHR_CAPTURE_ALL_INTERFACES=true"));
+                all_set = true;
+            }
+        } else if uncommented.starts_with("IOHR_CAPTURE_INTERFACE=") {
+            out.push_str("#IOHR_CAPTURE_INTERFACE=");
         } else {
             out.push_str(l);
         }
         out.push('\n');
     }
-    if !set {
-        let _ = writeln!(out, "{line}");
+    if !list_set {
+        let _ = writeln!(out, "{list}");
+    }
+    if let (Some(a), false) = (all, all_set) {
+        let _ = writeln!(out, "{a}");
     }
     out
 }
@@ -84,18 +115,6 @@ pub(crate) fn default_interface(route_table: &str) -> Option<String> {
         let f: Vec<&str> = l.split_whitespace().collect();
         (f.len() > 7 && f[1] == "00000000" && f[7] == "00000000").then(|| f[0].to_string())
     })
-}
-
-/// An interface name the kernel would accept (IFNAMSIZ, no path or space characters).
-#[must_use]
-pub(crate) fn valid_interface(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() < 16
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | ':'))
-        && name != "."
-        && name != ".."
 }
 
 /// A user or group name of the portable shape `useradd` accepts.
@@ -196,6 +215,55 @@ fn not_packaged() -> Result<(), ServiceError> {
     Ok(())
 }
 
+/// The interfaces `install` writes, and how to show them.
+fn selection(args: &InstallArgs) -> Result<(Selection, String), ServiceError> {
+    let selection = if args.all {
+        let picked = crate::ifaces::select_all(&crate::ifaces::all_facts(Path::new("/"))).1;
+        if picked.is_empty() {
+            return Err(ServiceError::Invalid(
+                "--all picks no interface here (see `iohr-capture interfaces`): name them with --interface".into(),
+            ));
+        }
+        Selection::All
+    } else {
+        let named = if args.interfaces.is_empty() {
+            vec![
+                fs::read_to_string("/proc/net/route")
+                    .ok()
+                    .and_then(|t| default_interface(&t))
+                    .ok_or_else(|| {
+                        ServiceError::Invalid(
+                            "no default route to pick an interface from: pass --interface or --all"
+                                .into(),
+                        )
+                    })?,
+            ]
+        } else {
+            args.interfaces.clone()
+        };
+        let resolved = crate::ifaces::resolve(
+            Path::new("/"),
+            &named,
+            None,
+            None,
+            false,
+            crate::ifaces::MAX,
+        )
+        .map_err(ServiceError::Invalid)?;
+        Selection::List(resolved)
+    };
+    let shown = match &selection {
+        Selection::List(n) => n.join(", "),
+        Selection::All => format!(
+            "all ({} today; chosen again at each start)",
+            crate::ifaces::select_all(&crate::ifaces::all_facts(Path::new("/")))
+                .1
+                .join(", ")
+        ),
+    };
+    Ok((selection, shown))
+}
+
 /// Sets up the service; returns what it did, one line each.
 ///
 /// # Errors
@@ -206,22 +274,7 @@ fn not_packaged() -> Result<(), ServiceError> {
 pub(crate) fn install(args: &InstallArgs) -> Result<Vec<String>, ServiceError> {
     root("install")?;
     not_packaged()?;
-    let interface = match &args.interface {
-        Some(i) => i.clone(),
-        None => fs::read_to_string("/proc/net/route")
-            .ok()
-            .and_then(|t| default_interface(&t))
-            .ok_or_else(|| {
-                ServiceError::Invalid(
-                    "no default route to pick an interface from: pass --interface".into(),
-                )
-            })?,
-    };
-    if !valid_interface(&interface) || !Path::new("/sys/class/net").join(&interface).exists() {
-        return Err(ServiceError::Invalid(format!(
-            "`{interface}` is not a network interface on this host (see `ip link`)"
-        )));
-    }
+    let (selection, shown) = selection(args)?;
     for u in &args.agent_users {
         if !valid_user(u) || !exists("passwd", u) {
             return Err(ServiceError::Invalid(format!(
@@ -273,10 +326,10 @@ pub(crate) fn install(args: &InstallArgs) -> Result<Vec<String>, ServiceError> {
 
     fs::create_dir_all(ETC).map_err(io(ETC))?;
     let existing = fs::read_to_string(ENV_PATH).ok();
-    write(ENV_PATH, &settings(existing.as_deref(), &interface), 0o640)?;
+    write(ENV_PATH, &settings(existing.as_deref(), &selection), 0o640)?;
     fs::set_permissions(ETC, fs::Permissions::from_mode(0o750)).map_err(io(ETC))?;
     run("chown", &[&format!("root:{USER}"), ETC, ENV_PATH])?;
-    done.push(format!("settings  {ENV_PATH} (interface {interface})"));
+    done.push(format!("settings  {ENV_PATH} (interfaces: {shown})"));
 
     write(UNIT_PATH, &unit(), 0o644)?;
     write(TMPFILES_PATH, TMPFILES, 0o644)?;
@@ -361,29 +414,35 @@ mod tests {
     }
 
     #[test]
-    fn settings_set_the_interface_and_keep_every_other_line() {
-        let fresh = settings(None, "enp70s0");
-        assert!(fresh.lines().any(|l| l == "IOHR_CAPTURE_INTERFACE=enp70s0"));
-        assert_eq!(
+    fn settings_set_the_interfaces_and_keep_every_other_line() {
+        let list = |n: &[&str]| Selection::List(n.iter().map(|s| (*s).to_owned()).collect());
+        let fresh = settings(None, &list(&["enp70s0", "bond0"]));
+        assert!(
             fresh
                 .lines()
-                .filter(|l| l.contains("IOHR_CAPTURE_INTERFACE="))
-                .count(),
-            1
+                .any(|l| l == "IOHR_CAPTURE_INTERFACES=enp70s0,bond0")
         );
+        assert!(
+            fresh
+                .lines()
+                .any(|l| l == "#IOHR_CAPTURE_ALL_INTERFACES=true")
+        );
+        assert!(fresh.lines().any(|l| l == "#IOHR_CAPTURE_INTERFACE="));
+        let all = settings(None, &Selection::All);
+        assert!(all.lines().any(|l| l == "IOHR_CAPTURE_ALL_INTERFACES=true"));
+        assert!(all.lines().any(|l| l == "#IOHR_CAPTURE_INTERFACES="));
+        // An older file: the single name goes (commented), the list comes, the rest stays.
         let kept = settings(
             Some("A=1\nIOHR_CAPTURE_INTERFACE=eth0\nIOHR_CAPTURE_PACKETS=true\n"),
-            "eth1",
+            &list(&["eth1", "eth2"]),
         );
         assert_eq!(
             kept,
-            "A=1\nIOHR_CAPTURE_INTERFACE=eth1\nIOHR_CAPTURE_PACKETS=true\n"
+            "A=1\n#IOHR_CAPTURE_INTERFACE=\nIOHR_CAPTURE_PACKETS=true\nIOHR_CAPTURE_INTERFACES=eth1,eth2\n"
         );
-        let commented = settings(Some("# IOHR_CAPTURE_INTERFACE=\nB=2\n"), "eth2");
-        assert_eq!(commented, "IOHR_CAPTURE_INTERFACE=eth2\nB=2\n");
         assert_eq!(
-            settings(Some("B=2\n"), "eth3"),
-            "B=2\nIOHR_CAPTURE_INTERFACE=eth3\n"
+            settings(Some("B=2\nIOHR_CAPTURE_INTERFACES=eth0\n"), &Selection::All),
+            "B=2\n#IOHR_CAPTURE_INTERFACES=\nIOHR_CAPTURE_ALL_INTERFACES=true\n"
         );
     }
 
@@ -399,7 +458,7 @@ mod tests {
     #[test]
     fn names_are_checked_before_any_command_sees_them() {
         for good in ["eth0", "enp70s0", "wlan0", "br-1a2b", "eth0.100"] {
-            assert!(valid_interface(good), "{good}");
+            assert!(crate::ifaces::valid(good), "{good}");
         }
         for bad in [
             "",
@@ -409,7 +468,7 @@ mod tests {
             "verylonginterfacename0",
             "..",
         ] {
-            assert!(!valid_interface(bad), "{bad}");
+            assert!(!crate::ifaces::valid(bad), "{bad}");
         }
         for good in ["nevio", "iohr-agent", "svc_1"] {
             assert!(valid_user(good), "{good}");

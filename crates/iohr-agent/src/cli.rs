@@ -1064,6 +1064,14 @@ async fn capture_status(args: &CaptureStatusArgs, config_path: &Path) -> Result<
         c.headers.egress.packets,
         c.headers.egress.bytes
     ));
+    if c.interfaces.len() > 1 {
+        for (i, h) in c.interfaces.iter().enumerate() {
+            out(&format!(
+                "  interface #{i}  in {} skb / {} B, out {} skb / {} B  (names: iohr-capture stats --tables)",
+                h.ingress.packets, h.ingress.bytes, h.egress.packets, h.egress.bytes
+            ));
+        }
+    }
     out(&format!(
         "drops      {} rate limited, {} ring buffer full, {} flows evicted",
         c.drops.rate_limited, c.drops.ring_buffer_full, c.drops.flows_evicted
