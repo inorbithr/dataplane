@@ -149,7 +149,7 @@ pub enum ConfigCommand {
 pub enum AtlasCommand {
     /// Read a checkout and/or a cluster and write the evidence as JSON lines. Read-only;
     /// the cluster's API server must pass the policy. Nothing is sent anywhere.
-    Observe(AtlasObserveArgs),
+    Observe(Box<AtlasObserveArgs>),
     /// Documentation sources (`[[docs.sources]]` in agent.toml): Notion first.
     #[command(subcommand)]
     Docs(AtlasDocsCommand),
@@ -237,6 +237,13 @@ pub struct AtlasObserveArgs {
     /// The policy that must admit the API server (default: the one agent.toml names).
     #[arg(long)]
     pub policy: Option<PathBuf>,
+    /// A local file of named metric queries against a Prometheus-compatible API, to
+    /// evaluate at each `--at` (aggregates only; see docs/atlas.md, Metrics).
+    #[arg(long)]
+    pub metrics: Option<PathBuf>,
+    /// An instant to evaluate the metric queries at, RFC 3339; repeat for more.
+    #[arg(long = "at")]
+    pub at: Vec<String>,
     /// Where to write the records (default: standard output).
     #[arg(long)]
     pub out: Option<PathBuf>,
@@ -753,7 +760,7 @@ async fn atlas_observe(args: &AtlasObserveArgs, config_path: &Path) -> Result<Ex
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".kube/config")))
     });
     let wants_host = args.what.contains(&ObserveWhat::Host);
-    let policy = if kubeconfig.is_some() || wants_host {
+    let policy = if kubeconfig.is_some() || wants_host || args.metrics.is_some() {
         let path = match &args.policy {
             Some(p) => p.clone(),
             None => AgentConfig::load(config_path)?.policy,
@@ -768,6 +775,13 @@ async fn atlas_observe(args: &AtlasObserveArgs, config_path: &Path) -> Result<Ex
         kube_context: args.kube_context.clone(),
         namespaces: args.namespaces.clone(),
         decided: args.decided.clone(),
+        metrics: args
+            .metrics
+            .clone()
+            .map(|file| crate::atlas::MetricsRequest {
+                file,
+                at: args.at.clone(),
+            }),
         host: if wants_host {
             if !(1..=360).contains(&args.samples) || !(1..=300).contains(&args.interval) {
                 return Err(Error::Atlas(

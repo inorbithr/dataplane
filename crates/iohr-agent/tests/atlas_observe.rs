@@ -371,6 +371,7 @@ async fn a_checkout_and_a_cluster_give_one_linked_record_set() {
         namespaces: Vec::new(),
         host: None,
         decided: None,
+        metrics: None,
     };
     let (sink, summary) = observe(&req, Some(&policy)).await.unwrap();
     let records = sink.records();
