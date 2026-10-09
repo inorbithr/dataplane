@@ -894,7 +894,12 @@ async fn change<S: AsyncWrite + Unpin>(
                 form.get("hostname").map(String::as_str),
                 Some("on" | "true" | "1")
             );
-            let share = crate::policy::SharePolicy { targets, hostname };
+            // The host summary is set in the policy file; the form keeps it.
+            let share = crate::policy::SharePolicy {
+                targets,
+                hostname,
+                host: ctx.policy.share().host,
+            };
             crate::share::write_policy(&ctx.policy_path, &share).map_err(|e| {
                 (
                     409,

@@ -110,6 +110,12 @@ pub struct SharePolicy {
     /// agent's name instead.
     #[serde(default)]
     pub hostname: bool,
+    /// Send a coarse host summary on the heartbeat (RFC 0102): load, memory, the
+    /// filesystems' free space, temperatures, RAID arrays and NVMe controllers' states.
+    /// Needs `[work] host`. Off by default, and left out of the hashed form while off,
+    /// so a policy that never names it keeps its hash.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host: bool,
 }
 
 /// `[domains]`.

@@ -87,6 +87,15 @@ first `hwmon` run judges what the sampler has seen since.
 Measured on the TRX40 host (48 threads, 15 hwmon chips, 52 sensors, 9 NVMe drives) at a
 10 s interval: under 0.1 % of one core, 7 MB RSS, no disk reads or writes from sampling.
 
+With `[share] host = true` too, the heartbeat carries a summary of the host on the first
+beat and every fourth (a minute at the platform's 15 s; `host/summary.rs`, RFC 0102): load,
+CPUs, memory, filesystems with their free space (`statvfs`) and read-only flag, up to 16
+temperatures, `md` arrays and NVMe controller states. An array counts a member as failed
+when `md` says it is degraded or its controller is no longer `live`; a RAID 0 or linear
+array with a failed member is `failed`, any other `degraded`, and one whose filesystem the
+kernel turned read-only is `read_only`. The platform keeps the latest on the agent and
+shows it; paging comes from declared `hwmon` checks, whose monitors open incidents.
+
 ## Fixture
 
 `crates/iohr-agent/tests/fixtures/host/trx40/` is that host's sysfs and procfs, captured

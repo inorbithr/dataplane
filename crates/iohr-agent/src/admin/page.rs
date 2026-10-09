@@ -938,6 +938,7 @@ fn chosen(ctx: &Context, view: &View) -> crate::policy::SharePolicy {
             q.get("hostname").map(String::as_str),
             Some("on" | "true" | "1")
         ),
+        host: current.host,
     }
 }
 

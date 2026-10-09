@@ -39,6 +39,10 @@ pub enum AgentFrame {
     Heartbeat {
         /// Increments per session.
         seq: u64,
+        /// The host summary (RFC 0102), every [`crate::session::HOST_EVERY`]th heartbeat
+        /// when the policy says `[share] host`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<serde_json::Value>,
     },
     /// The outcome of a job.
     Result(JobResult),
@@ -183,8 +187,17 @@ mod tests {
         let v = serde_json::to_value(&hello).unwrap();
         assert_eq!(v["checks_hash"], "sha256:11");
         assert_eq!(v["checks"], json!([]));
-        let hb = serde_json::to_value(AgentFrame::Heartbeat { seq: 3 }).unwrap();
+        let hb = serde_json::to_value(AgentFrame::Heartbeat { seq: 3, host: None }).unwrap();
         assert_eq!(hb, json!({"type": "heartbeat", "seq": 3}));
+        let hb = serde_json::to_value(AgentFrame::Heartbeat {
+            seq: 4,
+            host: Some(json!({"cpus": 8})),
+        })
+        .unwrap();
+        assert_eq!(
+            hb,
+            json!({"type": "heartbeat", "seq": 4, "host": {"cpus": 8}})
+        );
         let r = AgentFrame::Result(JobResult {
             job_id: "j".into(),
             status: ResultStatus::Refused,

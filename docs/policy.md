@@ -180,6 +180,7 @@ starts or reloads.
 |---|---|---|
 | `targets` | `"hash"` | How each declared check's target leaves: `"hash"` sends its label and an HMAC-SHA256 of the target under a key that never leaves the machine (`<state_dir>/share.key`), so the platform can tell when a target changes but not what it is, nor test a guess; `"label"` sends the label only; `"full"` sends the URL, or host and port, as before. |
 | `hostname` | `false` | Send this machine's host name (`hostname` in the hello). Off, the console shows the agent's name. |
+| `host` | `false` | Send a coarse host summary on the heartbeat (RFC 0102 in inorbithr/core), on the first and every fourth: the 1-minute load, CPUs, memory in use, each filesystem's mount point, use and free space and whether it is read-only (the kernel's `emergency_ro` too), temperatures (`chip/label` and °C, the chipset, CPU and drives first), `md` arrays (name, level, state, members, failed members) and NVMe controllers' kernel states. Needs `[work] host`. No process, user, file, address, model or serial number. Set it in the file; the page and `iohr agent share` keep it as it is. |
 
 Below `"full"`:
 
