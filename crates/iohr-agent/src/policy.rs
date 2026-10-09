@@ -116,6 +116,12 @@ pub struct SharePolicy {
     /// so a policy that never names it keeps its hash.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub host: bool,
+    /// Send the agent's inventory in the hello (RFC 0088.1): what this policy admits, its
+    /// ceilings, its observers and the extensions installed beside it. On by default (it
+    /// lets the platform send only work this agent can run); `false` sends the older
+    /// capability strings alone. Left out of the hashed form unless set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory: Option<bool>,
 }
 
 /// `[domains]`.

@@ -34,7 +34,9 @@ Everything else in the file (`api`, `name`, paths, `[admin]`, `[ledger]`, `[tele
 Top level: `api` (the platform, `https`), `name` (1 to 64 characters, shown in the
 console), `environment` (must equal the policy's), `policy`, `checks`, `key`,
 `state_dir` (relative paths resolve against the file's directory), `key_alg` (`es256`
-or `ed25519`).
+or `ed25519`), `extensions_lock` (the `iohr-ext.lock` whose pins the hello's inventory
+reports, RFC 0088.1; default `IOHR_DATA_DIR`'s, else iohr's own when the agent runs as an
+iohr extension; a missing file reports no extensions).
 
 `[admin]` the local agent page: loopback only unless `allow_non_loopback`, which then needs `tls_cert` and `tls_key` and always asks for the page's token; `require_token` asks for it on loopback too; `hosts` adds `Host` values it answers to ([security/admin-page.md](security/admin-page.md)); `[ledger]` the egress ledger, on by default, `retain_days` and `max_mb` ([ledger.md](ledger.md)); `[telemetry]` OTLP export, off by default;
 `[secrets]` the Vault and Kubernetes stores references may resolve from; `[tls]` an extra

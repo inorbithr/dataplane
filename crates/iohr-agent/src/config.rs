@@ -78,6 +78,11 @@ pub struct AgentConfig {
     /// (`docs/ledger.md`).
     #[serde(default, skip_serializing_if = "LedgerConfig::is_default")]
     pub ledger: LedgerConfig,
+    /// The extension lock (`iohr-ext.lock`) whose entries the hello's inventory reports
+    /// (RFC 0088.1). Default: `IOHR_DATA_DIR`, else iohr's data directory when this agent
+    /// runs as an iohr extension; a missing file reports no extensions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions_lock: Option<PathBuf>,
 }
 
 /// The read-only admin page.
@@ -342,6 +347,7 @@ impl AgentConfig {
             metadata: MetadataConfig::default(),
             docs: DocsConfig::default(),
             ledger: LedgerConfig::default(),
+            extensions_lock: None,
         }
     }
 
@@ -414,6 +420,9 @@ impl AgentConfig {
             fix(p);
         }
         if let Some(p) = &mut self.admin.tls_key {
+            fix(p);
+        }
+        if let Some(p) = &mut self.extensions_lock {
             fix(p);
         }
     }

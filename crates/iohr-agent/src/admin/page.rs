@@ -939,6 +939,7 @@ fn chosen(ctx: &Context, view: &View) -> crate::policy::SharePolicy {
             Some("on" | "true" | "1")
         ),
         host: current.host,
+        inventory: current.inventory,
     }
 }
 

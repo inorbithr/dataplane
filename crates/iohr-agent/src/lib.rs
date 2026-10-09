@@ -18,6 +18,7 @@ pub mod error;
 pub mod executor;
 pub mod extsock;
 pub mod host;
+pub mod inventory;
 pub mod keys;
 pub mod ledger;
 pub mod logbuf;
