@@ -96,6 +96,10 @@ pub struct PageArgs {
     /// Open the page in the browser, signed in with this run's token.
     #[arg(long)]
     pub open: bool,
+    /// Open the local console (`/console/`, when `[admin] console_dir` serves one) instead
+    /// of the page.
+    #[arg(long)]
+    pub console: bool,
 }
 
 /// `ledger …`.
@@ -705,8 +709,13 @@ fn page(args: &PageArgs, config_path: &Path) -> Result<ExitCode> {
         addr.to_string()
     };
     let base = format!("{scheme}://{host}/");
+    let landing = if args.console {
+        format!("{base}console/")
+    } else {
+        base.clone()
+    };
     if !args.open {
-        out(&base);
+        out(&landing);
         if cfg.admin.token_required() {
             out(&format!(
                 "It asks for its token: `{} page --open` opens it signed in.",
@@ -722,7 +731,8 @@ fn page(args: &PageArgs, config_path: &Path) -> Result<ExitCode> {
             token_path.display()
         ))
     })?;
-    let url = format!("{base}auth?token={}", token.trim());
+    let next = if args.console { "&next=/console/" } else { "" };
+    let url = format!("{base}auth?token={}{next}", token.trim());
     let opener = if cfg!(target_os = "macos") {
         "open"
     } else {
@@ -735,7 +745,7 @@ fn page(args: &PageArgs, config_path: &Path) -> Result<ExitCode> {
         .status();
     match status {
         Ok(s) if s.success() => {
-            out(&format!("Opened {base} in your browser, signed in."));
+            out(&format!("Opened {landing} in your browser, signed in."));
             Ok(ExitCode::SUCCESS)
         }
         _ => Err(Error::Config(format!(

@@ -267,6 +267,7 @@ fn a_change_is_refused_beyond_loopback() {
         tls: true,
         sessions: Mutex::new(Vec::new()),
         buckets: Mutex::new(HashMap::new()),
+        conn_buckets: Mutex::new(HashMap::new()),
         slots: Arc::new(Semaphore::new(1)),
     };
     let req = parse(format!("POST /policy/reload HTTP/1.1\r\nHost: 10.0.0.5:7790\r\nAuthorization: Bearer {token}\r\n\r\n").as_bytes()).unwrap();
@@ -652,11 +653,16 @@ async fn bounded_requests_and_rate() {
         tls: false,
         sessions: Mutex::new(Vec::new()),
         buckets: Mutex::new(HashMap::new()),
+        conn_buckets: Mutex::new(HashMap::new()),
         slots: Arc::new(Semaphore::new(1)),
     };
     let ip: IpAddr = "127.0.0.1".parse().unwrap();
     let allowed = (0..200).filter(|_| srv.rate_ok(ip)).count();
     assert!((40..200).contains(&allowed), "{allowed}");
+    // Connections have a looser bucket of their own (a console page loads dozens of
+    // files), still bounded.
+    let conns = (0..2000).filter(|_| srv.conn_rate_ok(ip)).count();
+    assert!((400..2000).contains(&conns), "{conns}");
     assert!(srv.rate_ok("127.0.0.2".parse().unwrap()));
 }
 

@@ -67,6 +67,11 @@ const MAX_CONNECTIONS: usize = 64;
 const BURST: f64 = 40.0;
 /// Requests a client may make per second, sustained.
 const PER_SECOND: f64 = 10.0;
+/// Every connection, the console's files included (a page of the console loads a few dozen
+/// small files): a looser bucket checked before the request is read.
+const CONN_BURST: f64 = 400.0;
+/// Connections a client may open per second, sustained.
+const CONN_PER_SECOND: f64 = 100.0;
 /// Client addresses tracked by the rate limit.
 const MAX_CLIENTS: usize = 1024;
 /// Browser sessions kept after `/auth`.
@@ -146,6 +151,7 @@ struct Server {
     tls: bool,
     sessions: Mutex<Vec<(String, Instant)>>,
     buckets: Mutex<HashMap<IpAddr, (f64, Instant)>>,
+    conn_buckets: Mutex<HashMap<IpAddr, (f64, Instant)>>,
     slots: Arc<Semaphore>,
 }
 
@@ -243,6 +249,7 @@ pub async fn serve_watch(
         tls: tls.is_some(),
         sessions: Mutex::new(Vec::new()),
         buckets: Mutex::new(HashMap::new()),
+        conn_buckets: Mutex::new(HashMap::new()),
         slots: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
     });
     loop {
@@ -407,9 +414,26 @@ impl Server {
             .is_some_and(|h| self.host_allowed(h))
     }
 
-    /// A token bucket per client address.
+    /// The page's token bucket per client address: every request but the console's files.
     fn rate_ok(&self, ip: IpAddr) -> bool {
-        let mut b = match self.buckets.lock() {
+        bucket_ok(&self.buckets, ip, BURST, PER_SECOND)
+    }
+
+    /// The looser bucket every connection takes from, before its request is read.
+    fn conn_rate_ok(&self, ip: IpAddr) -> bool {
+        bucket_ok(&self.conn_buckets, ip, CONN_BURST, CONN_PER_SECOND)
+    }
+}
+
+/// A token bucket per client address in `buckets`: `burst` at most, `per_second` back.
+fn bucket_ok(
+    buckets: &Mutex<HashMap<IpAddr, (f64, Instant)>>,
+    ip: IpAddr,
+    burst: f64,
+    per_second: f64,
+) -> bool {
+    {
+        let mut b = match buckets.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
@@ -420,9 +444,9 @@ impl Server {
                 return false;
             }
         }
-        let (tokens, last) = b.entry(ip).or_insert((BURST, now));
-        let refill = now.duration_since(*last).as_secs_f64() * PER_SECOND;
-        *tokens = (*tokens + refill).min(BURST);
+        let (tokens, last) = b.entry(ip).or_insert((burst, now));
+        let refill = now.duration_since(*last).as_secs_f64() * per_second;
+        *tokens = (*tokens + refill).min(burst);
         *last = now;
         if *tokens < 1.0 {
             return false;
@@ -430,7 +454,9 @@ impl Server {
         *tokens -= 1.0;
         true
     }
+}
 
+impl Server {
     fn session_ok(&self, req: &Request) -> bool {
         // A local client (`iohr agent status`) may present the token itself. A browser
         // cannot add this header cross-site without a CORS preflight, which is never
@@ -524,7 +550,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
     peer: SocketAddr,
     srv: &Server,
 ) -> std::io::Result<()> {
-    if !srv.rate_ok(peer.ip()) {
+    if !srv.conn_rate_ok(peer.ip()) {
         return respond(
             &mut sock,
             srv,
@@ -564,6 +590,11 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         }
     };
     let head = req.method == "HEAD";
+    // The page's own budget for everything but the console's files, which a page of the
+    // console loads by the dozen (they took from the connection's bucket above).
+    if !console::is_console(&req.path) && !srv.rate_ok(peer.ip()) {
+        return respond(&mut sock, srv, 429, "text/plain", b"slow down\n", &[], head).await;
+    }
     // DNS rebinding: a page on another name that resolves here is refused.
     if !req.header("host").is_some_and(|h| srv.host_allowed(h)) {
         return respond(

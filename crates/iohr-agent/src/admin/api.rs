@@ -27,6 +27,7 @@ use std::fmt::Write as _;
 use serde_json::{Value, json};
 
 use super::Context;
+use crate::checks_file::{DeclaredCheck, Kind, RefuseBy};
 use crate::state::JobRecord;
 
 /// Runs per page by default, and the most.
@@ -157,21 +158,35 @@ impl Query {
     }
 }
 
+/// Whether a run passed (`docs/checks.md`): a `[[check]]` when the target answered as
+/// expected (`ok`); a `[[refuse]]` when the target was refused, by the policy (`refused`)
+/// or by the target's own answer in `expect` (`ok`).
+fn passed(kind: Kind, refuse_by: Option<RefuseBy>, r: &JobRecord) -> bool {
+    match (kind, refuse_by) {
+        (Kind::Check, _) | (Kind::Refuse, Some(RefuseBy::Answer) | None) => r.verdict == "ok",
+        (Kind::Refuse, Some(RefuseBy::Policy | RefuseBy::Platform)) => r.verdict == "refused",
+    }
+}
+
 /// The health a declared check's runs give: `down` after `fail_after` failures in a
-/// row, `up` after a success, `unknown` with no runs.
-fn health(runs: &[JobRecord], fail_after: u8) -> &'static str {
+/// row, `up` after a pass, `unknown` with no runs.
+fn health(runs: &[JobRecord], fail_after: u8, ok: impl Fn(&JobRecord) -> bool) -> &'static str {
     let Some(last) = runs.last() else {
         return "unknown";
     };
-    if last.verdict == "ok" {
+    if ok(last) {
         return "up";
     }
     let n = usize::from(fail_after.max(1));
-    if runs.len() >= n && runs.iter().rev().take(n).all(|r| r.verdict != "ok") {
+    if runs.len() >= n && runs.iter().rev().take(n).all(|r| !ok(r)) {
         "down"
     } else {
         "up"
     }
+}
+
+fn declared<'a>(ctx: &'a Context, key: &str) -> Option<&'a DeclaredCheck> {
+    ctx.checks.as_ref()?.entries.iter().find(|c| c.key == key)
 }
 
 fn monitor(ctx: &Context, id: &str, agent_id: &str) -> Option<Value> {
@@ -197,7 +212,7 @@ fn monitor(ctx: &Context, id: &str, agent_id: &str) -> Option<Value> {
         "interval_secs": c.every_secs,
         "fail_after": c.fail_after,
         "state": "active",
-        "health": health(&runs, c.fail_after),
+        "health": health(&runs, c.fail_after, |r| passed(c.kind, c.refuse_by, r)),
         "executor": {"kind": "agent", "agent_id": agent_id},
         "last_run_at": runs.last().map(|r| r.at.clone()).unwrap_or_default(),
         "category": c.category.clone().unwrap_or_default(),
@@ -228,12 +243,12 @@ fn list_monitors(ctx: &Context, q: &Query, agent_id: &str) -> Answer {
     ok(&json!({"monitors": monitors, "next_page_token": "", "where": "agent"}))
 }
 
-fn run_json(id: i64, r: &JobRecord) -> Value {
+fn run_json(id: i64, r: &JobRecord, ok: bool) -> Value {
     json!({
         "run_id": format!("run-{id}"),
         "at": r.at,
         "status": r.verdict,
-        "ok": r.verdict == "ok",
+        "ok": ok,
         "latency_ms": r.latency_ms,
         "status_code": r.status_code,
         "error_class": r.error_class.clone().or_else(|| r.reason.clone()).unwrap_or_default(),
@@ -246,13 +261,10 @@ fn runs(ctx: &Context, id: &str, q: &Query) -> Answer {
     let Some(key) = id.strip_prefix(LOCAL_MONITOR) else {
         return not_found("monitor");
     };
-    if !ctx
-        .checks
-        .as_ref()
-        .is_some_and(|c| c.entries.iter().any(|c| c.key == key))
-    {
+    let Some(c) = declared(ctx, key) else {
         return not_found("monitor");
-    }
+    };
+    let pass = |r: &JobRecord| passed(c.kind, c.refuse_by, r);
     let size = q
         .page_size
         .unwrap_or(DEFAULT_PAGE)
@@ -268,16 +280,22 @@ fn runs(ctx: &Context, id: &str, q: &Query) -> Answer {
         let runs: Vec<Value> = mem
             .iter()
             .rev()
-            .filter(|r| ok_only.is_none_or(|o| (r.verdict == "ok") == o))
+            .filter(|r| ok_only.is_none_or(|o| pass(r) == o))
             .filter(|r| q.from.as_deref().is_none_or(|f| r.at.as_str() >= f))
             .take(size)
             .enumerate()
-            .map(|(i, r)| run_json(i64::try_from(i).unwrap_or(0), r))
+            .map(|(i, r)| run_json(i64::try_from(i).unwrap_or(0), r, pass(r)))
             .collect();
         return ok(&json!({"runs": runs, "next_page_token": "", "where": "agent"}));
     };
     let before = q.page_token.as_deref().and_then(|t| t.parse::<i64>().ok());
-    match store.runs(key, size + 1, before, ok_only, q.from.as_deref()) {
+    // What "passed" is stored as for this check: `ok`, or `refused` for a policy guard.
+    let pass_verdict = match (c.kind, c.refuse_by) {
+        (Kind::Refuse, Some(RefuseBy::Policy | RefuseBy::Platform)) => "refused",
+        _ => "ok",
+    };
+    let verdict = ok_only.map(|o| (pass_verdict, o));
+    match store.runs(key, size + 1, before, verdict, q.from.as_deref()) {
         Ok(mut rows) => {
             let next = if rows.len() > size {
                 rows.truncate(size);
@@ -285,7 +303,10 @@ fn runs(ctx: &Context, id: &str, q: &Query) -> Answer {
             } else {
                 String::new()
             };
-            let runs: Vec<Value> = rows.iter().map(|r| run_json(r.id, &r.record)).collect();
+            let runs: Vec<Value> = rows
+                .iter()
+                .map(|r| run_json(r.id, &r.record, pass(&r.record)))
+                .collect();
             ok(&json!({"runs": runs, "next_page_token": next, "where": "agent"}))
         }
         Err(e) => error(500, "internal", &e.to_string()),
@@ -398,11 +419,25 @@ mod tests {
 
     #[test]
     fn health_follows_fail_after() {
-        assert_eq!(health(&[], 2), "unknown");
-        assert_eq!(health(&[rec("ok")], 2), "up");
-        assert_eq!(health(&[rec("ok"), rec("failed")], 2), "up");
-        assert_eq!(health(&[rec("failed"), rec("failed")], 2), "down");
-        assert_eq!(health(&[rec("failed"), rec("ok")], 2), "up");
+        let ok = |r: &JobRecord| passed(Kind::Check, None, r);
+        assert_eq!(health(&[], 2, ok), "unknown");
+        assert_eq!(health(&[rec("ok")], 2, ok), "up");
+        assert_eq!(health(&[rec("ok"), rec("failed")], 2, ok), "up");
+        assert_eq!(health(&[rec("failed"), rec("failed")], 2, ok), "down");
+        assert_eq!(health(&[rec("failed"), rec("ok")], 2, ok), "up");
+    }
+
+    #[test]
+    fn a_refuse_check_passes_when_the_target_is_refused() {
+        let by_policy = |r: &JobRecord| passed(Kind::Refuse, Some(RefuseBy::Policy), r);
+        assert_eq!(health(&[rec("refused")], 1, by_policy), "up");
+        assert_eq!(
+            health(&[rec("ok")], 1, by_policy),
+            "down",
+            "a guard that stopped guarding"
+        );
+        let by_answer = |r: &JobRecord| passed(Kind::Refuse, Some(RefuseBy::Answer), r);
+        assert_eq!(health(&[rec("ok")], 1, by_answer), "up");
     }
 
     #[test]

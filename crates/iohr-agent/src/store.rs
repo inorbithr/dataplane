@@ -250,8 +250,8 @@ impl Store {
     }
 
     /// A check's runs, newest first: up to `limit`, older than row `before` when given,
-    /// only `ok` or only not-`ok` when `ok` is `Some`, at or after `from` (RFC 3339) when
-    /// given.
+    /// with `verdict` given as `(v, true)` only runs whose verdict is `v`, as `(v, false)`
+    /// only runs whose verdict is not, and at or after `from` (RFC 3339) when given.
     ///
     /// # Errors
     /// SQLite refused the read.
@@ -260,17 +260,13 @@ impl Store {
         key: &str,
         limit: usize,
         before: Option<i64>,
-        ok: Option<bool>,
+        verdict: Option<(&str, bool)>,
         from: Option<&str>,
     ) -> Result<Vec<StoredRun>> {
         let limit = i64::try_from(limit.clamp(1, MAX_PAGE)).unwrap_or(50);
         let before = before.unwrap_or(i64::MAX);
         let from = from.unwrap_or("");
-        let verdict = match ok {
-            None => "%",
-            Some(true) => "ok",
-            Some(false) => "",
-        };
+        let (want, equal) = verdict.unwrap_or(("", true));
         let c = self.conn();
         let mut stmt = c
             .prepare(
@@ -278,13 +274,13 @@ impl Store {
                         error_class, status_code, tls_expires_at
                  FROM runs
                  WHERE key = ?1 AND id < ?2
-                   AND (?3 = '' AND verdict <> 'ok' OR ?3 <> '' AND verdict LIKE ?3)
+                   AND (?3 = '' OR (?6 = 1 AND verdict = ?3) OR (?6 = 0 AND verdict <> ?3))
                    AND at >= ?5
                  ORDER BY id DESC LIMIT ?4",
             )
             .map_err(sql)?;
         let rows = stmt
-            .query_map(params![key, before, verdict, limit, from], |row| {
+            .query_map(params![key, before, want, limit, from, equal], |row| {
                 Ok(StoredRun {
                     id: row.get(0)?,
                     record: JobRecord {
@@ -431,8 +427,18 @@ mod tests {
         let page = s.runs("api", 2, Some(all[1].id), None, None).unwrap();
         assert_eq!(page.len(), 2);
         assert_eq!(page[0].id, all[2].id);
-        assert_eq!(s.runs("api", 10, None, Some(false), None).unwrap().len(), 1);
-        assert_eq!(s.runs("api", 10, None, Some(true), None).unwrap().len(), 4);
+        assert_eq!(
+            s.runs("api", 10, None, Some(("ok", false)), None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            s.runs("api", 10, None, Some(("ok", true)), None)
+                .unwrap()
+                .len(),
+            4
+        );
         assert_eq!(
             s.runs("api", 10, None, None, Some("2999-01-01T00:00:00Z"))
                 .unwrap()
