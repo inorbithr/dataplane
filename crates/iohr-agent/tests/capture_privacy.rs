@@ -221,7 +221,7 @@ fn dat10_captured_traffic_stays_on_the_host() {
         let (_, hb) = next(&mut h.frames, "heartbeat").await;
         frames.push(hb);
         let snap = agent.state.snapshot();
-        let html = iohr_agent::admin::render_all(&agent.admin_context(None));
+        let html = iohr_agent::admin::render_all(&agent.admin_context(None, None));
         let status = serde_json::to_string(&snap).unwrap();
         stop.send(true).unwrap();
         task.await.unwrap().unwrap();
@@ -352,7 +352,9 @@ async fn no_capture_strings_when_the_companion_is_silent() {
     );
     let info = agent.state.snapshot().capture.unwrap();
     assert_eq!(info.state, "not answering");
-    assert!(iohr_agent::admin::render_all(&agent.admin_context(None)).contains("not answering"));
+    assert!(
+        iohr_agent::admin::render_all(&agent.admin_context(None, None)).contains("not answering")
+    );
     stop.send(true).unwrap();
     task.await.unwrap().unwrap();
 }
@@ -394,7 +396,7 @@ async fn a_companion_error_never_carries_a_name() {
     for text in [
         hello.to_string(),
         serde_json::to_string(&snap).unwrap(),
-        iohr_agent::admin::render_all(&agent.admin_context(None)),
+        iohr_agent::admin::render_all(&agent.admin_context(None, None)),
     ] {
         assert!(leaks(&text).is_empty(), "leaks {:?}", leaks(&text));
     }

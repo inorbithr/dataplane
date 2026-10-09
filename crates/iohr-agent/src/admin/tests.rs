@@ -30,6 +30,14 @@ every = "5m"
 "#;
 
 fn context(dir: &Path, require_token: bool) -> Arc<Context> {
+    context_with(dir, require_token, None)
+}
+
+fn context_with(
+    dir: &Path,
+    require_token: bool,
+    reload: Option<tokio::sync::mpsc::Sender<crate::agent::Reload>>,
+) -> Arc<Context> {
     let policy = Policy::from_toml(POLICY).unwrap();
     let checks = DeclaredChecks::from_toml(CHECKS).unwrap();
     let state = Arc::new(AgentState::new(
@@ -61,7 +69,243 @@ fn context(dir: &Path, require_token: bool) -> Arc<Context> {
         admin,
         state_dir: dir.display().to_string(),
         token: Some(write_token(dir).unwrap()),
+        reload,
+        share_key: vec![9; 32],
+        policy_path: dir.join("policy.toml"),
     })
+}
+
+/// A supervisor stand-in: answers every reload, and counts them.
+fn reloader() -> (
+    tokio::sync::mpsc::Sender<crate::agent::Reload>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::agent::Reload>(4);
+    let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = Arc::clone(&n);
+    tokio::spawn(async move {
+        while let Some(r) = rx.recv().await {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = r.reply.send(Ok("reloaded with policy sha256:test".into()));
+        }
+    });
+    (tx, n)
+}
+
+fn post(path: &str, host: &str, extra: &str, body: &str) -> String {
+    format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n{extra}\r\n{body}",
+        body.len()
+    )
+}
+
+/// Signs in with the token; the session cookie.
+async fn sign_in(addr: SocketAddr, token: &str) -> String {
+    let r = send(
+        addr,
+        &get(&format!("/auth?token={token}"), &addr.to_string(), ""),
+    )
+    .await;
+    r.lines()
+        .find_map(|l| l.strip_prefix("Set-Cookie: "))
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
+/// The "What InOrbit sees" form: only from this machine, signed in, from this page's
+/// origin with the form's token; the platform has no way in. A good change rewrites
+/// `[share]` and reloads the agent.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // every refusal, then the change
+async fn what_inorbit_sees_changes_only_from_this_machine_signed_in() {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("policy.toml"), POLICY).unwrap();
+    let (tx, reloads) = reloader();
+    let ctx = context_with(d.path(), false, Some(tx));
+    let token = ctx.token.clone().unwrap();
+    let (addr, _stop) = start(ctx).await;
+    let host = addr.to_string();
+    let origin = format!("Origin: http://{host}\r\nSec-Fetch-Site: same-origin\r\n");
+    let form = "targets=full&hostname=on";
+
+    // Not signed in: refused, nothing written.
+    let r = send(addr, &post("/policy/share", &host, &origin, form)).await;
+    assert_eq!(status(&r), 401, "{r}");
+    // Another site's form, even with a stolen cookie name: refused before anything.
+    let cookie = sign_in(addr, &token).await;
+    let r = send(
+        addr,
+        &post(
+            "/policy/share",
+            &host,
+            &format!("Origin: https://attacker.example\r\nCookie: {cookie}\r\n"),
+            form,
+        ),
+    )
+    .await;
+    assert_eq!(status(&r), 403, "{r}");
+    // A browser POST without an Origin, or without the form's token: refused.
+    let r = send(
+        addr,
+        &post(
+            "/policy/share",
+            &host,
+            &format!("Cookie: {cookie}\r\n"),
+            form,
+        ),
+    )
+    .await;
+    assert_eq!(status(&r), 403, "{r}");
+    let r = send(
+        addr,
+        &post(
+            "/policy/share",
+            &host,
+            &format!("{origin}Cookie: {cookie}\r\n"),
+            &format!("{form}&csrf=0000"),
+        ),
+    )
+    .await;
+    assert_eq!(status(&r), 403, "{r}");
+    // A form too large, or a body on any other path: refused.
+    let r = send(
+        addr,
+        &post("/policy/share", &host, &origin, &"x".repeat(600)),
+    )
+    .await;
+    assert_eq!(status(&r), 413, "{r}");
+    let r = send(addr, &post("/checks", &host, &origin, "a=b")).await;
+    assert_eq!(status(&r), 413, "{r}");
+    assert_eq!(
+        std::fs::read_to_string(d.path().join("policy.toml")).unwrap(),
+        POLICY
+    );
+    assert_eq!(reloads.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    // Signed in, the page's own form: the policy changes and the agent reloads.
+    let page = send(
+        addr,
+        &get("/policy", &host, &format!("Cookie: {cookie}\r\n")),
+    )
+    .await;
+    assert!(
+        page.contains("formaction=/policy/share"),
+        "an Apply button when signed in"
+    );
+    let csrf = page
+        .split("name=csrf value=\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap()
+        .to_owned();
+    let r = send(
+        addr,
+        &post(
+            "/policy/share",
+            &host,
+            &format!("{origin}Cookie: {cookie}\r\n"),
+            &format!("{form}&csrf={csrf}"),
+        ),
+    )
+    .await;
+    assert_eq!(status(&r), 303, "{r}");
+    assert!(r.contains("Location: /policy?applied=1"));
+    let text = std::fs::read_to_string(d.path().join("policy.toml")).unwrap();
+    assert!(
+        text.starts_with(POLICY),
+        "the rest of the file is kept: {text}"
+    );
+    let p = Policy::from_toml(&text).unwrap();
+    assert_eq!(p.share().targets, crate::policy::TargetShare::Full);
+    assert!(p.share().hostname);
+    assert_eq!(reloads.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // `iohr agent share`: the token as a bearer, JSON back.
+    let r = send(
+        addr,
+        &post(
+            "/policy/reload",
+            &host,
+            &format!("Authorization: Bearer {token}\r\n"),
+            "",
+        ),
+    )
+    .await;
+    assert_eq!(status(&r), 200, "{r}");
+    assert!(r.contains("\"ok\":true"), "{r}");
+    let r = send(
+        addr,
+        &post(
+            "/policy/reload",
+            &host,
+            "Authorization: Bearer nope\r\n",
+            "",
+        ),
+    )
+    .await;
+    assert_eq!(status(&r), 401, "{r}");
+    // Not signed in: the page offers no Apply, only the way to sign in.
+    let page = send(addr, &get("/policy", &host, "")).await;
+    assert!(!page.contains("formaction=/policy/share") && page.contains("iohr agent page --open"));
+}
+
+#[test]
+fn a_change_is_refused_beyond_loopback() {
+    let d = tempfile::tempdir().unwrap();
+    let ctx = context(d.path(), false);
+    let token = ctx.token.clone().unwrap();
+    let (_keep, rx) = watch::channel(ctx);
+    let srv = Server {
+        ctx: rx,
+        local: Some("10.0.0.5:7790".parse().unwrap()),
+        tls: true,
+        sessions: Mutex::new(Vec::new()),
+        buckets: Mutex::new(HashMap::new()),
+        slots: Arc::new(Semaphore::new(1)),
+    };
+    let req = parse(format!("POST /policy/reload HTTP/1.1\r\nHost: 10.0.0.5:7790\r\nAuthorization: Bearer {token}\r\n\r\n").as_bytes()).unwrap();
+    let c = srv.ctx();
+    let r = change_refused(&srv, &c, &req, "10.0.0.9:5000".parse().unwrap(), b"");
+    assert_eq!(r.map(|(code, _)| code), Some(403));
+    let r = change_refused(&srv, &c, &req, "127.0.0.1:5000".parse().unwrap(), b"");
+    assert_eq!(
+        r.map(|(code, _)| code),
+        Some(403),
+        "the listener itself is not on loopback"
+    );
+}
+
+#[test]
+fn the_preview_shows_exactly_what_the_next_hello_would_carry() {
+    let d = tempfile::tempdir().unwrap();
+    let ctx = context(d.path(), false);
+    let view = page::View {
+        query: "targets=label".into(),
+        ..page::View::default()
+    };
+    let (_, html) = page::route(&ctx, "/policy", None, &view).unwrap();
+    assert!(
+        html.contains("Preview: the next hello, if you apply this"),
+        "{html}"
+    );
+    assert!(
+        !html.contains("api.example.com/healthz"),
+        "label: no target anywhere on the page"
+    );
+    let view = page::View {
+        query: "targets=full".into(),
+        ..page::View::default()
+    };
+    let (_, html) = page::route(&ctx, "/policy", None, &view).unwrap();
+    assert!(
+        html.contains("&quot;url&quot;: &quot;https://api.example.com/healthz&quot;"),
+        "{html}"
+    );
 }
 
 async fn start(ctx: Arc<Context>) -> (SocketAddr, watch::Sender<bool>) {
@@ -264,7 +508,9 @@ async fn every_answer_carries_the_security_headers_and_no_cors() {
             assert!(head.contains("frame-ancestors 'none'"), "{path}");
             assert!(head.contains("script-src 'none'"), "{path}");
             assert!(head.contains("X-Content-Type-Options: nosniff"), "{path}");
-            assert!(head.contains("Referrer-Policy: no-referrer"), "{path}");
+            // same-origin, not no-referrer: with no-referrer a browser posts the page's own
+            // form with `Origin: null`, which the origin check refuses.
+            assert!(head.contains("Referrer-Policy: same-origin"), "{path}");
             assert!(head.contains("Cache-Control: no-store"), "{path}");
             assert!(
                 !head.to_ascii_lowercase().contains("access-control-"),
@@ -398,8 +644,9 @@ async fn bounded_requests_and_rate() {
     assert_eq!(status(&send(addr, &get("/", &host, &big)).await), 400);
     // A burst past the bucket is slowed down (judged without I/O, so a slow test machine
     // refilling the bucket cannot hide it), and one client's burst leaves others alone.
+    let (_keep, ctx) = watch::channel(context(d.path(), false));
     let srv = Server {
-        ctx: context(d.path(), false),
+        ctx,
         local: Some(addr),
         tls: false,
         sessions: Mutex::new(Vec::new()),
@@ -457,7 +704,7 @@ fn never_lists_what_the_policy_turns_off() {
     );
     assert!(all.contains("[share] targets = \"hash\""), "{all}");
     let page = render_all(&ctx);
-    assert!(page.contains("What the platform is told"));
+    assert!(page.contains("What InOrbit sees"));
     assert!(page.contains("a keyed hash; the target stays on this agent"));
 }
 

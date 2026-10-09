@@ -37,6 +37,16 @@ max_jobs_per_minute = 120
 allow = ["vault:kv/staging/*", "k8s:checks/*"]
 ```
 
+## Sections a version does not know
+
+From 0.1.0-alpha.9, a whole top-level section this agent version does not know (written for
+a later one) is **ignored with a loud warning**: in the log at every start and reload, and
+at the top of the local page's Overview and Policy sections. The agent starts, and the
+section is left out of the policy hash. Everything else still refuses the file and stops
+the agent, as before: an unknown key inside a known section (a typo in a deny rule fails
+closed), and an unknown key at the top level that is not a section. Agents before
+alpha.9 refuse any unknown section, `[share]` included: set it after upgrading.
+
 ## `environment` (required)
 
 The one environment this agent serves: 1 to 32 of `a-z 0-9 -`, starting with a letter.
@@ -147,6 +157,24 @@ sensitive; the value is never logged, reported or written anywhere.
 What the hello tells the platform about this agent (RFC 0100 D11 and D13 in
 inorbithr/core). Absent means the defaults, which keep targets and the host name on
 this machine.
+
+You rarely edit it by hand. Three ways set it, each rewriting only these two keys in place
+(comments and every other line kept) and applying it without a restart:
+
+- **The agent's local page**, Policy, "What InOrbit sees": Everything, Fingerprint or Label
+  only, and a "Send host name" switch, with a preview of exactly what the next hello would
+  carry. Only on the agent's own machine (the page and the browser both on loopback) and
+  signed in (`iohr agent page --open`); the platform cannot change it.
+- **`iohr agent share full|hash|label [--hostname on|off]`** for headless machines (run it
+  as a user who can write the policy, `sudo` for a packaged `/etc/iohr-agent/policy.toml`).
+  Without a level it prints what InOrbit sees now.
+- **`iohr agent init`** asks once, with the defaults shown; `--share-targets` and
+  `--share-hostname` answer it for unattended installs.
+
+The running agent reloads its policy and checks when told to, opens a new session whose
+hello says what the new policy shares, and records the choice in the ledger
+(`share_set`, local, nothing sent). A change made by hand is recorded when the agent next
+starts or reloads.
 
 | Key | Default | Meaning |
 |---|---|---|

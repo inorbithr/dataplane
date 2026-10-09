@@ -26,8 +26,10 @@ request or response bodies.
 ## Assets and adversaries
 
 The asset is the page's content: it describes a company's network (targets, allowed
-ranges) and its agent's behaviour. The page is not a control surface: nothing reached
-through it changes the agent.
+ranges) and its agent's behaviour. The page is not a control surface, with one exception:
+"What InOrbit sees" sets `[share]` in the policy (`POST /policy/share`), and
+`POST /policy/reload` loads the files again. Both can only make the agent share the same or
+less unless the operator on this machine chooses more; neither reaches anything else.
 
 | Adversary | Can | Wants |
 |---|---|---|
@@ -44,11 +46,22 @@ through it changes the agent.
 | Reached from the network | Loopback only by default. Beyond loopback only with `admin.allow_non_loopback = true`, and then the agent refuses to start without `admin.tls_cert` and `admin.tls_key`, always asks for the token (`require_token = false` is refused), and prints a warning at startup | `config::tests::a_non_loopback_page_without_tls_and_token_is_refused_at_startup` |
 | DNS rebinding | The `Host` header must be exactly `127.0.0.1:<port>`, `localhost:<port>`, `[::1]:<port>` (plus `admin.hosts`); anything else gets 421; a missing or repeated `Host`, or an absolute-form target, gets 400 | `host_header_rebinding_attempts_are_refused` |
 | CSRF, cross-site reads | Read-only: GET and HEAD only (405 otherwise), no request bodies (413). An `Origin` that is not this page gets 403. `Sec-Fetch-Site` other than `same-origin`/`none` gets 403, except a top-level navigation to an HTML page (a link followed from another site), which cannot read what it opens. No CORS header is ever sent, so a preflight never succeeds | `a_cross_origin_post_is_refused_and_nothing_writes` |
-| Framing, script injection, leaks through referrers or caches | `Content-Security-Policy: default-src 'none'; style-src 'sha256-…'; img-src 'self'; script-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`; the page has no script at all; `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`, COOP and CORP `same-origin`. Every value is HTML-escaped | `every_answer_carries_the_security_headers_and_no_cors` |
+| Framing, script injection, leaks through referrers or caches | `Content-Security-Policy: default-src 'none'; style-src 'sha256-…'; img-src 'self'; script-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`; the page has no script at all; `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy: same-origin` (nothing to other sites; `no-referrer` would make browsers send `Origin: null` on the page's own form), `Cache-Control: no-store`, COOP and CORP `same-origin`. Every value is HTML-escaped | `every_answer_carries_the_security_headers_and_no_cors` |
 | Another local user | `admin.require_token = true` makes the page ask for its token on loopback too. The token (32 random bytes, new each start) is written to `<state_dir>/admin.token`, mode 0600; `iohr agent page --open` opens the browser with it; the page turns it into a session cookie (`HttpOnly`, `SameSite=Strict`, `Secure` over TLS, 12 h) and redirects so it leaves the address bar. Compared in constant time. `iohr agent status` sends it as a bearer header, which a browser cannot send cross-site without a preflight | `the_token_opens_the_page_once_required`, `constant_time_comparison` |
 | Secrets on the page | Values are redacted when recorded (log lines, errors, job fields) and every response body is redacted again on its way out ([`redact.rs`](../../crates/iohr-agent/src/redact.rs)): PEM private keys, values after secret-looking keys, bearer tokens, JWTs, enrollment tokens, cloud and Git tokens, long high-entropy words, and the page's own token. Check auth is shown as "a header from a secret", never the reference | `no_secret_in_any_page_or_api_answer` (a property test planting secrets in logs, errors, job fields and the ledger), `redact::tests` |
 | Path traversal | No file is served by path: the routes are a fixed list and the assets are compiled in | `every_answer_carries_the_security_headers_and_no_cors` |
 | Resource exhaustion | 8 KiB of request head, 64 header lines, 5 s to send it, 10 s per write, 64 connections at once, a token bucket per client address (40 burst, 10 per second, 1024 addresses tracked), 16 sessions; history, logs and the in-memory ledger are capped (60 runs per check, 300 log lines kept of 500, 1000 ledger entries in memory, the ledger on disk by `[ledger] retain_days` and `max_mb`) | `bounded_requests_and_rate`, `a_slow_client_is_cut_off`, `ledger::tests::bounded_in_memory`, `logbuf::tests::bounded_and_redacted` |
+
+### The one change
+
+| Threat | Control | Test |
+|---|---|---|
+| The platform, or anything off this machine, changes what is shared | The change endpoints answer only when the listener and the client are both on loopback; the platform has no path to them (the agent dials out, nothing dials in) | `a_change_is_refused_beyond_loopback` |
+| A web page makes the browser post the form (CSRF) | A session cookie (`HttpOnly`, `SameSite=Strict`) from `iohr agent page --open`; the request's `Origin` must be this page; a form token tied to the session, compared in constant time; `form-action 'self'` in the CSP | `what_inorbit_sees_changes_only_from_this_machine_signed_in` |
+| A local process without the token | 401: a session or the bearer token from `<state_dir>/admin.token` (0600) | same |
+| A large or malformed body | 512 bytes at most, form-encoded, only on the two paths; any other body is 413 | same |
+| A broken policy written | The file is edited in place, validated before it is written, written atomically with its permissions; a reload that fails keeps the agent on its previous policy | `share::tests`, `a_share_change_reloads_the_running_agent` |
+| A change nobody can see afterwards | Every change of `[share]` is a `share_set` entry in the ledger when the new policy starts | `a_change_is_noted_once_in_the_ledger` |
 
 ## Not covered
 

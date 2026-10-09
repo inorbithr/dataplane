@@ -684,3 +684,82 @@ every = "5m"
         assert!(iohr_agent::ledger::verify(&dir).ok());
     }
 }
+
+/// The owner's way to change what InOrbit sees on a running agent: `[share]` is set
+/// through the local page (as `iohr agent share` does, with this run's token), the policy
+/// file keeps the rest, the agent reloads without a restart and greets the platform again
+/// saying what the new policy shares, and both choices are on the ledger.
+#[tokio::test]
+async fn a_share_change_reloads_the_running_agent() {
+    let mut h = harness(KeyAlg::Es256).await;
+    let web = http_target().await;
+    std::fs::write(
+        &h.cfg.checks,
+        format!("[[check]]\nname = \"web\"\ntarget = \"http://{web}/healthz\"\nevery = \"60s\"\n"),
+    )
+    .unwrap();
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    h.cfg.admin.listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let enrollment = enroll_agent(&h).await;
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(iohr_agent::agent::supervise(h.cfg.clone(), enrollment, rx));
+
+    let (_, hello) = next(&mut h.frames, "hello").await;
+    assert_eq!(hello["checks"][0]["target_shared"], "hash");
+    assert!(hello.get("hostname").is_none());
+
+    let token = std::fs::read_to_string(h.cfg.state_dir.join("admin.token")).unwrap();
+    let r = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/policy/share"))
+        .bearer_auth(token.trim())
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("targets=full&hostname=on")
+        .send()
+        .await
+        .unwrap();
+    let status = r.status();
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert!(status.is_success(), "{status} {body}");
+    assert_eq!(body["ok"], true, "{body}");
+
+    // A new session, its hello sharing what the new policy says.
+    let (n, hello) = next(&mut h.frames, "hello").await;
+    assert_eq!(n, 2, "a second session");
+    assert_eq!(hello["checks"][0]["target_shared"], "full");
+    assert_eq!(
+        hello["checks"][0]["target"]["url"],
+        format!("http://{web}/healthz")
+    );
+    assert_eq!(hello["hostname"], iohr_agent::host::sysfs::host_name());
+    let text = std::fs::read_to_string(&h.cfg.policy).unwrap();
+    assert!(
+        text.contains("[share]") && text.contains("targets = \"full\""),
+        "{text}"
+    );
+    assert!(
+        text.starts_with(common::POLICY.trim_start_matches('\n'))
+            || text.contains("bound = [\"example.com\"]"),
+        "the rest kept: {text}"
+    );
+
+    stop.send(true).unwrap();
+    task.await.unwrap().unwrap();
+    let dir = iohr_agent::ledger::dir_in(&h.cfg.state_dir);
+    assert!(iohr_agent::ledger::verify(&dir).ok());
+    let mut out = Vec::new();
+    iohr_agent::ledger::export(&dir, &mut out).unwrap();
+    let kinds: Vec<String> = String::from_utf8(out)
+        .unwrap()
+        .lines()
+        .map(|l| {
+            serde_json::from_str::<iohr_agent::ledger::Entry>(l)
+                .unwrap()
+                .kind
+        })
+        .filter(|k| k == "share_set")
+        .collect();
+    assert_eq!(kinds.len(), 2, "the first choice and the change");
+}

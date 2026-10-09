@@ -131,6 +131,7 @@ Every artifact is an OCI artifact; copy them into your registry with their signa
 | `iohr-agent run` | connect and work until stopped (exit 3: revoked) |
 | `iohr-agent status` | running, connected, policy hash, what was sent |
 | `iohr-agent page [--open]` | the local agent page's address, or the browser opened on it signed in |
+| `iohr-agent share [full\|hash\|label] [--hostname on\|off]` | what InOrbit sees about your checks and this machine (`[share]` in the policy, [docs/policy.md](docs/policy.md#share)); set in place and applied to the running agent |
 | `iohr-agent ledger verify` | check the egress ledger's chain: nothing removed, inserted or changed; exit 1 on any problem ([docs/ledger.md](docs/ledger.md)) |
 | `iohr-agent ledger export [--out F]` | every ledger entry as JSON lines, for your SIEM |
 | `iohr-agent policy check [--target URL]` | validate the policy, test a target against it |

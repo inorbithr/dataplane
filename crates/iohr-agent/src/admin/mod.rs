@@ -8,15 +8,22 @@
 //!
 //! - **Loopback only** by default; beyond loopback only with `admin.allow_non_loopback`,
 //!   TLS and the page's token (checked at startup, [`crate::config::AdminConfig::check`]).
-//! - **Read-only**: GET and HEAD; no endpoint changes state. The one exchange that sets
-//!   anything, `/auth`, turns the page's token into a cookie for this browser.
+//! - **Read-only, but for one choice**: GET and HEAD everywhere. The one thing the page
+//!   changes is `[share]` in the policy ("What InOrbit sees", `POST /policy/share`), and
+//!   `POST /policy/reload` loads the files again: only from this machine (the listener and
+//!   the client both on loopback), only signed in (the page's token as a session cookie, or
+//!   as a bearer for `iohr agent share`), a browser's from this page's own origin with the
+//!   form's token. The platform has no way to call either. `/auth` turns the token into a
+//!   cookie for this browser.
 //! - **DNS rebinding and CSRF**: the `Host` header must be one of `127.0.0.1:<port>`,
 //!   `localhost:<port>`, `[::1]:<port>` (plus `admin.hosts`), else 421; an `Origin` that is
 //!   not this page and a `Sec-Fetch-Site` other than `same-origin`/`none` are refused with
 //!   403 (a cross-site top-level navigation to an HTML page is let through: it cannot read
 //!   the answer); no CORS header is ever sent.
 //! - **Headers**: a CSP with `default-src 'none'`, the one stylesheet by hash, no script
-//!   at all; `frame-ancestors 'none'`, `nosniff`, `no-referrer`, `no-store`.
+//!   at all; `frame-ancestors 'none'`, `nosniff`, `Referrer-Policy: same-origin` (no referrer to
+//!   any other site; `no-referrer` would make browsers send `Origin: null` on the page's own
+//!   form), `no-store`.
 //! - **Never shown**: the private key, enrollment tokens, secret values, check auth
 //!   headers; every body passes through [`crate::redact`] last.
 //! - **Bounded**: 8 KiB of request headers, no bodies, 5 s to send them, 10 s per write,
@@ -68,6 +75,25 @@ const SESSION_TTL: Duration = Duration::from_hours(12);
 const COOKIE: &str = "iohr_agent_page";
 /// The token file in the state directory.
 pub const TOKEN_FILE: &str = "admin.token";
+/// The only paths that take a POST.
+const CHANGE_PATHS: [&str; 2] = ["/policy/share", "/policy/reload"];
+/// The largest form accepted.
+const MAX_FORM: usize = 512;
+/// How long a change waits for the agent to reload.
+const RELOAD_WAIT: Duration = Duration::from_secs(20);
+
+/// The form token for a session: tied to it, so another session's form or a guessed one
+/// does not pass.
+fn csrf_for(session: &str) -> String {
+    use sha2::Digest as _;
+    let d = sha2::Sha256::digest(format!("iohr-agent-page-form:{session}").as_bytes());
+    d.iter()
+        .take(16)
+        .fold(String::with_capacity(32), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
 
 /// What the page reads. Never the private key, never the enrollment.
 pub struct Context {
@@ -89,6 +115,13 @@ pub struct Context {
     pub state_dir: String,
     /// The page's token.
     pub token: Option<String>,
+    /// Asks the running agent to load its policy and checks again; `None` when the agent
+    /// runs without a supervisor (tests), and then nothing can be changed here.
+    pub reload: Option<tokio::sync::mpsc::Sender<crate::agent::Reload>>,
+    /// The key target hashes are made with, for the preview (never shown).
+    pub share_key: Vec<u8>,
+    /// The policy file `[share]` is written to.
+    pub policy_path: std::path::PathBuf,
 }
 
 impl std::fmt::Debug for Context {
@@ -96,6 +129,7 @@ impl std::fmt::Debug for Context {
         f.debug_struct("Context")
             .field("api", &self.api)
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("share_key", &"<redacted>")
             .finish_non_exhaustive()
     }
 }
@@ -103,7 +137,7 @@ impl std::fmt::Debug for Context {
 /// The server's own bookkeeping: sessions, rate limits, connection slots.
 #[derive(Debug)]
 struct Server {
-    ctx: Arc<Context>,
+    ctx: watch::Receiver<Arc<Context>>,
     local: Option<SocketAddr>,
     tls: bool,
     sessions: Mutex<Vec<(String, Instant)>>,
@@ -179,10 +213,23 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Serves until `shutdown` turns true.
+/// Serves one context until `shutdown` turns true.
 pub async fn serve(
     listener: TcpListener,
     ctx: Arc<Context>,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+    shutdown: watch::Receiver<bool>,
+) {
+    let (_keep, rx) = watch::channel(ctx);
+    serve_watch(listener, rx, tls, shutdown).await;
+}
+
+/// Serves until `shutdown` turns true, each request against the newest context: the
+/// supervisor swaps it when the agent reloads, and the page, its token and the browser
+/// sessions stay.
+pub async fn serve_watch(
+    listener: TcpListener,
+    ctx: watch::Receiver<Arc<Context>>,
     tls: Option<tokio_rustls::TlsAcceptor>,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -231,6 +278,7 @@ struct Request {
     path: String,
     query: String,
     headers: Vec<(String, String)>,
+    content_length: usize,
 }
 
 impl Request {
@@ -282,6 +330,7 @@ fn parse(buf: &[u8]) -> std::result::Result<Request, (u16, &'static str)> {
         path: path.to_owned(),
         query: query.to_owned(),
         headers: Vec::new(),
+        content_length: 0,
     };
     for line in lines {
         let (k, v) = line.split_once(':').ok_or((400, "bad request"))?;
@@ -297,18 +346,31 @@ fn parse(buf: &[u8]) -> std::result::Result<Request, (u16, &'static str)> {
     if req.count("host") != 1 || req.count("origin") > 1 {
         return Err((400, "bad request"));
     }
-    // No request bodies at all: nothing here takes input beyond the URL.
-    if req.header("transfer-encoding").is_some()
-        || req
-            .header("content-length")
-            .is_some_and(|l| l.trim() != "0")
+    // No request bodies but the one small form that changes `[share]`.
+    let len = match req
+        .header("content-length")
+        .map(|l| l.trim().parse::<usize>())
     {
+        None => 0,
+        Some(Ok(n)) => n,
+        Some(Err(_)) => return Err((400, "bad request")),
+    };
+    let form_post = req.method == "POST" && CHANGE_PATHS.contains(&req.path.as_str());
+    if req.header("transfer-encoding").is_some() || (len > 0 && !form_post) {
         return Err((413, "request bodies are not accepted"));
     }
+    if len > MAX_FORM {
+        return Err((413, "the form is too large"));
+    }
+    req.content_length = len;
     Ok(req)
 }
 
 impl Server {
+    fn ctx(&self) -> Arc<Context> {
+        Arc::clone(&self.ctx.borrow())
+    }
+
     /// The `Host` values this page answers to.
     fn allowed_hosts(&self) -> Vec<String> {
         let mut out = Vec::new();
@@ -324,7 +386,7 @@ impl Server {
                 });
             }
         }
-        out.extend(self.ctx.admin.hosts.iter().cloned());
+        out.extend(self.ctx().admin.hosts.iter().cloned());
         out
     }
 
@@ -372,7 +434,7 @@ impl Server {
         if let (Some(given), Some(token)) = (
             req.header("authorization")
                 .and_then(|a| a.strip_prefix("Bearer ")),
-            &self.ctx.token,
+            &self.ctx().token,
         ) {
             return constant_time_eq(token.as_bytes(), given.trim().as_bytes());
         }
@@ -388,6 +450,13 @@ impl Server {
         s.iter().fold(false, |ok, (k, _)| {
             constant_time_eq(k.as_bytes(), id.as_bytes()) | ok
         })
+    }
+
+    /// The form token for the session this request's cookie names.
+    fn csrf(&self, req: &Request) -> Option<String> {
+        req.cookie(COOKIE)
+            .filter(|_| self.session_ok(req))
+            .map(csrf_for)
     }
 
     fn new_session(&self) -> String {
@@ -517,6 +586,21 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         )
         .await;
     }
+    if req.method == "POST" && CHANGE_PATHS.contains(&req.path.as_str()) {
+        let Some(body) = read_body(&mut sock, &buf, req.content_length).await else {
+            return respond(
+                &mut sock,
+                srv,
+                400,
+                "text/plain",
+                b"bad request\n",
+                &[],
+                false,
+            )
+            .await;
+        };
+        return change(&mut sock, srv, &req, peer, &body).await;
+    }
     if req.method != "GET" && !head {
         return respond(
             &mut sock,
@@ -546,8 +630,9 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         "/auth" => return auth(&mut sock, srv, &req, head).await,
         _ => {}
     }
-    if srv.ctx.admin.token_required() && !srv.session_ok(&req) {
-        let body = page::locked(&srv.ctx);
+    let ctx = srv.ctx();
+    if ctx.admin.token_required() && !srv.session_ok(&req) {
+        let body = page::locked(&ctx);
         return respond(
             &mut sock,
             srv,
@@ -562,7 +647,16 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
     if req.path == "/ledger.jsonl" {
         return export(&mut sock, srv, head).await;
     }
-    match page::route(&srv.ctx, &req.path, srv.local) {
+    let view = page::View {
+        query: req.query.clone(),
+        csrf: srv.csrf(&req),
+        signed_in: srv.session_ok(&req),
+        can_change: srv.local.is_some_and(|l| l.ip().is_loopback())
+            && peer.ip().is_loopback()
+            && ctx.reload.is_some(),
+        flash: None,
+    };
+    match page::route(&ctx, &req.path, srv.local, &view) {
         Some((ctype, body)) => {
             // Last line of defence: whatever reached the agent's memory, no secret
             // leaves through this page.
@@ -583,12 +677,12 @@ async fn auth<S: AsyncWrite + Unpin>(
 ) -> std::io::Result<()> {
     let given = req.query_param("token").unwrap_or_default();
     let ok = srv
-        .ctx
+        .ctx()
         .token
         .as_ref()
         .is_some_and(|t| constant_time_eq(t.as_bytes(), given.as_bytes()));
     if !ok {
-        let body = page::locked(&srv.ctx);
+        let body = page::locked(&srv.ctx());
         return respond(
             sock,
             srv,
@@ -624,7 +718,8 @@ async fn export<S: AsyncWrite + Unpin>(
     srv: &Server,
     head: bool,
 ) -> std::io::Result<()> {
-    let Some(ledger) = &srv.ctx.ledger else {
+    let ctx = srv.ctx();
+    let Some(ledger) = &ctx.ledger else {
         return respond(
             sock,
             srv,
@@ -674,6 +769,182 @@ async fn export<S: AsyncWrite + Unpin>(
     sock.shutdown().await
 }
 
+/// The body after the head: what `read_head` already holds, and the rest within the
+/// read timeout.
+async fn read_body<S: AsyncRead + Unpin>(sock: &mut S, buf: &[u8], len: usize) -> Option<Vec<u8>> {
+    let start = buf.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+    let mut body: Vec<u8> = buf.get(start..).unwrap_or_default().to_vec();
+    if body.len() > len {
+        return None;
+    }
+    let rest = tokio::time::timeout(READ_TIMEOUT, async {
+        while body.len() < len {
+            let mut chunk = vec![0u8; len - body.len()];
+            let n = sock.read(&mut chunk).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            body.extend_from_slice(chunk.get(..n).unwrap_or_default());
+        }
+        Some(())
+    })
+    .await;
+    matches!(rest, Ok(Some(()))).then_some(body)
+}
+
+/// Why a change is refused, before anything is written; `None` when it may go ahead.
+fn change_refused(
+    srv: &Server,
+    ctx: &Context,
+    req: &Request,
+    peer: SocketAddr,
+    body: &[u8],
+) -> Option<(u16, String)> {
+    // Only on this machine: both ends on loopback.
+    if !srv.local.is_some_and(|l| l.ip().is_loopback()) || !peer.ip().is_loopback() {
+        return Some((
+            403,
+            "the policy changes only from the agent's own machine".into(),
+        ));
+    }
+    if !srv.session_ok(req) {
+        return Some((
+            401,
+            "sign in first: `iohr agent page --open` on this machine".into(),
+        ));
+    }
+    if req.header("authorization").is_none() {
+        // A browser: this page's own origin, and the form's token for this session.
+        if !req.header("origin").is_some_and(|o| srv.origin_allowed(o)) {
+            return Some((403, "the form must come from this page".into()));
+        }
+        let given = url::form_urlencoded::parse(body)
+            .find(|(k, _)| k == "csrf")
+            .map(|(_, v)| v.into_owned())
+            .unwrap_or_default();
+        if !srv
+            .csrf(req)
+            .is_some_and(|c| constant_time_eq(c.as_bytes(), given.as_bytes()))
+        {
+            return Some((403, "the form has expired; open the page again".into()));
+        }
+    }
+    if ctx.reload.is_none() {
+        return Some((
+            503,
+            "this agent cannot reload; restart it after editing policy.toml".into(),
+        ));
+    }
+    None
+}
+
+/// `POST /policy/share` and `POST /policy/reload`: the page's one change. Every rule is
+/// checked before anything is written; the policy file is changed in place
+/// ([`crate::share::write_policy`]), then the agent reloads, and the change is on the
+/// ledger when the new policy starts.
+async fn change<S: AsyncWrite + Unpin>(
+    sock: &mut S,
+    srv: &Server,
+    req: &Request,
+    peer: SocketAddr,
+    body: &[u8],
+) -> std::io::Result<()> {
+    let ctx = srv.ctx();
+    let json = req.header("authorization").is_some();
+    let answer = |code: u16, msg: String, ok: bool| -> (u16, &'static str, String) {
+        if json {
+            let v = serde_json::json!({ "ok": ok, "message": msg });
+            (
+                code,
+                "application/json",
+                crate::redact::redact(&v.to_string()),
+            )
+        } else {
+            let view = page::View {
+                flash: Some((ok, msg)),
+                signed_in: srv.session_ok(req),
+                can_change: true,
+                csrf: srv.csrf(req),
+                query: String::new(),
+            };
+            let html = page::route(&ctx, "/policy", srv.local, &view)
+                .map(|(_, b)| b)
+                .unwrap_or_default();
+            (
+                code,
+                "text/html; charset=utf-8",
+                crate::redact::redact(&html),
+            )
+        }
+    };
+    let outcome: std::result::Result<String, (u16, String)> = async {
+        if let Some(r) = change_refused(srv, &ctx, req, peer, body) {
+            return Err(r);
+        }
+        if req.path == "/policy/share" {
+            let form: std::collections::HashMap<String, String> =
+                url::form_urlencoded::parse(body).into_owned().collect();
+            let targets = match form.get("targets").map(String::as_str) {
+                Some("full") => crate::policy::TargetShare::Full,
+                Some("hash") => crate::policy::TargetShare::Hash,
+                Some("label") => crate::policy::TargetShare::Label,
+                _ => return Err((400, "targets: full, hash or label".into())),
+            };
+            let hostname = matches!(
+                form.get("hostname").map(String::as_str),
+                Some("on" | "true" | "1")
+            );
+            let share = crate::policy::SharePolicy { targets, hostname };
+            crate::share::write_policy(&ctx.policy_path, &share).map_err(|e| {
+                (
+                    409,
+                    format!(
+                        "{e}. If the agent's user cannot write it, run on this machine: sudo iohr agent share {} --hostname {}",
+                        targets.as_str(),
+                        if hostname { "on" } else { "off" }
+                    ),
+                )
+            })?;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let sent = match &ctx.reload {
+            Some(r) => r.send(crate::agent::Reload { reply: tx }).await.is_ok(),
+            None => false,
+        };
+        if !sent {
+            return Err((409, "saved, but not applied: the agent is not running its supervisor".into()));
+        }
+        tokio::time::timeout(RELOAD_WAIT, rx)
+            .await
+            .map_err(|_| (409, "saved, but not applied: the agent did not answer in time".to_owned()))?
+            .map_err(|_| (409, "saved, but not applied: the agent stopped".to_owned()))?
+            .map_err(|e| (409, format!("saved, but not applied: {e}")))
+    }
+    .await;
+    match outcome {
+        Ok(_) if !json => {
+            respond(
+                sock,
+                srv,
+                303,
+                "text/plain",
+                b"applied\n",
+                &[("Location", "/policy?applied=1")],
+                false,
+            )
+            .await
+        }
+        Ok(msg) => {
+            let (code, ctype, out) = answer(200, msg, true);
+            respond(sock, srv, code, ctype, out.as_bytes(), &[], false).await
+        }
+        Err((code, msg)) => {
+            let (code, ctype, out) = answer(code, msg, false);
+            respond(sock, srv, code, ctype, out.as_bytes(), &[], false).await
+        }
+    }
+}
+
 async fn write_timed<S: AsyncWrite + Unpin>(sock: &mut S, bytes: &[u8]) -> std::io::Result<()> {
     tokio::time::timeout(WRITE_TIMEOUT, sock.write_all(bytes))
         .await
@@ -702,7 +973,7 @@ fn headers(srv: &Server, status: u16, ctype: &str, len: u64, extra: &[(&str, &st
     let mut h = format!(
         "HTTP/1.1 {status} {}\r\nContent-Type: {ctype}\r\nContent-Length: {len}\r\n\
 Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\n\
-Referrer-Policy: no-referrer\r\nContent-Security-Policy: {}\r\n\
+Referrer-Policy: same-origin\r\nContent-Security-Policy: {}\r\n\
 Cross-Origin-Opener-Policy: same-origin\r\nCross-Origin-Resource-Policy: same-origin\r\n\
 Permissions-Policy: camera=(), microphone=(), geolocation=(), interest-cohort=()\r\n",
         reason(status),
