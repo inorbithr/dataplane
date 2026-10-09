@@ -139,6 +139,26 @@ capture can run on this host
 
 ## Install
 
+### With iohr (any Linux with systemd)
+
+```sh
+iohr ext install inorbit/capture          # fetches, verifies signature, provenance and digest; shows the three capabilities and asks
+iohr ext service capture --interface eth0   # sets up the system service (runs the installed program with sudo)
+```
+
+`iohr ext install` offers the second step itself after installing (it runs it with `sudo`
+when you say yes, or with `--yes`); `iohr ext service capture` runs it again later, as
+`sudo <installed program> service install --agent-user <you> [--interface ...]`. `service install` sets up exactly what the packages
+set up, from the same unit, settings file and tmpfiles rule, with the program copied to
+`/usr/local/bin/iohr-capture`: the user `iohr-capture`, the group `iohr-capture-read`,
+`/etc/iohr-capture/capture.env` with the interface (default: the one the default route
+uses), the unit, then `systemctl enable --now`. `--agent-user` puts the agent's user in
+the read group (`iohr-agent` joins too when it exists). It refuses on a host where the
+package is installed. `sudo iohr-capture service remove` stops and removes it
+(`--purge` also removes the settings, the user and the group). Then turn it on in the
+agent ([below](#turn-it-on-in-the-agent)).
+
+
 ### Debian, Ubuntu, RHEL, Fedora (package and systemd)
 
 Download the `.deb` or `.rpm` from the [release](https://github.com/inorbithr/dataplane/releases),

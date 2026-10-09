@@ -38,6 +38,9 @@ mod proto;
 mod route;
 #[cfg(target_os = "linux")]
 mod server;
+// Linux only; also compiled for unit tests on any Unix (its pure parts are portable).
+#[cfg(any(target_os = "linux", all(test, unix)))]
+mod service;
 #[cfg(target_os = "linux")]
 mod sockdiag;
 #[cfg(target_os = "linux")]
@@ -60,6 +63,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Set up or remove the system service, for a companion installed with
+    /// `iohr ext install inorbit/capture` instead of the package (root only).
+    #[command(subcommand)]
+    Service(ServiceCommand),
     /// Attach to an interface, count and recognise until the time is up or a signal
     /// arrives, answer the agent on the aggregates socket, print totals (counts) as JSON.
     Run(Box<RunArgs>),
@@ -317,6 +324,30 @@ pub(crate) enum AttachMode {
     Netlink,
 }
 
+#[derive(Debug, Subcommand)]
+enum ServiceCommand {
+    /// The same service the packages install: the program at /usr/local/bin, the system
+    /// user and read group, /etc/iohr-capture/capture.env, the unit; then enable and start.
+    Install {
+        /// The interface to attach to (default: the one the default route uses).
+        #[arg(long, short = 'i')]
+        interface: Option<String>,
+        /// A user that may read the counts (the agent's user); repeatable. `iohr-agent`
+        /// joins too when it exists.
+        #[arg(long = "agent-user")]
+        agent_users: Vec<String>,
+        /// Write everything, but don't enable or start the service.
+        #[arg(long)]
+        no_start: bool,
+    },
+    /// Stop and remove the service and the program.
+    Remove {
+        /// Also remove the settings, the user and the read group.
+        #[arg(long)]
+        purge: bool,
+    },
+}
+
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -352,6 +383,7 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         }
+        Command::Service(cmd) => service_cmd(cmd),
         Command::Run(args) => run(&args),
         Command::Worker { config } => worker(&config),
         Command::Stats {
@@ -371,6 +403,43 @@ fn main() -> ExitCode {
             route,
         } => lookup(&socket, &owner, &route),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn service_cmd(cmd: ServiceCommand) -> ExitCode {
+    let result = match cmd {
+        ServiceCommand::Install {
+            interface,
+            agent_users,
+            no_start,
+        } => service::install(&service::InstallArgs {
+            interface,
+            agent_users,
+            no_start,
+        })
+        .map(|mut done| {
+            done.push(String::new());
+            done.push(service::agent_hint().to_string());
+            done
+        }),
+        ServiceCommand::Remove { purge } => service::remove(purge),
+    };
+    match result {
+        Ok(done) => {
+            emit(&done.join("\n"));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "service");
+            ExitCode::from(1)
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn service_cmd(_cmd: ServiceCommand) -> ExitCode {
+    tracing::error!("the capture service runs on Linux only");
+    ExitCode::from(1)
 }
 
 fn emit(text: &str) {

@@ -82,6 +82,7 @@ jobs:
       - run: mise run dist:packages
       - run: mise run dist:sbom
       - run: python3 tools/ext_artifact.py --version 0.0.0-ci
+      - run: python3 tools/ext_artifact.py --version 0.0.0-ci --extension capture --out dist/oci/ext-capture
       - run: docker build -t iohr-agent:ci . && docker run --rm iohr-agent:ci --version
       - run: docker build -f Dockerfile.capture -t iohr-capture:ci . && docker run --rm iohr-capture:ci --version
 
