@@ -17,11 +17,11 @@ to a local file (or standard output), and a summary of counts goes to standard e
 
 | Provider | State | Reads |
 |---|---|---|
-| Notion | in development (merged, in no release yet) | pages, database rows (properties as fields), data source schemas, page comments; attachments by reference |
+| Notion | preview (in agent 0.1.0-alpha.8, a pre-release; tested against recorded answers, not yet a live workspace) | pages, database rows (properties as fields), data source schemas, page comments; attachments by reference |
 | Confluence Cloud | in development (merged, in no release yet) | pages and blog posts (ADF to markdown), labels, footer comments, spaces; attachments by reference |
+| Static docs sites (Docusaurus, MkDocs, Sphinx, ReadMe, any site with a sitemap) | in development (merged, in no release yet) | every page the sitemap lists under the configured root that robots.txt allows; main content to markdown, links, change times from `<lastmod>` |
 
-Other providers (Google Docs, GitBook, static docs sites, SharePoint, Slab, Coda) use the
-same framework. Each one is added in its own pull request and listed here once it is
+Other providers (Google Docs, GitBook, SharePoint, Slab, Coda) use the same framework. Each one is added in its own pull request and listed here once it is
 merged.
 
 ## What a run produces
@@ -200,3 +200,45 @@ tenant. The agent paces to 300 requests a minute by default and honours 429 with
 `Retry-After`. Inline comments and page properties macros are not read yet.
 
 Tests: `tests/docs_confluence.rs` with fixtures in `tests/fixtures/confluence/`.
+
+## Static documentation sites
+
+**No credential.** The agent reads a site the way a polite crawler does, and only what
+anyone on the site's network could read. A site behind a login is not read this way (its
+provider's API is the way in, when there is a connector for it).
+
+```toml
+[[docs.sources]]
+id = "handbook"
+provider = "site"
+base_url = "https://docs.acme.example/handbook/"   # the root; nothing outside it is read
+```
+
+The policy allows the site's host under `[networks] allow`. An internal site is reachable
+only if the agent runs where the site is.
+
+How a run reads it:
+
+1. **`robots.txt` first.** The agent reads the group for `iohr-agent`, else `*`, and
+   applies `Allow`/`Disallow` with `*` and `$` (RFC 9309, longest match wins).
+   `Crawl-delay` slows the pace, and `Sitemap:` lines name the sitemaps. A 404 means no
+   rules. A 401 or 403 on robots.txt is read as "disallow everything".
+2. **The sitemaps** it names (else `/sitemap.xml`), sitemap indexes included (up to 50
+   sitemaps and 50,000 pages, same origin only). Gzipped sitemaps are not read yet.
+3. **Each page** under the root that robots allows, one request a second by default.
+   Redirects are not followed: an entry that redirects is skipped as gone. No links are
+   followed beyond the sitemap, and no JavaScript runs.
+
+The main content is found the way the generators mark it: `<article>` (Docusaurus, MkDocs
+Material), `role="main"` or `div.body` (Sphinx), `.markdown-body` or `.rm-Article`
+(ReadMe), else `<main>`, else `<body>`. Navigation, headers, footers, sidebars, scripts,
+heading anchors, edit links, pagers and breadcrumbs are dropped. The first `<h1>` is the
+title (else `<title>`). Links to other pages under the root become `doc.mentions` (the item
+id is the page's path), and other links become `doc.links_to`.
+
+Change times come from `<lastmod>`. A page without one is read on every run, and its digest
+says whether it changed. A site that renders its content with JavaScript has nothing to
+read in its HTML; such a site needs a prerendered build or its provider's API.
+
+Tests: `tests/docs_site.rs` with Docusaurus-, MkDocs- and Sphinx-shaped pages in
+`tests/fixtures/site/`.

@@ -103,6 +103,10 @@ impl DocsConfig {
                 out.push(format!("{at}.id: {:?} is used twice", s.id));
             }
             match &s.token {
+                None if s.provider == Provider::Site => {}
+                Some(_) if s.provider == Provider::Site => out.push(format!(
+                    "{at}.token: a site is read without a credential; a site behind a login is not supported"
+                )),
                 None => out.push(format!(
                     "{at}.token: {} needs a credential reference",
                     s.provider
@@ -126,6 +130,16 @@ impl DocsConfig {
                         out.push(format!(
                             "{at}.spaces: Notion has no spaces filter; share only the pages Atlas may read with the integration"
                         ));
+                    }
+                }
+                Provider::Site => {
+                    if s.base_url.is_none() {
+                        out.push(format!(
+                            "{at}.base_url: a site needs its root URL (https://docs.example.com/)"
+                        ));
+                    }
+                    if !s.spaces.is_empty() || s.account.is_some() {
+                        out.push(format!("{at}: a site takes no spaces or account"));
                     }
                 }
                 Provider::Confluence => {

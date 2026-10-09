@@ -10,6 +10,7 @@ use super::config::{DEFAULT_MAX_ITEMS, DocsSourceConfig};
 use super::confluence::{self, Confluence};
 use super::http::Limits;
 use super::notion::{self, Notion};
+use super::site::{self, Site};
 use super::sync::{SyncOptions, SyncSummary, sync_source};
 use crate::atlas::common::ObservedNow;
 use crate::atlas::record::{DocsSourceRef, Record, RunRecord, Sink};
@@ -102,8 +103,8 @@ pub async fn sync_configured(
         agent_version: env!("CARGO_PKG_VERSION").to_owned(),
         repository: None,
         cluster: None,
-        docs: refs,
         host: None,
+        docs: refs,
     }));
     Ok((sink, outcomes))
 }
@@ -120,6 +121,73 @@ async fn run_one(
     sink: &mut Sink,
     clock: &ObservedNow,
 ) -> Result<(SyncSummary, (u64, u64, u64))> {
+    let opts = SyncOptions {
+        source_id: s.id.clone(),
+        full,
+        max_items: usize::try_from(s.max_items.unwrap_or(DEFAULT_MAX_ITEMS)).unwrap_or(usize::MAX),
+        store: content.join(&s.id),
+        now: started,
+    };
+    let fail = |e: super::DocsError| Error::Atlas(format!("docs source {}: {e}", s.id));
+    let base = || {
+        s.base_url
+            .clone()
+            .ok_or_else(|| Error::Config(format!("docs source {}: no base_url", s.id)))
+    };
+    let rate = |default: u32| Limits::for_rate(s.requests_per_minute.unwrap_or(default));
+    match s.provider {
+        Provider::Site => {
+            let src = Site::connect(base()?, policy, tls, rate(site::RATE_PER_MINUTE))
+                .await
+                .map_err(fail)?;
+            finish(&src, src.client(), &opts, sink, clock).await
+        }
+        Provider::Notion => {
+            let token = credential(s, policy, resolver).await?;
+            let src = Notion::connect(
+                s.base_url.clone(),
+                &token,
+                policy,
+                tls,
+                rate(notion::RATE_PER_MINUTE),
+                s.comments,
+            )
+            .await
+            .map_err(fail)?;
+            drop(token);
+            finish(&src, src.client(), &opts, sink, clock).await
+        }
+        Provider::Confluence => {
+            let account = s
+                .account
+                .as_deref()
+                .ok_or_else(|| Error::Config(format!("docs source {}: no account", s.id)))?;
+            let token = credential(s, policy, resolver).await?;
+            let src = Confluence::connect(
+                base()?,
+                account,
+                &token,
+                policy,
+                tls,
+                rate(confluence::RATE_PER_MINUTE),
+                s.spaces.clone(),
+                s.comments,
+            )
+            .await
+            .map_err(fail)?;
+            drop(token);
+            finish(&src, src.client(), &opts, sink, clock).await
+        }
+    }
+}
+
+/// The source's credential, after the policy allowed its reference; read now, dropped by
+/// the caller as soon as the client holds it.
+async fn credential(
+    s: &DocsSourceConfig,
+    policy: &Policy,
+    resolver: &SecretResolver,
+) -> Result<zeroize::Zeroizing<String>> {
     let reference = s
         .token
         .as_deref()
@@ -131,52 +199,17 @@ async fn run_one(
         )));
     }
     let r: SecretRef = reference.parse()?;
-    let token = resolver.resolve(&r).await?;
-    let opts = SyncOptions {
-        source_id: s.id.clone(),
-        full,
-        max_items: usize::try_from(s.max_items.unwrap_or(DEFAULT_MAX_ITEMS)).unwrap_or(usize::MAX),
-        store: content.join(&s.id),
-        now: started,
-    };
-    match s.provider {
-        Provider::Notion => {
-            let limits = Limits::for_rate(s.requests_per_minute.unwrap_or(notion::RATE_PER_MINUTE));
-            let src = Notion::connect(s.base_url.clone(), &token, policy, tls, limits, s.comments)
-                .await
-                .map_err(|e| Error::Atlas(format!("docs source {}: {e}", s.id)))?;
-            drop(token);
-            let summary = sync_source(&src, &opts, sink, clock).await?;
-            let st = src.client().stats();
-            Ok((summary, (st.requests(), st.retries(), st.rate_limited())))
-        }
-        Provider::Confluence => {
-            let limits =
-                Limits::for_rate(s.requests_per_minute.unwrap_or(confluence::RATE_PER_MINUTE));
-            let base = s
-                .base_url
-                .clone()
-                .ok_or_else(|| Error::Config(format!("docs source {}: no base_url", s.id)))?;
-            let account = s
-                .account
-                .as_deref()
-                .ok_or_else(|| Error::Config(format!("docs source {}: no account", s.id)))?;
-            let src = Confluence::connect(
-                base,
-                account,
-                &token,
-                policy,
-                tls,
-                limits,
-                s.spaces.clone(),
-                s.comments,
-            )
-            .await
-            .map_err(|e| Error::Atlas(format!("docs source {}: {e}", s.id)))?;
-            drop(token);
-            let summary = sync_source(&src, &opts, sink, clock).await?;
-            let st = src.client().stats();
-            Ok((summary, (st.requests(), st.retries(), st.rate_limited())))
-        }
-    }
+    resolver.resolve(&r).await
+}
+
+async fn finish<S: super::DocsSource>(
+    src: &S,
+    client: &super::http::ApiClient,
+    opts: &SyncOptions,
+    sink: &mut Sink,
+    clock: &ObservedNow,
+) -> Result<(SyncSummary, (u64, u64, u64))> {
+    let summary = sync_source(src, opts, sink, clock).await?;
+    let st = client.stats();
+    Ok((summary, (st.requests(), st.retries(), st.rate_limited())))
 }

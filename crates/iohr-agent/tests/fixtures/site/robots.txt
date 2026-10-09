@@ -1,0 +1,9 @@
+# Acme docs
+User-agent: BadBot
+Disallow: /
+
+User-agent: *
+Disallow: /docs/private/
+Allow: /
+
+Sitemap: __SITE__/sitemap-index.xml

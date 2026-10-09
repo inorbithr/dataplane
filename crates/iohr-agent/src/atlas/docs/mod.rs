@@ -19,11 +19,13 @@
 pub mod adf;
 pub mod config;
 pub mod confluence;
+pub mod html;
 pub mod http;
 pub mod markdown;
 pub mod mock;
 pub mod notion;
 pub mod run;
+pub mod site;
 pub mod sync;
 
 use std::collections::BTreeMap;
@@ -195,6 +197,9 @@ pub enum DocsError {
     /// The answer was not what the provider documents.
     #[error("malformed answer: {0}")]
     Malformed(String),
+    /// The provider answered with a redirect, which the agent does not follow.
+    #[error("redirected: {0}")]
+    Redirected(String),
     /// The answer was larger than the agent accepts.
     #[error("too large: {0}")]
     TooLarge(String),
@@ -262,6 +267,9 @@ pub enum Provider {
     Notion,
     /// Confluence Cloud (REST API v2), through an Atlassian account's API token.
     Confluence,
+    /// A static documentation site (Docusaurus, `MkDocs`, Sphinx, `ReadMe`, ...), through
+    /// robots.txt and its sitemap; no credential.
+    Site,
 }
 
 impl fmt::Display for Provider {
@@ -269,6 +277,7 @@ impl fmt::Display for Provider {
         f.write_str(match self {
             Self::Notion => "notion",
             Self::Confluence => "confluence",
+            Self::Site => "site",
         })
     }
 }

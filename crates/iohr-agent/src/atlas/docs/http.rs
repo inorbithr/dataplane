@@ -6,7 +6,7 @@
 //! URL's origin. Errors name the method, the path and the status, never a header, a query
 //! or a body.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, RETRY_AFTER};
@@ -86,6 +86,7 @@ pub struct ApiClient {
     base: Url,
     headers: HeaderMap,
     limits: Limits,
+    rate: AtomicU32,
     next_slot: Mutex<Option<Instant>>,
     stats: Stats,
 }
@@ -153,6 +154,7 @@ impl ApiClient {
             http,
             base,
             headers: map,
+            rate: AtomicU32::new(limits.per_minute.max(1)),
             limits,
             next_slot: Mutex::new(None),
             stats: Stats::default(),
@@ -163,6 +165,11 @@ impl ApiClient {
     #[must_use]
     pub const fn stats(&self) -> &Stats {
         &self.stats
+    }
+
+    /// Lowers the pace to `per_minute` (a site's `Crawl-delay`); never raises it.
+    pub fn slow_to(&self, per_minute: u32) {
+        self.rate.fetch_min(per_minute.max(1), Ordering::Relaxed);
     }
 
     /// The base URL.
@@ -193,7 +200,18 @@ impl ApiClient {
     /// # Errors
     /// See [`DocsError`].
     pub async fn get(&self, path: &str) -> Result<Value, DocsError> {
-        self.send(Method::GET, path, None).await
+        let (bytes, what) = self.send(Method::GET, path, None, JSON).await?;
+        json_of(&bytes, &what)
+    }
+
+    /// `GET path`, answered with text (a page, a sitemap, robots.txt). Invalid UTF-8 is
+    /// replaced, never guessed at.
+    ///
+    /// # Errors
+    /// See [`DocsError`].
+    pub async fn get_text(&self, path: &str) -> Result<String, DocsError> {
+        let (bytes, _) = self.send(Method::GET, path, None, TEXT).await?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     /// `POST path` with a JSON body, for providers that read with POST (Notion's search
@@ -202,11 +220,12 @@ impl ApiClient {
     /// # Errors
     /// See [`DocsError`].
     pub async fn post(&self, path: &str, body: &Value) -> Result<Value, DocsError> {
-        self.send(Method::POST, path, Some(body)).await
+        let (bytes, what) = self.send(Method::POST, path, Some(body), JSON).await?;
+        json_of(&bytes, &what)
     }
 
     async fn pace(&self) {
-        let interval = Duration::from_secs(60) / self.limits.per_minute.max(1);
+        let interval = Duration::from_secs(60) / self.rate.load(Ordering::Relaxed).max(1);
         let mut next = self.next_slot.lock().await;
         let now = Instant::now();
         let at = match *next {
@@ -239,7 +258,8 @@ impl ApiClient {
         method: Method,
         path: &str,
         body: Option<&Value>,
-    ) -> Result<Value, DocsError> {
+        accept: &'static str,
+    ) -> Result<(Vec<u8>, String), DocsError> {
         let url = self.url(path)?;
         let what = format!("{method} {}", url.path());
         let mut attempt = 0u32;
@@ -250,7 +270,7 @@ impl ApiClient {
                 .http
                 .request(method.clone(), url.clone())
                 .headers(self.headers.clone())
-                .header(reqwest::header::ACCEPT, "application/json");
+                .header(reqwest::header::ACCEPT, accept);
             if let Some(b) = body {
                 req = req.json(b);
             }
@@ -258,7 +278,8 @@ impl ApiClient {
                 Ok(resp) => {
                     let status = resp.status();
                     if status.is_success() {
-                        return self.read_json(resp, &what).await;
+                        let bytes = self.read_body(resp, &what).await?;
+                        return Ok((bytes, what));
                     }
                     match status {
                         StatusCode::TOO_MANY_REQUESTS => {
@@ -294,6 +315,9 @@ impl ApiClient {
                         StatusCode::NOT_FOUND | StatusCode::GONE => {
                             return Err(DocsError::NotFound(format!("{what}: {status}")));
                         }
+                        s if s.is_redirection() => {
+                            return Err(DocsError::Redirected(format!("{what}: {status}")));
+                        }
                         _ => return Err(DocsError::Malformed(format!("{what}: {status}"))),
                     }
                 }
@@ -318,7 +342,11 @@ impl ApiClient {
         }
     }
 
-    async fn read_json(&self, mut resp: reqwest::Response, what: &str) -> Result<Value, DocsError> {
+    async fn read_body(
+        &self,
+        mut resp: reqwest::Response,
+        what: &str,
+    ) -> Result<Vec<u8>, DocsError> {
         if resp
             .content_length()
             .is_some_and(|n| n > self.limits.max_body as u64)
@@ -336,8 +364,15 @@ impl ApiClient {
             }
             buf.extend_from_slice(&chunk);
         }
-        serde_json::from_slice(&buf).map_err(|_| DocsError::Malformed(format!("{what}: not JSON")))
+        Ok(buf)
     }
+}
+
+const JSON: &str = "application/json";
+const TEXT: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8";
+
+fn json_of(bytes: &[u8], what: &str) -> Result<Value, DocsError> {
+    serde_json::from_slice(bytes).map_err(|_| DocsError::Malformed(format!("{what}: not JSON")))
 }
 
 /// `Retry-After` in seconds. An HTTP date is not honoured (the backoff applies).
@@ -498,7 +533,7 @@ mod tests {
         let c = client(&s, fast()).await;
         assert!(matches!(
             c.get("/r").await.unwrap_err(),
-            DocsError::Malformed(_)
+            DocsError::Redirected(_)
         ));
     }
 

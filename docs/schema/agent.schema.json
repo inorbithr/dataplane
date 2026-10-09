@@ -928,6 +928,11 @@
           "const": "confluence",
           "description": "Confluence Cloud (REST API v2), through an Atlassian account's API token.",
           "type": "string"
+        },
+        {
+          "const": "site",
+          "description": "A static documentation site (Docusaurus, `MkDocs`, Sphinx, `ReadMe`, ...), through\nrobots.txt and its sitemap; no credential.",
+          "type": "string"
         }
       ]
     },
