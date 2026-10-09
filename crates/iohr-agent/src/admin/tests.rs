@@ -1514,12 +1514,13 @@ async fn people_sign_in_with_the_company_idp_and_their_role_decides() {
             let q: std::collections::HashMap<_, _> = u.query_pairs().into_owned().collect();
             assert_eq!(q["code_challenge_method"], "S256");
             *nonce.lock().unwrap() = q["nonce"].clone();
+            // The identity provider sends the browser back: a cross-site navigation.
             send(
                 addr,
                 &get(
                     &format!("/auth/oidc/callback?code=c1&state={}", q["state"]),
                     &host,
-                    "",
+                    "Sec-Fetch-Site: cross-site\r\nSec-Fetch-Mode: navigate\r\nSec-Fetch-Dest: document\r\n",
                 ),
             )
             .await
@@ -1573,6 +1574,17 @@ async fn people_sign_in_with_the_company_idp_and_their_role_decides() {
         "{r}"
     );
     assert!(!r.contains("Set-Cookie"));
+    // A cross-site fetch of the callback (not a navigation) is still refused.
+    let r = send(
+        addr,
+        &get(
+            "/auth/oidc/callback?code=c1&state=x",
+            &host,
+            "Sec-Fetch-Site: cross-site\r\nSec-Fetch-Mode: cors\r\n",
+        ),
+    )
+    .await;
+    assert_eq!(status(&r), 403);
     // A replayed or unknown state.
     let r = send(
         addr,

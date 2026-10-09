@@ -577,10 +577,16 @@ fn fetch_site_ok(req: &Request) -> bool {
     match req.header("sec-fetch-site") {
         None | Some("same-origin" | "none") => true,
         Some(_) => {
+            // A top-level navigation cannot read what it opens: the page's views, the
+            // console's pages (code, no data), and the identity provider sending the browser
+            // back to the sign-in callback, which is cross-site by nature (its `state` is the
+            // check there).
             req.method == "GET"
                 && req.header("sec-fetch-mode") == Some("navigate")
                 && req.header("sec-fetch-dest") == Some("document")
-                && page::is_html_route(&req.path)
+                && (page::is_html_route(&req.path)
+                    || console::is_console(&req.path)
+                    || req.path == "/auth/oidc/callback")
         }
     }
 }
