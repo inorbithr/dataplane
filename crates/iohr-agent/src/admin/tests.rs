@@ -72,6 +72,7 @@ fn context_with(
         reload,
         share_key: vec![9; 32],
         policy_path: dir.join("policy.toml"),
+        account_id: "acc_TEST".into(),
     })
 }
 
@@ -794,4 +795,366 @@ async fn the_ledger_export_is_the_files_and_verifies() {
     crate::ledger::export(l.dir(), &mut exported).unwrap();
     assert_eq!(body.as_bytes(), exported.as_slice());
     assert_eq!(body.lines().count(), 3);
+}
+
+// ---- the local API and the console bundle (RFC 0100.4, slice 1) ----------------------
+
+fn body(r: &str) -> &str {
+    r.split_once("\r\n\r\n").map_or("", |(_, b)| b)
+}
+
+fn json_of(r: &str) -> serde_json::Value {
+    serde_json::from_str(body(r)).unwrap()
+}
+
+fn bearer(token: &str) -> String {
+    format!("Authorization: Bearer {token}\r\n")
+}
+
+/// The context with a trial store holding `n` runs of `api`, the last one failed.
+fn context_with_store(dir: &Path, n: usize) -> Arc<Context> {
+    let ctx = context(dir, false);
+    let store = crate::store::Store::open(&dir.join("store"), 30).unwrap();
+    for i in 0..n {
+        store
+            .record_run(&JobRecord {
+                at: crate::enroll::now_rfc3339(),
+                kind: "check".into(),
+                surface: Some("http".into()),
+                target_host: Some("api.example.com".into()),
+                verdict: if i + 1 == n { "failed" } else { "ok" }.into(),
+                latency_ms: 10 + i as u64,
+                key: Some("api".into()),
+                status_code: Some(if i + 1 == n { 503 } else { 200 }),
+                ..JobRecord::default()
+            })
+            .unwrap();
+    }
+    ctx.state.attach_store(Arc::new(store));
+    ctx
+}
+
+/// Unlike the page, the API always asks for the token, on loopback too, and answers in
+/// the response contract.
+#[tokio::test]
+async fn the_local_api_always_needs_the_token() {
+    let d = tempfile::tempdir().unwrap();
+    let ctx = context(d.path(), false);
+    let token = ctx.token.clone().unwrap();
+    let (addr, _stop) = start(ctx).await;
+    let host = addr.to_string();
+    let path = "/v1/accounts/orgs/acc_TEST/monitors";
+    let r = send(addr, &get(path, &host, "")).await;
+    assert_eq!(status(&r), 401, "{r}");
+    let e = json_of(&r);
+    assert_eq!(e["code"], "unauthenticated");
+    assert!(e["request_id"].as_str().is_some_and(|s| !s.is_empty()));
+    let r = send(addr, &get(path, &host, &bearer("not-the-token"))).await;
+    assert_eq!(status(&r), 401);
+    let r = send(addr, &get(path, &host, &bearer(&token))).await;
+    assert_eq!(status(&r), 200, "{r}");
+    assert!(r.contains("Content-Type: application/json"));
+    assert!(!r.to_ascii_lowercase().contains("access-control-allow"));
+    // The browser's way: the session cookie from /auth works too.
+    let cookie = sign_in(addr, &token).await;
+    let r = send(addr, &get(path, &host, &format!("Cookie: {cookie}\r\n"))).await;
+    assert_eq!(status(&r), 200);
+}
+
+/// Same paths and shapes as the public API; another account or agent is not found.
+#[tokio::test]
+async fn monitors_and_runs_have_the_public_shapes() {
+    let d = tempfile::tempdir().unwrap();
+    let ctx = context_with_store(d.path(), 3);
+    let token = ctx.token.clone().unwrap();
+    let (addr, _stop) = start(ctx).await;
+    let host = addr.to_string();
+    let auth = bearer(&token);
+
+    let list = json_of(
+        &send(
+            addr,
+            &get("/v1/accounts/orgs/acc_TEST/monitors", &host, &auth),
+        )
+        .await,
+    );
+    let ms = list["monitors"].as_array().unwrap();
+    assert_eq!(ms.len(), 2, "a `[[check]]` and a `[[refuse]]`: {list}");
+    let m = ms.iter().find(|m| m["monitor_id"] == "local-api").unwrap();
+    let refuse = ms
+        .iter()
+        .find(|m| m["monitor_id"] == "local-metadata-closed")
+        .unwrap();
+    assert_eq!(refuse["check"]["refuse_by"], "policy");
+    assert_eq!(m["monitor_id"], "local-api");
+    assert_eq!(m["agent_id"], "agt_01TEST");
+    assert_eq!(m["interval_secs"], 60);
+    assert_eq!(m["where"], "agent");
+    assert_eq!(m["executor"]["kind"], "agent");
+    assert_eq!(m["check"]["surface"], "http");
+    // The check's secret reference never appears.
+    assert!(!list.to_string().contains("CHECK_TOKEN"));
+
+    let one = json_of(
+        &send(
+            addr,
+            &get(
+                "/v1/accounts/orgs/acc_TEST/monitors/local-api",
+                &host,
+                &auth,
+            ),
+        )
+        .await,
+    );
+    assert_eq!(one["monitor"]["name"], "api");
+
+    let runs = json_of(
+        &send(
+            addr,
+            &get(
+                "/v1/accounts/orgs/acc_TEST/monitors/local-api/runs?page_size=2",
+                &host,
+                &auth,
+            ),
+        )
+        .await,
+    );
+    let rs = runs["runs"].as_array().unwrap();
+    assert_eq!(rs.len(), 2);
+    assert_eq!(rs[0]["ok"], false, "newest first: {runs}");
+    assert_eq!(rs[0]["status_code"], 503);
+    let next = runs["next_page_token"].as_str().unwrap();
+    assert_ne!(next, "");
+    let page2 = json_of(
+        &send(
+            addr,
+            &get(
+                &format!("/v1/accounts/orgs/acc_TEST/monitors/local-api/runs?page_size=2&page_token={next}"),
+                &host,
+                &auth,
+            ),
+        )
+        .await,
+    );
+    assert_eq!(page2["runs"].as_array().unwrap().len(), 1);
+    assert_eq!(page2["next_page_token"], "");
+    let failed = json_of(
+        &send(
+            addr,
+            &get(
+                "/v1/accounts/orgs/acc_TEST/monitors/local-api/runs?status=failed",
+                &host,
+                &auth,
+            ),
+        )
+        .await,
+    );
+    assert_eq!(failed["runs"].as_array().unwrap().len(), 1);
+
+    for p in [
+        "/v1/accounts/orgs/acc_OTHER/monitors",
+        "/v1/accounts/orgs/acc_TEST/monitors/local-nope",
+        "/v1/accounts/orgs/acc_TEST/monitors/mon_platform",
+        "/v1/accounts/orgs/acc_TEST/agents/agt_OTHER",
+        "/v1/agents/agt_OTHER/ledger",
+        "/v1/accounts/orgs/acc_TEST/billing",
+    ] {
+        let r = send(addr, &get(p, &host, &auth)).await;
+        assert_eq!(status(&r), 404, "{p}: {r}");
+        assert_eq!(json_of(&r)["code"], "not_found");
+    }
+}
+
+/// The agent, its host, its ledger and its share settings, all from this machine.
+#[tokio::test]
+async fn agent_host_ledger_and_share_answer_locally() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context_with_store(dir.path(), 1);
+    ctx.state.host_sampled(crate::state::HostInfo {
+        sensors: 12,
+        last_sample_at: crate::enroll::now_rfc3339(),
+        chipset_millicelsius: Some(110_000),
+        ..crate::state::HostInfo::default()
+    });
+    let token = ctx.token.clone().unwrap();
+    let (addr, _stop) = start(ctx).await;
+    let host = addr.to_string();
+    let auth = bearer(&token);
+    let agent = json_of(
+        &send(
+            addr,
+            &get("/v1/accounts/orgs/acc_TEST/agents/agt_01TEST", &host, &auth),
+        )
+        .await,
+    );
+    assert_eq!(agent["agent"]["agent_id"], "agt_01TEST");
+    assert_eq!(
+        agent["agent"]["status"], "offline",
+        "no platform session: {agent}"
+    );
+    assert_eq!(agent["agent"]["store"]["kind"], "trial");
+    let host_doc = json_of(
+        &send(
+            addr,
+            &get(
+                "/v1/accounts/orgs/acc_TEST/agents/agt_01TEST/host",
+                &host,
+                &auth,
+            ),
+        )
+        .await,
+    );
+    assert_eq!(host_doc["host"]["latest"]["sensors"], 12);
+    assert_eq!(host_doc["host"]["readings"].as_array().unwrap().len(), 1);
+    let ledger_doc = json_of(&send(addr, &get("/v1/agents/agt_01TEST/ledger", &host, &auth)).await);
+    assert_eq!(ledger_doc["kept"], true);
+    assert!(ledger_doc["entries"].is_array());
+    let share_doc = json_of(
+        &send(
+            addr,
+            &get(
+                "/v1/accounts/orgs/acc_TEST/agents/agt_01TEST/share",
+                &host,
+                &auth,
+            ),
+        )
+        .await,
+    );
+    assert_eq!(share_doc["where"], "agent");
+}
+
+/// Read-only in this phase: every other method is 405 with the contract's body.
+#[tokio::test]
+async fn the_local_api_is_read_only() {
+    let d = tempfile::tempdir().unwrap();
+    let ctx = context(d.path(), false);
+    let token = ctx.token.clone().unwrap();
+    let (addr, _stop) = start(ctx).await;
+    let host = addr.to_string();
+    for m in ["DELETE", "PATCH", "PUT"] {
+        let r = send(
+            addr,
+            &format!(
+                "{m} /v1/accounts/orgs/acc_TEST/monitors/local-api HTTP/1.1\r\nHost: {host}\r\n{}\r\n",
+                bearer(&token)
+            ),
+        )
+        .await;
+        assert_eq!(status(&r), 405, "{m}: {r}");
+    }
+}
+
+/// A web page elsewhere cannot read the API, even with the browser's cookie.
+#[tokio::test]
+async fn another_site_cannot_read_the_api() {
+    let d = tempfile::tempdir().unwrap();
+    let ctx = context(d.path(), false);
+    let token = ctx.token.clone().unwrap();
+    let (addr, _stop) = start(ctx).await;
+    let host = addr.to_string();
+    let cookie = sign_in(addr, &token).await;
+    let r = send(
+        addr,
+        &get(
+            "/v1/accounts/orgs/acc_TEST/monitors",
+            &host,
+            &format!(
+                "Cookie: {cookie}\r\nOrigin: https://evil.example\r\nSec-Fetch-Site: cross-site\r\n"
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(status(&r), 403, "{r}");
+}
+
+/// History survives a restart: a new state over the same store has the runs back.
+#[test]
+fn check_history_survives_a_restart() {
+    let d = tempfile::tempdir().unwrap();
+    {
+        let _ = context_with_store(d.path(), 4);
+    }
+    let state = AgentState::default();
+    state.attach_store(Arc::new(
+        crate::store::Store::open(&d.path().join("store"), 30).unwrap(),
+    ));
+    assert_eq!(state.check_runs()["api"].len(), 4);
+}
+
+/// The console bundle: served from `console_dir` with its own CSP by hash, nothing
+/// without it, and `/auth?next=` goes back only to a console page.
+#[tokio::test]
+async fn the_console_bundle_is_served_with_its_own_csp() {
+    let d = tempfile::tempdir().unwrap();
+    let bundle = d.path().join("bundle");
+    std::fs::create_dir_all(bundle.join("monitors")).unwrap();
+    std::fs::write(
+        bundle.join("index.html"),
+        "<html><script>self.x=1</script><body>local console</body></html>",
+    )
+    .unwrap();
+    std::fs::write(bundle.join("monitors/index.html"), "<p>monitors</p>").unwrap();
+
+    // No console_dir: 404.
+    let (addr, _stop) = start(context(d.path(), false)).await;
+    assert_eq!(
+        status(&send(addr, &get("/console/", &addr.to_string(), "")).await),
+        404
+    );
+
+    let mut ctx = Arc::try_unwrap(context(d.path(), false)).unwrap();
+    ctx.admin.console_dir = Some(bundle);
+    let token = ctx.token.clone().unwrap();
+    let (addr, _stop2) = start(Arc::new(ctx)).await;
+    let host = addr.to_string();
+    let r = send(addr, &get("/console/", &host, "")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    assert!(r.contains("local console"));
+    let csp = r
+        .lines()
+        .find_map(|l| l.strip_prefix("Content-Security-Policy: "))
+        .unwrap();
+    assert!(csp.contains("script-src 'self' 'sha256-"), "{csp}");
+    assert!(csp.contains("frame-ancestors 'none'"));
+    assert!(!csp.contains("script-src 'self' 'unsafe-inline'"));
+    assert_eq!(
+        status(&send(addr, &get("/console/monitors/", &host, "")).await),
+        200
+    );
+    assert_eq!(
+        status(&send(addr, &get("/console/../admin.token", &host, "")).await),
+        404
+    );
+
+    // Signing in returns to the console page that asked, and only to one.
+    let r = send(
+        addr,
+        &get(
+            &format!("/auth?token={token}&next=/console/monitors/"),
+            &host,
+            "",
+        ),
+    )
+    .await;
+    assert!(r.contains("Location: /console/monitors/"), "{r}");
+    let r = send(
+        addr,
+        &get(
+            &format!("/auth?token={token}&next=https://evil.example/"),
+            &host,
+            "",
+        ),
+    )
+    .await;
+    assert!(r.contains("Location: /\r\n"), "{r}");
+}
+
+/// The default listener is loopback: the API and the console add no listener of their
+/// own and nothing is reachable from another machine unless the operator says so.
+#[test]
+fn nothing_listens_beyond_loopback_by_default() {
+    let admin = AdminConfig::default();
+    assert!(admin.listen.ip().is_loopback());
+    assert!(!admin.allow_non_loopback);
+    assert!(admin.console_dir.is_none());
 }

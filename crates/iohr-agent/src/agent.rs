@@ -240,6 +240,20 @@ impl Agent {
             how_to_stop(),
         ));
         state.set_api(config.api.as_str());
+        // The local console's trial storage (RFC 0100.1 §5). A store that cannot open is
+        // logged and the agent runs on, with in-memory history only.
+        if config.local.store {
+            match crate::store::Store::open(
+                &crate::store::dir_in(&config.state_dir),
+                config.local.retain_days,
+            ) {
+                Ok(store) => state.attach_store(Arc::new(store)),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "the trial store could not be opened: check history is kept in memory only"
+                ),
+            }
+        }
         Ok(Self {
             config,
             policy,
@@ -289,6 +303,7 @@ impl Agent {
             admin: self.config.admin.clone(),
             state_dir: self.config.state_dir.display().to_string(),
             token,
+            account_id: self.enrollment.account_id.clone(),
         }
     }
 

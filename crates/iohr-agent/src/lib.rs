@@ -30,6 +30,7 @@ pub mod secrets;
 pub mod session;
 pub mod share;
 pub mod state;
+pub mod store;
 pub mod telemetry;
 pub mod tls;
 pub mod token;

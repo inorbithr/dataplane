@@ -29,6 +29,8 @@
 //! - **Bounded**: 8 KiB of request headers, no bodies, 5 s to send them, 10 s per write,
 //!   64 connections, a token bucket per client address, embedded assets only.
 
+mod api;
+mod console;
 mod page;
 
 use std::collections::HashMap;
@@ -122,6 +124,8 @@ pub struct Context {
     pub share_key: Vec<u8>,
     /// The policy file `[share]` is written to.
     pub policy_path: std::path::PathBuf,
+    /// The account this agent belongs to: the `{org_id}` the local API answers for.
+    pub account_id: String,
 }
 
 impl std::fmt::Debug for Context {
@@ -601,6 +605,19 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         };
         return change(&mut sock, srv, &req, peer, &body).await;
     }
+    if req.method != "GET" && !head && api::is_api(&req.path) {
+        let (code, body) = api::read_only();
+        return respond(
+            &mut sock,
+            srv,
+            code,
+            "application/json",
+            body.as_bytes(),
+            &[("Allow", "GET, HEAD")],
+            false,
+        )
+        .await;
+    }
     if req.method != "GET" && !head {
         return respond(
             &mut sock,
@@ -631,6 +648,51 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         _ => {}
     }
     let ctx = srv.ctx();
+    // The local API: always signed in, loopback too (RFC 0100.4 1.6).
+    if api::is_api(&req.path) {
+        let (code, body) = if srv.session_ok(&req) {
+            api::route(&ctx, &req.path, &req.query)
+        } else {
+            api::unauthenticated()
+        };
+        let body = crate::redact::redact(&body);
+        return respond(
+            &mut sock,
+            srv,
+            code,
+            "application/json",
+            body.as_bytes(),
+            &[],
+            head,
+        )
+        .await;
+    }
+    // The console bundle: code, no data (the data comes through the API above). Behind
+    // the page's own rule: the token when the page asks for it.
+    if console::is_console(&req.path) {
+        if ctx.admin.token_required() && !srv.session_ok(&req) {
+            let body = page::locked(&ctx);
+            return respond(
+                &mut sock,
+                srv,
+                401,
+                "text/html; charset=utf-8",
+                body.as_bytes(),
+                &[],
+                head,
+            )
+            .await;
+        }
+        let found = ctx
+            .admin
+            .console_dir
+            .as_deref()
+            .and_then(|dir| console::file(dir, &req.path));
+        return match found {
+            Some(f) => respond_csp(&mut sock, srv, 200, f.ctype, &f.body, &f.csp, head).await,
+            None => respond(&mut sock, srv, 404, "text/plain", b"not found\n", &[], head).await,
+        };
+    }
     if ctx.admin.token_required() && !srv.session_ok(&req) {
         let body = page::locked(&ctx);
         return respond(
@@ -695,6 +757,11 @@ async fn auth<S: AsyncWrite + Unpin>(
         .await;
     }
     let id = srv.new_session();
+    // Back to the console page that asked, when it did; never anywhere else.
+    let next = req
+        .query_param("next")
+        .filter(|n| console::is_console(n) && !n.contains("//") && !n.contains('\\'))
+        .unwrap_or_else(|| "/".to_owned());
     let cookie = format!(
         "{COOKIE}={id}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
         SESSION_TTL.as_secs(),
@@ -706,7 +773,7 @@ async fn auth<S: AsyncWrite + Unpin>(
         303,
         "text/plain",
         b"signed in\n",
-        &[("Location", "/"), ("Set-Cookie", &cookie)],
+        &[("Location", &next), ("Set-Cookie", &cookie)],
         head,
     )
     .await
@@ -745,6 +812,7 @@ async fn export<S: AsyncWrite + Unpin>(
             "Content-Disposition",
             "attachment; filename=\"iohr-agent-ledger.jsonl\"",
         )],
+        page::csp(),
     );
     write_timed(sock, header.as_bytes()).await?;
     if !head {
@@ -969,12 +1037,20 @@ fn reason(status: u16) -> &'static str {
         421 => "Misdirected Request",
         429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
+        500 => "Internal Server Error",
         _ => "Error",
     }
 }
 
 /// The response head: the same security headers on every answer, and never a CORS one.
-fn headers(srv: &Server, status: u16, ctype: &str, len: u64, extra: &[(&str, &str)]) -> String {
+fn headers(
+    srv: &Server,
+    status: u16,
+    ctype: &str,
+    len: u64,
+    extra: &[(&str, &str)],
+    csp: &str,
+) -> String {
     let mut h = format!(
         "HTTP/1.1 {status} {}\r\nContent-Type: {ctype}\r\nContent-Length: {len}\r\n\
 Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\n\
@@ -982,7 +1058,7 @@ Referrer-Policy: same-origin\r\nContent-Security-Policy: {}\r\n\
 Cross-Origin-Opener-Policy: same-origin\r\nCross-Origin-Resource-Policy: same-origin\r\n\
 Permissions-Policy: camera=(), microphone=(), geolocation=(), interest-cohort=()\r\n",
         reason(status),
-        page::csp()
+        csp
     );
     if srv.tls {
         h.push_str("Strict-Transport-Security: max-age=31536000\r\n");
@@ -1003,7 +1079,25 @@ async fn respond<S: AsyncWrite + Unpin>(
     extra: &[(&str, &str)],
     head: bool,
 ) -> std::io::Result<()> {
-    let header = headers(srv, status, ctype, body.len() as u64, extra);
+    let header = headers(srv, status, ctype, body.len() as u64, extra, page::csp());
+    write_timed(sock, header.as_bytes()).await?;
+    if !head {
+        write_timed(sock, body).await?;
+    }
+    sock.shutdown().await
+}
+
+/// [`respond`] with a CSP of its own (the console bundle's).
+async fn respond_csp<S: AsyncWrite + Unpin>(
+    sock: &mut S,
+    srv: &Server,
+    status: u16,
+    ctype: &str,
+    body: &[u8],
+    csp: &str,
+    head: bool,
+) -> std::io::Result<()> {
+    let header = headers(srv, status, ctype, body.len() as u64, &[], csp);
     write_timed(sock, header.as_bytes()).await?;
     if !head {
         write_timed(sock, body).await?;

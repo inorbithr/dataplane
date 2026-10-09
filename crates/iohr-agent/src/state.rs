@@ -30,6 +30,8 @@ pub struct AgentState {
     checks: Mutex<BTreeMap<String, VecDeque<JobRecord>>>,
     /// When jobs arrived in the last minute.
     arrivals: Mutex<VecDeque<Instant>>,
+    /// The trial store (RFC 0100.1 §5), when the agent keeps one.
+    store: std::sync::OnceLock<std::sync::Arc<crate::store::Store>>,
 }
 
 impl Default for AgentState {
@@ -279,6 +281,7 @@ impl AgentState {
             started: Instant::now(),
             checks: Mutex::new(BTreeMap::new()),
             arrivals: Mutex::new(VecDeque::new()),
+            store: std::sync::OnceLock::new(),
         }
     }
 
@@ -396,7 +399,37 @@ impl AgentState {
 
     /// The host sampler took a sample.
     pub fn host_sampled(&self, info: HostInfo) {
+        if let Some(store) = self.store.get()
+            && let Err(e) = store.record_host(&info)
+        {
+            tracing::warn!(error = %e, "a host reading was not kept in the trial store");
+        }
         self.with(|s| s.host = Some(info));
+    }
+
+    /// Keeps runs and host readings in `store` from now on, and loads the newest runs of
+    /// each check back into memory, so the page's history survives a restart. A second
+    /// call is ignored.
+    pub fn attach_store(&self, store: std::sync::Arc<crate::store::Store>) {
+        match store.recent_by_key(CHECK_HISTORY) {
+            Ok(by_key) => {
+                let mut g = match self.checks.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                for (key, runs) in by_key.into_iter().take(MAX_CHECK_KEYS) {
+                    g.entry(key).or_insert_with(|| runs.into_iter().collect());
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "the trial store's history could not be read"),
+        }
+        let _ = self.store.set(store);
+    }
+
+    /// The trial store, when kept.
+    #[must_use]
+    pub fn store(&self) -> Option<&std::sync::Arc<crate::store::Store>> {
+        self.store.get()
     }
 
     /// The latest answer from the capture companion.
@@ -437,6 +470,11 @@ impl AgentState {
     /// A result went out.
     pub fn result_sent(&self, record: JobRecord, status: ResultStatus) {
         let record = record.bounded();
+        if let Some(store) = self.store.get()
+            && let Err(e) = store.record_run(&record)
+        {
+            tracing::warn!(error = %e, "a run was not kept in the trial store");
+        }
         if let Some(key) = &record.key {
             let mut g = match self.checks.lock() {
                 Ok(g) => g,

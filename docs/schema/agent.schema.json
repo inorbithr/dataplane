@@ -9,6 +9,13 @@
           "description": "Allow a non-loopback address (for a cluster-internal page behind a network policy).\nNeeds `tls_cert` and `tls_key`; the page then always asks for its token.",
           "type": "boolean"
         },
+        "console_dir": {
+          "description": "A console bundle (the `agent` build of InOrbit's console, RFC 0100.1 §1) to serve\nunder `/console/`. Read from this directory only, which the operator controls; a\nsigned, verified bundle replaces this in a later phase (RFC 0100.4, 1.8).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "enabled": {
           "default": true,
           "description": "Serve it at all.",
@@ -551,6 +558,25 @@
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "LocalConfig": {
+      "additionalProperties": false,
+      "description": "`[local]`: the trial store the local console reads. Nothing in it leaves the machine.",
+      "properties": {
+        "retain_days": {
+          "default": 30,
+          "description": "Days of runs and readings kept.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "store": {
+          "default": true,
+          "description": "Keep check runs and host readings in `<state_dir>/store/agent.sqlite` (\"trial\nstorage, not for production\"; the customer's own stores come with `[stores]`).",
+          "type": "boolean"
         }
       },
       "type": "object"
@@ -1202,6 +1228,10 @@
     "ledger": {
       "$ref": "#/$defs/LedgerConfig",
       "description": "The egress ledger: every message sent to the platform, recorded here first\n(`docs/ledger.md`)."
+    },
+    "local": {
+      "$ref": "#/$defs/LocalConfig",
+      "description": "What the agent keeps on this machine for its local console (RFC 0100.1 §5)."
     },
     "metadata": {
       "$ref": "#/$defs/MetadataConfig",

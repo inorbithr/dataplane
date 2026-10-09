@@ -63,6 +63,28 @@ less unless the operator on this machine chooses more; neither reaches anything 
 | A broken policy written | The file is edited in place, validated before it is written, written atomically with its permissions; a reload that fails keeps the agent on its previous policy | `share::tests`, `a_share_change_reloads_the_running_agent` |
 | A change nobody can see afterwards | Every change of `[share]` is a `share_set` entry in the ledger when the new policy starts | `a_change_is_noted_once_in_the_ledger` |
 
+### The local API and the console bundle (RFC 0100.4, slice 1)
+
+The same listener also answers the local API (`/v1/...`, the public API's paths and shapes
+for what this agent holds) and serves the console bundle under `/console/` when
+`[admin] console_dir` names one. No new listener.
+
+| Threat | Control | Test |
+|---|---|---|
+| Anyone on the machine reads the agent's data through the API | The API always asks for the page's token, on loopback too (`require_token` or not): the bearer from `<state_dir>/admin.token`, or the session cookie `/auth` gives a browser. 401 otherwise, in the response contract | `the_local_api_always_needs_the_token` |
+| Another site reads the API through the operator's browser | The page's rules apply first: `Origin` must be this page, `Sec-Fetch-Site` other than `same-origin`/`none` is 403, no CORS header | `another_site_cannot_read_the_api` |
+| The API changes something | GET and HEAD only; any other method on `/v1/` is 405 with the contract's body | `the_local_api_is_read_only` |
+| Probing for other accounts or agents | Another account's or agent's id, and any route the agent does not hold, is `not_found`, never a refusal that confirms it exists | `monitors_and_runs_have_the_public_shapes` |
+| Secrets in an answer | Every API answer passes through the same redaction; a check's secret reference is never in a monitor | `no_secret_in_any_page_or_api_answer`, `monitors_and_runs_have_the_public_shapes` |
+| Script on the console pages | The console is JavaScript, so `/console/` has its own CSP: `script-src 'self'` plus each inline script of the HTML page being served, by SHA-256 computed from the file's bytes; no `'unsafe-inline'` or `'unsafe-eval'` for scripts; `connect-src 'self'`, `frame-ancestors 'none'` | `the_console_bundle_is_served_with_its_own_csp`, `admin::console::tests` |
+| Path traversal through `/console/` | Only files inside `console_dir`: no `..`, no hidden files, no backslash or NUL, the canonical path must stay under the canonical directory (a symlink out is refused), 16 MiB per file | `admin::console::tests::never_leaves_the_directory` |
+| `/auth?next=` used as an open redirect | `next` is followed only to a `/console/` path, never to `//` or another site | `the_console_bundle_is_served_with_its_own_csp` |
+| A tampered bundle | Not covered in this slice: the bundle is read from a directory the operator controls. A signed bundle verified before the first file is served is RFC 0100.4 step 1.8 | none yet |
+
+The trial store (`<state_dir>/store/agent.sqlite`, mode 0600 in a 0700 directory) holds
+the same fields the page shows: verdicts, timings, status codes, classes of error and host
+names, never a path, query, body or secret. Nothing in it leaves the machine.
+
 ## Not covered
 
 - **Root, or the agent's own user.** Either can read the state directory, the token and
