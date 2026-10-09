@@ -363,7 +363,6 @@ pub struct Reload {
 }
 
 /// The admin page's listener, bound once for the process.
-#[derive(Debug)]
 pub struct AdminListener {
     /// Bound.
     pub listener: tokio::net::TcpListener,
@@ -371,6 +370,16 @@ pub struct AdminListener {
     pub tls: Option<tokio_rustls::TlsAcceptor>,
     /// This run's token (`<state_dir>/admin.token`).
     pub token: String,
+}
+
+impl std::fmt::Debug for AdminListener {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminListener")
+            .field("listener", &self.listener)
+            .field("tls", &self.tls.is_some())
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 impl AdminListener {
@@ -451,7 +460,7 @@ fn build(
     ) {
         tracing::warn!(error = %e, "the [share] change was not recorded in the ledger");
     }
-    Ok(agent)
+    Ok(Arc::new(agent))
 }
 
 /// Runs the agent for the life of the process: the admin page once, and the agent itself

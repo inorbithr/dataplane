@@ -1027,7 +1027,7 @@ allow = ["vault:kv/staging/*", "env:CHECK_TOKEN"]
             "[networks]\ndeny_list = [\"10.0.0.0/8\"]\n",
             "[work]\nchecks = true\nlaod = true\n",
             "[share]\ntarget = \"full\"\n",
-            "enviroment = \"prod\"\n",
+            "region = \"eu\"\n",
         ] {
             assert!(Policy::from_toml(&format!("{base}{bad}")).is_err(), "{bad}");
         }
