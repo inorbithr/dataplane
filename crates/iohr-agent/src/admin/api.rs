@@ -109,6 +109,20 @@ pub(super) fn route(
                 }
                 ["agents", agent, "extensions"] if *agent == agent_id => extensions(ctx, person),
                 ["agents", agent, "audit"] if *agent == agent_id => audit(ctx, person),
+                ["agents", agent, "verifications", ..]
+                    if *agent == agent_id
+                        && !crate::extensions::running(
+                            "inorbit/verify",
+                            &ctx.policy,
+                            &ctx.lock,
+                        ) =>
+                {
+                    not_found("verification (inorbit/verify is not installed on this agent)")
+                }
+                ["agents", agent, "verifications"] if *agent == agent_id => verifications(ctx),
+                ["agents", agent, "verifications", id] if *agent == agent_id => {
+                    verification(ctx, id)
+                }
                 ["agents", ..] => not_found("agent"),
                 _ => not_found("route"),
             }
@@ -205,6 +219,11 @@ fn passed(kind: Kind, refuse_by: Option<RefuseBy>, r: &JobRecord) -> bool {
         (Kind::Check, _) | (Kind::Refuse, Some(RefuseBy::Answer) | None) => r.verdict == "ok",
         (Kind::Refuse, Some(RefuseBy::Policy | RefuseBy::Platform)) => r.verdict == "refused",
     }
+}
+
+/// Whether a run of `c` passed (for the verifier).
+pub(super) fn passed_for(c: &DeclaredCheck, r: &JobRecord) -> bool {
+    passed(c.kind, c.refuse_by, r)
 }
 
 /// The health a declared check's runs give: `down` after `fail_after` failures in a
@@ -557,6 +576,102 @@ fn extensions(ctx: &Context, person: &Person) -> Answer {
     }))
 }
 
+// ---- verify (verify.rs) ----------------------------------------------------------------
+
+fn verifications(ctx: &Context) -> Answer {
+    let Some(store) = ctx.state.store() else {
+        return ok(&json!({"verifications": [], "kept": false, "where": "agent"}));
+    };
+    match store.verifications(100, None) {
+        Ok(vs) => {
+            let list: Vec<Value> = vs
+                .into_iter()
+                .map(|v| super::verify::with_record(ctx, v))
+                .collect();
+            ok(&json!({"verifications": list, "kept": true, "where": "agent"}))
+        }
+        Err(e) => error(500, "internal", &e.to_string()),
+    }
+}
+
+fn verification(ctx: &Context, id: &str) -> Answer {
+    let Some(id) = id.strip_prefix("ver-").and_then(|i| i.parse::<i64>().ok()) else {
+        return not_found("verification");
+    };
+    match ctx
+        .state
+        .store()
+        .and_then(|s| s.verifications(1, Some(id)).ok())
+        .and_then(|v| v.into_iter().next())
+    {
+        Some(v) => {
+            ok(&json!({"verification": super::verify::with_record(ctx, v), "where": "agent"}))
+        }
+        None => not_found("verification"),
+    }
+}
+
+fn create_verification(ctx: &Context, person: &Person, body: &[u8]) -> (u16, WriteOut) {
+    if !crate::extensions::running("inorbit/verify", &ctx.policy, &ctx.lock) {
+        return out(not_found(
+            "verification (inorbit/verify is not installed on this agent)",
+        ));
+    }
+    if person.role < Role::Member {
+        return noted(
+            forbidden("starting a verification needs the member role"),
+            "verify.create",
+            "-",
+            "refused: role",
+            "",
+        );
+    }
+    let Ok(n) = serde_json::from_slice::<super::verify::NewVerification>(body) else {
+        return out(error(
+            400,
+            "invalid_argument",
+            "send {\"name\", \"claims\": [check names], \"change_at\", \"window_secs\", \"reason\"}",
+        ));
+    };
+    let change_at = match super::verify::check(ctx, &n) {
+        Ok(t) => t,
+        Err(e) => return out(error(400, "invalid_argument", &e)),
+    };
+    let Some(store) = ctx.state.store() else {
+        return out(error(
+            412,
+            "failed_precondition",
+            "verifications are kept in the trial store, which is off ([local] store)",
+        ));
+    };
+    let v = crate::store::Verification {
+        id: 0,
+        name: n.name.trim().into(),
+        claims: n.claims,
+        change_at,
+        window_secs: n.window_secs,
+        who: person.who.clone(),
+        by_name: person.name.clone(),
+        reason: n.reason.clone(),
+        at: crate::enroll::now_rfc3339(),
+        record: None,
+    };
+    match store.create_verification(&v) {
+        Ok(id) => {
+            let v = crate::store::Verification { id, ..v };
+            let target = format!("ver-{id}");
+            noted(
+                ok(&json!({"verification": super::verify::with_record(ctx, v)})),
+                "verify.create",
+                &target,
+                "ok",
+                &n.reason,
+            )
+        }
+        Err(e) => out(error(500, "internal", &e.to_string())),
+    }
+}
+
 // ---- the audit log ---------------------------------------------------------------------
 
 fn audit(ctx: &Context, person: &Person) -> Answer {
@@ -708,6 +823,7 @@ pub(super) async fn write(
             )
             .await
         }
+        ("POST", ["verifications"]) => create_verification(ctx, person, body),
         (
             "POST",
             [

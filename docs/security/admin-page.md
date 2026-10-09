@@ -98,6 +98,7 @@ names, never a path, query, body or secret. Nothing in it leaves the machine.
 | Two people overwrite each other | A change names the version it started from (`base_sha`); a stale one is refused with 409 | same |
 | A change nobody can trace | Every write, sign-in and sign-out is a line in `<state_dir>/audit/audit.jsonl`, hash-chained like the egress ledger, with the reason given; versions keep who, when and why; a policy change is also a `policy_set` ledger entry (hashes only) | `audit::tests`, same |
 | The console widens what the policy forbids | Checks are judged against the policy in force; extensions need the licence and the policy before the lock; only an admin edits the policy itself | `extensions_need_three_yeses_and_an_admin` |
+| A verification's verdict changed afterwards | Its evidence record is computed from the kept runs and frozen once its window has passed; counts and pass rates only, never an estimate; creating one needs the member role and is audited | `a_verification_judges_each_claim_before_and_after` |
 | Sessions that never end | 30 minutes idle, 12 hours at most, ended on sign-out | `a_browser_write_needs…` |
 
 ## Not covered

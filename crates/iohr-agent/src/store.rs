@@ -81,6 +81,24 @@ pub struct ConfigVersion {
     pub at: String,
 }
 
+/// A verification: a change, the checks that are its claims, and (once its window has
+/// passed) the evidence record, frozen.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Verification {
+    pub id: i64,
+    pub name: String,
+    pub claims: Vec<String>,
+    pub change_at: String,
+    pub window_secs: i64,
+    pub who: String,
+    pub by_name: String,
+    pub reason: String,
+    pub at: String,
+    /// The frozen evidence record, once complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<serde_json::Value>,
+}
+
 /// The trial store. Cheap to share; one connection behind a lock (the writes are a few a
 /// minute, the reads are a person looking at a page).
 #[derive(Debug)]
@@ -145,6 +163,18 @@ impl Store {
                at TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS config_versions_file ON config_versions (file, id);
+             CREATE TABLE IF NOT EXISTS verifications (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               name TEXT NOT NULL,
+               claims TEXT NOT NULL,
+               change_at TEXT NOT NULL,
+               window_secs INTEGER NOT NULL,
+               who TEXT NOT NULL,
+               by_name TEXT NOT NULL,
+               reason TEXT NOT NULL,
+               at TEXT NOT NULL,
+               record TEXT
+             );
              CREATE TABLE IF NOT EXISTS host (
                at TEXT PRIMARY KEY,
                sensors INTEGER NOT NULL,
@@ -462,6 +492,117 @@ impl Store {
                 },
             )
             .optional()
+            .map_err(sql)
+    }
+
+    /// A check's runs with `from <= at < to`, oldest first (at most [`MAX_PAGE`] × 10).
+    ///
+    /// # Errors
+    /// SQLite refused the read.
+    pub fn runs_between(&self, key: &str, from: &str, to: &str) -> Result<Vec<StoredRun>> {
+        let c = self.conn();
+        let mut stmt = c
+            .prepare(
+                "SELECT id, at, kind, surface, target_host, verdict, latency_ms, job_id, reason,
+                        error_class, status_code, tls_expires_at
+                 FROM runs WHERE key = ?1 AND at >= ?2 AND at < ?3 ORDER BY id LIMIT 5000",
+            )
+            .map_err(sql)?;
+        let rows = stmt
+            .query_map(params![key, from, to], |row| {
+                Ok(StoredRun {
+                    id: row.get(0)?,
+                    record: JobRecord {
+                        at: row.get(1)?,
+                        kind: row.get(2)?,
+                        surface: row.get(3)?,
+                        target_host: row.get(4)?,
+                        verdict: row.get(5)?,
+                        latency_ms: u64::try_from(row.get::<_, i64>(6)?).unwrap_or(0),
+                        job_id: row.get(7)?,
+                        key: Some(key.to_owned()),
+                        reason: row.get(8)?,
+                        error_class: row.get(9)?,
+                        status_code: row.get(10)?,
+                        tls_expires_at: row.get(11)?,
+                    },
+                })
+            })
+            .map_err(sql)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(sql)
+    }
+
+    /// Keeps a new verification.
+    ///
+    /// # Errors
+    /// SQLite refused the write.
+    pub fn create_verification(&self, v: &Verification) -> Result<i64> {
+        let c = self.conn();
+        c.execute(
+            "INSERT INTO verifications (name, claims, change_at, window_secs, who, by_name, reason, at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                v.name,
+                serde_json::to_string(&v.claims).unwrap_or_default(),
+                v.change_at,
+                v.window_secs,
+                v.who,
+                v.by_name,
+                v.reason,
+                v.at
+            ],
+        )
+        .map_err(sql)?;
+        Ok(c.last_insert_rowid())
+    }
+
+    /// Freezes a verification's evidence record.
+    ///
+    /// # Errors
+    /// SQLite refused the write.
+    pub fn freeze_verification(&self, id: i64, record: &serde_json::Value) -> Result<()> {
+        self.conn()
+            .execute(
+                "UPDATE verifications SET record = ?2 WHERE id = ?1 AND record IS NULL",
+                params![id, record.to_string()],
+            )
+            .map_err(sql)?;
+        Ok(())
+    }
+
+    /// Verifications, newest first.
+    ///
+    /// # Errors
+    /// SQLite refused the read.
+    pub fn verifications(&self, limit: usize, id: Option<i64>) -> Result<Vec<Verification>> {
+        let limit = i64::try_from(limit.clamp(1, MAX_PAGE)).unwrap_or(50);
+        let c = self.conn();
+        let mut stmt = c
+            .prepare(
+                "SELECT id, name, claims, change_at, window_secs, who, by_name, reason, at, record
+                 FROM verifications WHERE (?2 IS NULL OR id = ?2) ORDER BY id DESC LIMIT ?1",
+            )
+            .map_err(sql)?;
+        let rows = stmt
+            .query_map(params![limit, id], |r| {
+                let claims: String = r.get(2)?;
+                let record: Option<String> = r.get(9)?;
+                Ok(Verification {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    claims: serde_json::from_str(&claims).unwrap_or_default(),
+                    change_at: r.get(3)?,
+                    window_secs: r.get(4)?,
+                    who: r.get(5)?,
+                    by_name: r.get(6)?,
+                    reason: r.get(7)?,
+                    at: r.get(8)?,
+                    record: record.and_then(|t| serde_json::from_str(&t).ok()),
+                })
+            })
+            .map_err(sql)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(sql)
     }
 

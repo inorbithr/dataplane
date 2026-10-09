@@ -1641,7 +1641,7 @@ async fn extensions_need_three_yeses_and_an_admin() {
     );
     let r = send(
         addr,
-        &post_json(&format!("{base}/inorbit/verify/enable"), &host, &auth, "{}"),
+        &post_json(&format!("{base}/inorbit/chaos/enable"), &host, &auth, "{}"),
     )
     .await;
     assert_eq!(status(&r), 412, "{r}");
@@ -1661,4 +1661,83 @@ async fn the_console_is_an_extension() {
     let r = send(addr, &get("/console/", &addr.to_string(), "")).await;
     assert_eq!(status(&r), 404);
     assert!(r.contains("inorbit/console"));
+}
+
+/// Verify: a change's claims judged before and after from the kept runs, frozen as an
+/// evidence record once its window has passed.
+#[tokio::test]
+async fn a_verification_judges_each_claim_before_and_after() {
+    let d = tempfile::tempdir().unwrap();
+    let ctx = context(d.path(), false);
+    let store = Arc::new(crate::store::Store::open(&d.path().join("store"), 30).unwrap());
+    ctx.state.attach_store(Arc::clone(&store));
+    let fmt = |t: time::OffsetDateTime| {
+        t.format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    };
+    let change = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+    for (offset, verdict) in [(-300, "ok"), (-200, "ok"), (200, "ok"), (300, "failed")] {
+        store
+            .record_run(&JobRecord {
+                at: fmt(change + time::Duration::seconds(offset)),
+                kind: "check".into(),
+                verdict: verdict.into(),
+                key: Some("api".into()),
+                status_code: Some(if verdict == "ok" { 200 } else { 503 }),
+                ..JobRecord::default()
+            })
+            .unwrap();
+    }
+    let token = ctx.token.clone().unwrap();
+    let (addr, _stop) = start(ctx).await;
+    let host = addr.to_string();
+    let auth = bearer(&token);
+    let base = "/v1/accounts/orgs/acc_TEST/agents/agt_01TEST/verifications";
+    // A claim that is not a check is refused.
+    let bad = serde_json::json!({"name": "x", "claims": ["nope"]}).to_string();
+    assert_eq!(
+        status(&send(addr, &post_json(base, &host, &auth, &bad)).await),
+        400
+    );
+    let body = serde_json::json!({
+        "name": "Retry change in the API client",
+        "claims": ["api"],
+        "change_at": fmt(change),
+        "window_secs": 600,
+        "reason": "PR 42",
+    })
+    .to_string();
+    let r = json_of(&send(addr, &post_json(base, &host, &auth, &body)).await);
+    let rec = &r["verification"]["record"];
+    assert_eq!(rec["verdict"], "fail", "{r}");
+    assert_eq!(rec["claims"][0]["verdict"], "broke");
+    assert_eq!(rec["claims"][0]["before"]["runs"], 2);
+    assert_eq!(rec["claims"][0]["after"]["passed"], 1);
+    assert_eq!(
+        rec["claims"][0]["after"]["first_failures"][0]["status_code"],
+        503
+    );
+    // Frozen: a later run in the window does not change the record.
+    store
+        .record_run(&JobRecord {
+            at: fmt(change + time::Duration::seconds(400)),
+            kind: "check".into(),
+            verdict: "ok".into(),
+            key: Some("api".into()),
+            ..JobRecord::default()
+        })
+        .unwrap();
+    let id = r["verification"]["verification_id"].as_str().unwrap();
+    let again = json_of(&send(addr, &get(&format!("{base}/{id}"), &host, &auth)).await);
+    assert_eq!(
+        again["verification"]["record"]["claims"][0]["after"]["runs"],
+        2
+    );
+    // A change still inside its window is measuring.
+    let body =
+        serde_json::json!({"name": "now", "claims": ["api"], "window_secs": 600}).to_string();
+    let r = json_of(&send(addr, &post_json(base, &host, &auth, &body)).await);
+    assert_eq!(r["verification"]["record"]["verdict"], "measuring");
+    let list = json_of(&send(addr, &get(base, &host, &auth)).await);
+    assert_eq!(list["verifications"].as_array().unwrap().len(), 2);
 }

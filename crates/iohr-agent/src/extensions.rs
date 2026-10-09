@@ -193,21 +193,44 @@ pub fn builtins() -> Vec<Manifest> {
         },
         Manifest {
             id: "inorbit/verify",
-            name: "Chaos and verify",
-            summary: "Load, faults and before-and-after verification of a change, with an evidence record (RFC 0047.2, PRD 0008).",
+            name: "Verify",
+            summary: "Did a change hold? Its checks before and after, judged per claim, with an evidence record kept on this machine (PRD 0008).",
             kind: "agent-plugin",
-            delivery: "program",
+            delivery: "builtin",
             version: VERSION,
-            entitlement: "verify",
+            entitlement: "verify.local",
             where_: &["agent", "console"],
-            policy: &["load", "faults"],
+            policy: &["checks"],
             data: Data {
-                reads: &["checks.toml", "scenarios"],
-                writes: &["store: runs, verdicts, evidence records"],
-                leaves: &["verdicts (pass, fail, per claim)"],
+                reads: &["store: runs"],
+                writes: &["store: verifications"],
+                leaves: &[],
             },
             privileges: &[],
             routes: &["/verify/"],
+            permissions: Permissions {
+                read: ALL,
+                write: MEMBERS,
+            },
+            required: false,
+        },
+        Manifest {
+            id: "inorbit/chaos",
+            name: "Chaos",
+            summary: "Load and faults within the policy's limits, as scenarios with a verdict (RFC 0047.2).",
+            kind: "agent-plugin",
+            delivery: "program",
+            version: VERSION,
+            entitlement: "chaos",
+            where_: &["agent", "console"],
+            policy: &["load", "faults"],
+            data: Data {
+                reads: &["scenarios"],
+                writes: &["store: runs, verdicts"],
+                leaves: &["verdicts (pass, fail, per claim)"],
+            },
+            privileges: &[],
+            routes: &["/chaos/"],
             permissions: Permissions {
                 read: ALL,
                 write: ADMINS,
@@ -223,6 +246,7 @@ const FREE: &[&str] = &[
     "console.local",
     "monitors.local",
     "host.local",
+    "verify.local",
 ];
 /// What the lock holds on first start.
 const FIRST_START: &[&str] = &[
@@ -230,6 +254,7 @@ const FIRST_START: &[&str] = &[
     "inorbit/console",
     "inorbit/monitors",
     "inorbit/host",
+    "inorbit/verify",
 ];
 
 /// One installed extension.
@@ -447,9 +472,11 @@ mod tests {
             &policy("[work]\nhost = true\n"),
             &lock
         ));
-        // Verify needs load or faults, refused by this version, and a licence.
-        let v = state(&builtins()[5], &policy(""), &lock);
-        assert!(!v.running && !v.licence.ok && !v.policy.ok);
+        // Verify runs from the checks; chaos needs load or faults, refused by this version,
+        // and a licence.
+        assert!(running("inorbit/verify", &policy(""), &lock));
+        let c = state(&builtins()[6], &policy(""), &lock);
+        assert!(!c.running && !c.licence.ok && !c.policy.ok);
     }
 
     #[test]
