@@ -10,6 +10,7 @@
 //! | `GET /v1/accounts/orgs/{org}/agents/{agent}` | `AgentsService.GetAgent` | the agent's state |
 //! | `GET /v1/accounts/orgs/{org}/agents/{agent}/host` | agent only | the host sampler and the trial store |
 //! | `GET /v1/agents/{agent}/ledger` | ADR 0049 | the egress ledger |
+//! | `GET /v1/agents/self` | agent only | which account and agent answer here |
 //! | `GET /v1/accounts/orgs/{org}/agents/{agent}/share` | agent only | the policy's `[share]` |
 //!
 //! Every answer carries `"where": "agent"` (RFC 0090.1 §3: a local-only field is added,
@@ -53,6 +54,7 @@ pub(super) fn route(ctx: &Context, path: &str, query: &str) -> Answer {
     let q = Query::parse(query);
     let agent_id = ctx.state.snapshot().agent.agent_id.unwrap_or_default();
     match parts.as_slice() {
+        ["v1", "agents", "self"] => self_doc(ctx, &agent_id),
         ["v1", "agents", agent, "ledger"] => {
             if *agent != agent_id {
                 return not_found("agent");
@@ -127,6 +129,7 @@ struct Query {
     page_size: Option<usize>,
     page_token: Option<String>,
     status: Option<String>,
+    from: Option<String>,
     agent_id: Option<String>,
     category: Option<String>,
 }
@@ -144,6 +147,7 @@ impl Query {
                 "page_size" => out.page_size = v.parse().ok(),
                 "page_token" if !v.is_empty() => out.page_token = Some(v),
                 "status" if !v.is_empty() => out.status = Some(v.to_ascii_lowercase()),
+                "from" if !v.is_empty() => out.from = Some(v),
                 "agent_id" if !v.is_empty() => out.agent_id = Some(v),
                 "category" if !v.is_empty() => out.category = Some(v),
                 _ => {}
@@ -265,6 +269,7 @@ fn runs(ctx: &Context, id: &str, q: &Query) -> Answer {
             .iter()
             .rev()
             .filter(|r| ok_only.is_none_or(|o| (r.verdict == "ok") == o))
+            .filter(|r| q.from.as_deref().is_none_or(|f| r.at.as_str() >= f))
             .take(size)
             .enumerate()
             .map(|(i, r)| run_json(i64::try_from(i).unwrap_or(0), r))
@@ -272,7 +277,7 @@ fn runs(ctx: &Context, id: &str, q: &Query) -> Answer {
         return ok(&json!({"runs": runs, "next_page_token": "", "where": "agent"}));
     };
     let before = q.page_token.as_deref().and_then(|t| t.parse::<i64>().ok());
-    match store.runs(key, size + 1, before, ok_only) {
+    match store.runs(key, size + 1, before, ok_only, q.from.as_deref()) {
         Ok(mut rows) => {
             let next = if rows.len() > size {
                 rows.truncate(size);
@@ -309,6 +314,22 @@ fn agent_doc(ctx: &Context) -> Answer {
                 "path": st.path().display().to_string(),
             })),
         }
+    }))
+}
+
+/// `GET /v1/agents/self` (agent only): who answers here, so a console that opens on this
+/// agent knows which `{org_id}` and `{agent_id}` to ask for.
+fn self_doc(ctx: &Context, agent_id: &str) -> Answer {
+    let s = ctx.state.snapshot();
+    ok(&json!({
+        "account_id": ctx.account_id,
+        "agent_id": agent_id,
+        "name": s.agent.name,
+        "environment": s.agent.environment,
+        "version": s.agent.version,
+        "connected": s.connected,
+        "store": if ctx.state.store().is_some() { "trial" } else { "memory" },
+        "where": "agent",
     }))
 }
 
@@ -386,7 +407,10 @@ mod tests {
 
     #[test]
     fn query_parses_and_decodes() {
-        let q = Query::parse("page_size=5&page_token=12&status=FAILED&agent_id=agt%5F1");
+        let q = Query::parse(
+            "page_size=5&page_token=12&status=FAILED&agent_id=agt%5F1&from=2026-10-09T00%3A00%3A00Z",
+        );
+        assert_eq!(q.from.as_deref(), Some("2026-10-09T00:00:00Z"));
         assert_eq!(q.page_size, Some(5));
         assert_eq!(q.page_token.as_deref(), Some("12"));
         assert_eq!(q.status.as_deref(), Some("failed"));

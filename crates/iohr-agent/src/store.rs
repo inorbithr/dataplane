@@ -250,7 +250,8 @@ impl Store {
     }
 
     /// A check's runs, newest first: up to `limit`, older than row `before` when given,
-    /// only `ok` or only not-`ok` when `status` is `Some`.
+    /// only `ok` or only not-`ok` when `ok` is `Some`, at or after `from` (RFC 3339) when
+    /// given.
     ///
     /// # Errors
     /// SQLite refused the read.
@@ -260,9 +261,11 @@ impl Store {
         limit: usize,
         before: Option<i64>,
         ok: Option<bool>,
+        from: Option<&str>,
     ) -> Result<Vec<StoredRun>> {
         let limit = i64::try_from(limit.clamp(1, MAX_PAGE)).unwrap_or(50);
         let before = before.unwrap_or(i64::MAX);
+        let from = from.unwrap_or("");
         let verdict = match ok {
             None => "%",
             Some(true) => "ok",
@@ -276,11 +279,12 @@ impl Store {
                  FROM runs
                  WHERE key = ?1 AND id < ?2
                    AND (?3 = '' AND verdict <> 'ok' OR ?3 <> '' AND verdict LIKE ?3)
+                   AND at >= ?5
                  ORDER BY id DESC LIMIT ?4",
             )
             .map_err(sql)?;
         let rows = stmt
-            .query_map(params![key, before, verdict, limit], |row| {
+            .query_map(params![key, before, verdict, limit, from], |row| {
                 Ok(StoredRun {
                     id: row.get(0)?,
                     record: JobRecord {
@@ -322,7 +326,7 @@ impl Store {
         let mut out = BTreeMap::new();
         for k in keys {
             let mut runs: Vec<JobRecord> = self
-                .runs(&k, n, None, None)?
+                .runs(&k, n, None, None, None)?
                 .into_iter()
                 .map(|r| r.record)
                 .collect();
@@ -421,14 +425,20 @@ mod tests {
             s.record_run(&run("other", "ok", &now())).unwrap();
         }
         let s = Store::open(&dir, 30).unwrap();
-        let all = s.runs("api", 10, None, None).unwrap();
+        let all = s.runs("api", 10, None, None, None).unwrap();
         assert_eq!(all.len(), 5);
         assert!(all[0].id > all[4].id, "newest first");
-        let page = s.runs("api", 2, Some(all[1].id), None).unwrap();
+        let page = s.runs("api", 2, Some(all[1].id), None, None).unwrap();
         assert_eq!(page.len(), 2);
         assert_eq!(page[0].id, all[2].id);
-        assert_eq!(s.runs("api", 10, None, Some(false)).unwrap().len(), 1);
-        assert_eq!(s.runs("api", 10, None, Some(true)).unwrap().len(), 4);
+        assert_eq!(s.runs("api", 10, None, Some(false), None).unwrap().len(), 1);
+        assert_eq!(s.runs("api", 10, None, Some(true), None).unwrap().len(), 4);
+        assert_eq!(
+            s.runs("api", 10, None, None, Some("2999-01-01T00:00:00Z"))
+                .unwrap()
+                .len(),
+            0
+        );
         let by_key = s.recent_by_key(60).unwrap();
         assert_eq!(by_key["api"].len(), 5);
         assert_eq!(by_key["other"].len(), 1);
@@ -442,7 +452,7 @@ mod tests {
             .unwrap();
         s.record_run(&run("api", "ok", &now())).unwrap();
         s.prune().unwrap();
-        assert_eq!(s.runs("api", 10, None, None).unwrap().len(), 1);
+        assert_eq!(s.runs("api", 10, None, None, None).unwrap().len(), 1);
     }
 
     #[test]

@@ -980,6 +980,10 @@ async fn agent_host_ledger_and_share_answer_locally() {
     let (addr, _stop) = start(ctx).await;
     let host = addr.to_string();
     let auth = bearer(&token);
+    let me = json_of(&send(addr, &get("/v1/agents/self", &host, &auth)).await);
+    assert_eq!(me["account_id"], "acc_TEST");
+    assert_eq!(me["agent_id"], "agt_01TEST");
+    assert_eq!(me["store"], "trial");
     let agent = json_of(
         &send(
             addr,
