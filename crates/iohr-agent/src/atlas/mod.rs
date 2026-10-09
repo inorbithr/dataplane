@@ -40,6 +40,8 @@ pub struct ObserveRequest {
     pub namespaces: Vec<String>,
     /// Read this host (needs a policy with `[work] host = true`).
     pub host: Option<HostRequest>,
+    /// A directory of decided documents (PRDs, ADRs, RFCs) to read, whatever its layout.
+    pub decided: Option<PathBuf>,
 }
 
 /// How to read the host.
@@ -72,6 +74,8 @@ pub struct Summary {
     pub components: Option<(usize, usize)>,
     /// A human report of the host reading.
     pub host_report: Option<String>,
+    /// What a `--decided` directory held.
+    pub decided: Option<decided::Found>,
 }
 
 /// Runs the observers and returns the records with a summary. A cluster is read only
@@ -82,9 +86,9 @@ pub struct Summary {
 /// any read or record failure.
 #[allow(clippy::too_many_lines)] // repository, host, cluster, in order
 pub async fn observe(req: &ObserveRequest, policy: Option<&Policy>) -> Result<(Sink, Summary)> {
-    if req.repo.is_none() && req.kubeconfig.is_none() && req.host.is_none() {
+    if req.repo.is_none() && req.kubeconfig.is_none() && req.host.is_none() && req.decided.is_none() {
         return Err(Error::Atlas(
-            "nothing to observe: pass host, --repo and/or --kubeconfig".into(),
+            "nothing to observe: pass host, --repo, --decided and/or --kubeconfig".into(),
         ));
     }
     let host_policy = match &req.host {
@@ -161,6 +165,10 @@ pub async fn observe(req: &ObserveRequest, policy: Option<&Policy>) -> Result<(S
 
     if let Some(r) = &repository {
         summary.repository = Some(repo::observe(r, &mut sink, &clock)?);
+    }
+
+    if let Some(d) = &req.decided {
+        summary.decided = Some(decided::observe_dir(d, &mut sink, &clock)?);
     }
 
     if let Some(c) = &context {

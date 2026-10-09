@@ -46,8 +46,6 @@ pub mod methods {
     pub const NETPOL: &str = "k8s.networkpolicy";
     /// Envoy routes and clusters.
     pub const ENVOY: &str = "envoy.route";
-    /// PRDs, ADRs and RFCs: what they decide.
-    pub const DECIDED: &str = "docs.decided";
 }
 
 /// A checkout.
@@ -90,7 +88,7 @@ impl Repo {
 
     /// Every regular file under the root with one of `extensions`, as relative paths,
     /// sorted. Skips build output, dependencies and hidden directories.
-    fn files(&self, extensions: &[&str]) -> Vec<PathBuf> {
+    pub(super) fn files(&self, extensions: &[&str]) -> Vec<PathBuf> {
         let mut out = Vec::new();
         let mut stack = vec![(self.root.clone(), 0usize)];
         while let Some((dir, depth)) = stack.pop() {
@@ -124,7 +122,7 @@ impl Repo {
     }
 
     /// Reads `rel`, records the artefact, and returns its bytes with the artefact id.
-    fn read(
+    pub(super) fn read(
         &self,
         ctx: &Ctx,
         sink: &mut Sink,
@@ -319,7 +317,7 @@ pub fn observe(repo: &Repo, sink: &mut Sink, clock: &ObservedNow) -> Result<Foun
         sink,
         "decided-document-reader",
         ObserverClass::DeterministicExtractor,
-        method(methods::DECIDED, MethodCategory::Configuration)?,
+        method(super::decided::METHOD, MethodCategory::Configuration)?,
         &principal,
         &["read"],
         clock,
