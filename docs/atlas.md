@@ -27,6 +27,7 @@ of counts goes to standard error.
 | `k8s-manifest-reader` | deterministic extractor | `k8s.manifest` (configuration) | Deployments, StatefulSets, DaemonSets and Services in YAML files (the namespace comes from the object, else the nearest `kustomization.yaml`, else `default`) | `runs_image`, `labelled`, `reads_secret`, `reads_secret_key`, `selects`, `targets`, `exposes_port` |
 | `k8s-networkpolicy-reader` | deterministic extractor | `k8s.networkpolicy` (configuration) | NetworkPolicies in the same files | `selects`, `applies_to`, `allows_egress` |
 | `envoy-route-reader` | deterministic extractor | `envoy.route` (configuration) | `envoy.yaml` static listeners and clusters | `envoy.route/<vhost>/<match> matches_path`, `in_virtual_host`, `routes_to`; `envoy.cluster/<name> upstream_host`, `upstream_port`, `upstream_service` |
+| `decided-document-reader` | deterministic extractor | `docs.decided` (configuration) | PRDs, ADRs and RFCs: `docs/prds`, `docs/adrs`, `docs/rfcs` of `--repo` (READMEs excepted), or every markdown file under `--decided <dir>` | `document/<kind>/<n>` `doc.kind`, `doc.source`, `doc.status`, `doc.title`, `doc.date`, `doc.public`, `doc.parent`, `doc.decides`, `doc.states`; each fact of a `decided` block as `decided.<predicate>` on its subject and as `decision/<kind>/<n>#<i>` with `decision.document`, `decision.subject`, `decision.predicate`, `decision.value`, `decision.lines`; each constraint sentence as `statement/<kind>/<n>@<first>-<last>` with `statement.text`, `statement.lines` |
 | `k8s-reader` | external system | `k8s.api.read` (runtime state) | the Kubernetes API: deployments, pods, services, network policies in the namespaces asked for | the same predicates as the manifests, plus `built_from_commit` (the `inorbit.hr/commit` annotation), `runs_image_digest` (from pod status) and `replicas_ready` |
 
 Every file read becomes an artefact observation with the digest of its bytes, and every
@@ -39,6 +40,35 @@ From the cluster reading, the run also writes an environment manifest: one compo
 deployment, pinned by its commit and its pods' image digests. Each part cites the
 observation that reported it. A deployment with neither is listed as unknown, with the
 reason.
+
+## The decided world
+
+What a document decides about the running system, it states in a `decided` block: a fenced
+block marked `decided`, TOML with one `[[decided]]` table per fact.
+
+````markdown
+```decided
+[[decided]]
+subject = "deployment/tbd/paging"      # an entity key, as the other observers name it
+predicate = "egress_only"              # read as decided.egress_only
+text = "api.push.apple.com:443"        # exactly one of text, entity, int, bool
+note = "one line for people; not observed"
+```
+````
+
+The block is refused as a whole when it does not parse or a fact has an unknown field, two
+values or none; a refusal is listed in the run's summary and nothing of the block is read.
+Facts use the `decided.` namespace so they never pass for something an observer measured:
+setting a decided fact against an observed one (and telling a discovery from a
+restatement: a fact is *stated* when a `decision` names the same subject, predicate and
+value) is Atlas core's job, not the reader's.
+
+Sentences of a `Decision` or `Decisions` section that say `must`, `only`, `never` or
+`always` are kept as text with their lines, never typed. Classified spans
+(`[[classified:…]]…[[/classified]]` and fenced `classified` blocks) are cut before anything
+is read, keeping line numbers; nothing inside one is ever observed. The kind comes from the
+front matter, else the file name (`adr-9001-….md`), else the directory; the number from the
+file name.
 
 ## Output
 

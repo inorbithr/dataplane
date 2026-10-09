@@ -88,7 +88,7 @@ impl Repo {
 
     /// Every regular file under the root with one of `extensions`, as relative paths,
     /// sorted. Skips build output, dependencies and hidden directories.
-    fn files(&self, extensions: &[&str]) -> Vec<PathBuf> {
+    pub(super) fn files(&self, extensions: &[&str]) -> Vec<PathBuf> {
         let mut out = Vec::new();
         let mut stack = vec![(self.root.clone(), 0usize)];
         while let Some((dir, depth)) = stack.pop() {
@@ -122,7 +122,7 @@ impl Repo {
     }
 
     /// Reads `rel`, records the artefact, and returns its bytes with the artefact id.
-    fn read(
+    pub(super) fn read(
         &self,
         ctx: &Ctx,
         sink: &mut Sink,
@@ -200,6 +200,8 @@ pub struct Found {
     pub k8s_objects: BTreeMap<String, usize>,
     /// Envoy routes read.
     pub envoy_routes: usize,
+    /// The decided world: documents, typed facts, constraint sentences, refusals.
+    pub decided: super::decided::Found,
 }
 
 /// A parsed Kubernetes object with the artefact it came from.
@@ -309,6 +311,44 @@ pub fn observe(repo: &Repo, sink: &mut Sink, clock: &ObservedNow) -> Result<Foun
     observe_k8s(&k8s_ctx, &netpol_ctx, &objects, sink)?;
     for (doc, artifact) in &envoy {
         found.envoy_routes += observe_envoy(&envoy_ctx, doc, *artifact, &objects, sink)?;
+    }
+    found.decided = observe_decided(repo, sink, clock, &principal)?;
+    Ok(found)
+}
+
+/// The PRDs, ADRs and RFCs under the checkout's `docs/` ([`super::decided`]).
+fn observe_decided(
+    repo: &Repo,
+    sink: &mut Sink,
+    clock: &ObservedNow,
+    principal: &str,
+) -> Result<super::decided::Found> {
+    let mut found = super::decided::Found::default();
+    let decided_ctx = Ctx::new(
+        sink,
+        "decided-document-reader",
+        ObserverClass::DeterministicExtractor,
+        method(super::decided::METHOD, MethodCategory::Configuration)?,
+        principal,
+        &["read"],
+        clock,
+    )?;
+    for rel in repo.files(&["md"]) {
+        let Some(kind) = super::decided::kind_for(&rel) else {
+            continue;
+        };
+        let Some((bytes, artifact)) = repo.read(&decided_ctx, sink, &rel)? else {
+            continue;
+        };
+        super::decided::observe_document(
+            &decided_ctx,
+            sink,
+            &rel,
+            kind,
+            &bytes,
+            artifact,
+            &mut found,
+        )?;
     }
     Ok(found)
 }

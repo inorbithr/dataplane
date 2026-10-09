@@ -217,9 +217,13 @@ pub struct AtlasObserveArgs {
     /// host: name PCI devices from this pci.ids (default: the host's).
     #[arg(long, hide = true)]
     pub pci_ids: Option<PathBuf>,
-    /// A checkout to read (Cargo manifests, Kubernetes manifests, Envoy routes).
+    /// A checkout to read (Cargo manifests, Kubernetes manifests, Envoy routes, and the
+    /// PRDs, ADRs and RFCs under docs/).
     #[arg(long)]
     pub repo: Option<PathBuf>,
+    /// A directory of decided documents (PRDs, ADRs, RFCs) to read, whatever its layout.
+    #[arg(long)]
+    pub decided: Option<PathBuf>,
     /// The kubeconfig to read a cluster through (default: `$KUBECONFIG`, then
     /// `~/.kube/config`, when `--kube-context` is given).
     #[arg(long)]
@@ -761,6 +765,7 @@ async fn atlas_observe(args: &AtlasObserveArgs, config_path: &Path) -> Result<Ex
         kubeconfig,
         kube_context: args.kube_context.clone(),
         namespaces: args.namespaces.clone(),
+        decided: args.decided.clone(),
         host: if wants_host {
             if !(1..=360).contains(&args.samples) || !(1..=300).contains(&args.interval) {
                 return Err(Error::Atlas(
