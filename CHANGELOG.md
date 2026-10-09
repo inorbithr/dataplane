@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.0-alpha.10](https://github.com/inorbithr/dataplane/compare/v0.1.0-alpha.9...v0.1.0-alpha.10) (2026-10-09)
+
+
+### Features
+
+* **agent:** the heartbeat carries a coarse host summary under [share] host (RFC 0102) ([#40](https://github.com/inorbithr/dataplane/issues/40)) ([0d00eeb](https://github.com/inorbithr/dataplane/commit/0d00eebb5cb7cad685cca0df44829f3d5af3a5ca))
+* **capture:** installable with iohr ext install inorbit/capture; several interfaces per companion ([#42](https://github.com/inorbithr/dataplane/issues/42)) ([96935b7](https://github.com/inorbithr/dataplane/commit/96935b70fcf6e73f26680132228b68276a05e74a))
+
 ## [0.1.0-alpha.9](https://github.com/inorbithr/dataplane/compare/v0.1.0-alpha.8...v0.1.0-alpha.9) (2026-10-09)
 
 
