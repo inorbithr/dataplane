@@ -236,6 +236,13 @@ async fn once(agent: &Arc<Agent>, shutdown: &mut watch::Receiver<bool>) -> Resul
             .share()
             .hostname
             .then(crate::host::sysfs::host_name),
+        inventory: agent.policy.share().inventory.unwrap_or(true).then(|| {
+            let lock = crate::inventory::lock_path(agent.config.extensions_lock.as_deref());
+            let extensions = lock
+                .as_deref()
+                .map_or((Vec::new(), 0), crate::inventory::read_lock);
+            Box::new(crate::inventory::build(&agent.policy, extensions))
+        }),
     };
     send(agent, &mut sink, &hello, "contract.hello", None).await?;
 

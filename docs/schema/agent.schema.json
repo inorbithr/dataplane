@@ -1189,6 +1189,13 @@
       "description": "The environment this agent serves; must equal the policy's.",
       "type": "string"
     },
+    "extensions_lock": {
+      "description": "The extension lock (`iohr-ext.lock`) whose entries the hello's inventory reports\n(RFC 0088.1). Default: `IOHR_DATA_DIR`, else iohr's data directory when this agent\nruns as an iohr extension; a missing file reports no extensions.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "key": {
       "default": "agent.key",
       "description": "The private key file (mode 0600).",

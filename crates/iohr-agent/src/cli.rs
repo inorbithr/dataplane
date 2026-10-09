@@ -557,16 +557,14 @@ async fn share_cmd(args: &ShareArgs, config_path: &Path) -> Result<ExitCode> {
         out(&format!("Policy: {}", cfg.policy.display()));
         return Ok(ExitCode::SUCCESS);
     };
-    let want = SharePolicy {
-        targets: match t.as_str() {
-            "full" => TargetShare::Full,
-            "label" => TargetShare::Label,
-            _ => TargetShare::Hash,
-        },
-        hostname: args.hostname.as_deref().map_or(now.hostname, |h| h == "on"),
-        // Set in the policy file; `share` keeps it.
-        host: now.host,
+    // The host summary and the inventory are set in the policy file; `share` keeps them.
+    let mut want = now.clone();
+    want.targets = match t.as_str() {
+        "full" => TargetShare::Full,
+        "label" => TargetShare::Label,
+        _ => TargetShare::Hash,
     };
+    want.hostname = args.hostname.as_deref().map_or(now.hostname, |h| h == "on");
     let changed = crate::share::write_policy(&cfg.policy, &want).map_err(|e| match e {
         Error::Io { .. } => Error::Config(format!(
             "{e}; the policy is not writable by this user: run it with sudo, or as the user that owns {}",
@@ -1603,6 +1601,7 @@ fn ask_share(p: &Prompter, a: &InitArgs) -> Result<crate::policy::SharePolicy> {
         targets,
         hostname,
         host: false,
+        inventory: None,
     })
 }
 
