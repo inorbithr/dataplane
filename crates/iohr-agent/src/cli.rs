@@ -1550,17 +1550,16 @@ fn kernel_host_name() -> Option<String> {
 /// The one question about what leaves, asked once at setup with the defaults shown.
 fn ask_share(p: &Prompter, a: &InitArgs) -> Result<crate::policy::SharePolicy> {
     use crate::policy::{SharePolicy, TargetShare};
-    let targets = match &a.share_targets {
-        Some(t) => t.clone(),
-        None => {
-            if p.interactive {
-                out("What InOrbit sees about your checks:");
-                out("  full   each check's URL, or host and port");
-                out("  hash   a label and a keyed hash; the target stays here (default)");
-                out("  label  the label only");
-            }
-            p.ask("What InOrbit sees (full, hash, label)", Some("hash"))?
+    let targets = if let Some(t) = &a.share_targets {
+        t.clone()
+    } else {
+        if p.interactive {
+            out("What InOrbit sees about your checks:");
+            out("  full   each check's URL, or host and port");
+            out("  hash   a label and a keyed hash; the target stays here (default)");
+            out("  label  the label only");
         }
+        p.ask("What InOrbit sees (full, hash, label)", Some("hash"))?
     };
     let targets = match targets.trim() {
         "full" => TargetShare::Full,

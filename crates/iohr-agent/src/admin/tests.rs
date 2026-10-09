@@ -641,8 +641,9 @@ async fn bounded_requests_and_rate() {
     assert_eq!(status(&send(addr, &get("/", &host, &big)).await), 400);
     // A burst past the bucket is slowed down (judged without I/O, so a slow test machine
     // refilling the bucket cannot hide it), and one client's burst leaves others alone.
+    let (_keep, ctx) = watch::channel(context(d.path(), false));
     let srv = Server {
-        ctx: context(d.path(), false),
+        ctx,
         local: Some(addr),
         tls: false,
         sessions: Mutex::new(Vec::new()),

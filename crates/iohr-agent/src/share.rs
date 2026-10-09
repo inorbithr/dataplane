@@ -294,10 +294,11 @@ pub fn edit_policy_text(text: &str, share: &SharePolicy) -> Result<String> {
             if !seen.1 {
                 add.push(format!("{}\n", value_line("hostname", share)));
             }
-            if at > 0 && !body.get(at - 1).is_some_and(|l| l.ends_with('\n')) {
-                if let Some(l) = body.get_mut(at - 1) {
-                    l.push('\n');
-                }
+            if at > 0
+                && !body.get(at - 1).is_some_and(|l| l.ends_with('\n'))
+                && let Some(l) = body.get_mut(at - 1)
+            {
+                l.push('\n');
             }
             for (n, a) in add.into_iter().enumerate() {
                 body.insert(at + n, a);
