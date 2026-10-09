@@ -84,6 +84,19 @@ what was measured as evidence, not as memory.
   (Prometheus, VictoriaMetrics, Thanos, Mimir) at each instant. Per series:
   `metric/<name>{kept labels}@<instant>` with `measured_ms` (or `measured`), `measured_at`
   and `query`, all derived from `query/<name>@<instant>`'s `answer_digest`.
+  - **Ranges:** `--at START..END[/STEP]` names every instant from `START` to `END`, both
+    included: hourly by default, or a step like `15m` or `2h`. All instants are written in
+    UTC, and a run takes at most 169 (a week, hourly).
+  - **Bucket bounds:** when a query reads a histogram, `metric/<name>@<instant>` also gets
+    `histogram`, `bucket_bounds` (the `le` values ascending, `+Inf` last, comma-separated)
+    and `bucket_count`, from `query/<name>.buckets@<instant>`'s `answer_digest`. A quantile
+    read from a histogram can't be finer than its buckets, and these say how coarse they
+    are.
+    - **Which histogram:** the one `<histogram>_bucket` series the query names. When it
+      names several, set `histogram` in the file.
+    - **The query:** the agent runs `count by (le) (<histogram>_bucket)`, and the
+      histogram must be a plain metric name. That is the only query text the agent writes
+      itself.
 
 ```toml
 endpoint = "http://victoria-metrics.observability:8428"
@@ -93,12 +106,14 @@ name = "envoy.upstream.p95.1h"
 query = "histogram_quantile(0.95, sum by (envoy_cluster_name, le) (rate(envoy_cluster_upstream_rq_time_bucket[1h])))"
 unit = "ms"                       # ms, s (converted to ms) or count
 keep_labels = ["envoy_cluster_name"]
+# histogram = "envoy_cluster_upstream_rq_time"   # only when the query reads several
 ```
 
 Why this is scoped, since read-only is not automatically safe:
 
-- **Only the file's queries run.** Nothing the platform sends can make the agent run a
-  query of its choosing, so a metrics API cannot be used to enumerate what you measure.
+- **Only the file's queries run, plus one bucket list per histogram the file reads.**
+  Nothing the platform sends can make the agent run a query of its choosing, so a metrics
+  API cannot be used to enumerate what you measure.
 - **The endpoint passes the policy** like every target (host, port, networks).
 - **Only numbers and the labels you keep are recorded.** Every other label (pods, paths,
   users, tenants) is dropped before anything is written; the answer is kept by digest.
