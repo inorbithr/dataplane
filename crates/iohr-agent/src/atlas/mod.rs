@@ -86,7 +86,8 @@ pub struct Summary {
 /// any read or record failure.
 #[allow(clippy::too_many_lines)] // repository, host, cluster, in order
 pub async fn observe(req: &ObserveRequest, policy: Option<&Policy>) -> Result<(Sink, Summary)> {
-    if req.repo.is_none() && req.kubeconfig.is_none() && req.host.is_none() && req.decided.is_none() {
+    if req.repo.is_none() && req.kubeconfig.is_none() && req.host.is_none() && req.decided.is_none()
+    {
         return Err(Error::Atlas(
             "nothing to observe: pass host, --repo, --decided and/or --kubeconfig".into(),
         ));

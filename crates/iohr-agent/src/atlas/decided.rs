@@ -388,7 +388,13 @@ pub fn observe_document(
     };
     found.documents += 1;
     let doc = format!("document/{key}");
-    ctx.observe(sink, &doc, "doc.kind", Value::Text(kind.clone()), &[artifact])?;
+    ctx.observe(
+        sink,
+        &doc,
+        "doc.kind",
+        Value::Text(kind.clone()),
+        &[artifact],
+    )?;
     ctx.observe(
         sink,
         &doc,
@@ -406,7 +412,13 @@ pub fn observe_document(
         }
     }
     if let Some(p) = field("public") {
-        ctx.observe(sink, &doc, "doc.public", Value::Bool(p == "true"), &[artifact])?;
+        ctx.observe(
+            sink,
+            &doc,
+            "doc.public",
+            Value::Bool(p == "true"),
+            &[artifact],
+        )?;
     }
     if let Some(parent) = field("parent")
         .filter(|v| !v.is_empty())
@@ -446,7 +458,9 @@ pub fn observe_document(
             let value = match value_of(&fact, sink) {
                 Ok(v) => v,
                 Err(why) => {
-                    found.refused.push(format!("{}:{}: {why}", rel.display(), block.first));
+                    found
+                        .refused
+                        .push(format!("{}:{}: {why}", rel.display(), block.first));
                     continue;
                 }
             };
@@ -455,8 +469,20 @@ pub fn observe_document(
             let subject = sink.entity(&fact.subject);
             let document = sink.entity(&doc);
             ctx.observe(sink, &fact.subject, &pred, value.clone(), &[artifact])?;
-            ctx.observe(sink, &decision, "decision.document", Value::Entity(document), &[artifact])?;
-            ctx.observe(sink, &decision, "decision.subject", Value::Entity(subject), &[artifact])?;
+            ctx.observe(
+                sink,
+                &decision,
+                "decision.document",
+                Value::Entity(document),
+                &[artifact],
+            )?;
+            ctx.observe(
+                sink,
+                &decision,
+                "decision.subject",
+                Value::Entity(subject),
+                &[artifact],
+            )?;
             ctx.observe(
                 sink,
                 &decision,
@@ -473,7 +499,13 @@ pub fn observe_document(
                 &[artifact],
             )?;
             let target = sink.entity(&decision);
-            ctx.observe(sink, &doc, "doc.decides", Value::Entity(target), &[artifact])?;
+            ctx.observe(
+                sink,
+                &doc,
+                "doc.decides",
+                Value::Entity(target),
+                &[artifact],
+            )?;
             found.decided += 1;
         }
     }
@@ -605,9 +637,20 @@ mod tests {
     fn read(rel: &str, kind: &str, doc: &str) -> (Vec<(String, String, String)>, Found) {
         let mut sink = Sink::default();
         let c = ctx(&mut sink);
-        let a = c.artifact(&mut sink, &format!("core@x:{rel}"), doc.as_bytes()).unwrap();
+        let a = c
+            .artifact(&mut sink, &format!("core@x:{rel}"), doc.as_bytes())
+            .unwrap();
         let mut found = Found::default();
-        observe_document(&c, &mut sink, Path::new(rel), kind, doc.as_bytes(), a, &mut found).unwrap();
+        observe_document(
+            &c,
+            &mut sink,
+            Path::new(rel),
+            kind,
+            doc.as_bytes(),
+            a,
+            &mut found,
+        )
+        .unwrap();
         (observations(&sink), found)
     }
 
@@ -622,15 +665,64 @@ mod tests {
     fn a_document_yields_its_front_matter_typed_facts_and_constraint_sentences() {
         let (obs, found) = read("docs/adrs/0067-p.md", "adr", ADR);
         assert!(has(&obs, "document/adr/0067", "doc.status", "proposed"));
-        assert!(has(&obs, "document/adr/0067", "doc.source", "docs/adrs/0067-p.md"));
-        assert!(has(&obs, "deployment/tbd/paging", "decided.egress_only", "api.push.apple.com:443"));
-        assert!(has(&obs, "decision/adr/0067#1", "decision.document", "document/adr/0067"));
-        assert!(has(&obs, "decision/adr/0067#1", "decision.subject", "deployment/tbd/paging"));
-        assert!(has(&obs, "decision/adr/0067#1", "decision.predicate", "egress_only"));
-        assert!(has(&obs, "decision/adr/0067#1", "decision.lines", "16-21"), "{obs:?}");
-        assert!(has(&obs, "document/adr/0067", "doc.decides", "decision/adr/0067#1"));
-        assert!(has(&obs, "statement/adr/0067@13-14", "statement.text", "The paging service must reach only Apple's push service."), "{obs:?}");
-        assert_eq!(found, Found { documents: 1, decided: 1, constraints: 1, refused: vec![] });
+        assert!(has(
+            &obs,
+            "document/adr/0067",
+            "doc.source",
+            "docs/adrs/0067-p.md"
+        ));
+        assert!(has(
+            &obs,
+            "deployment/tbd/paging",
+            "decided.egress_only",
+            "api.push.apple.com:443"
+        ));
+        assert!(has(
+            &obs,
+            "decision/adr/0067#1",
+            "decision.document",
+            "document/adr/0067"
+        ));
+        assert!(has(
+            &obs,
+            "decision/adr/0067#1",
+            "decision.subject",
+            "deployment/tbd/paging"
+        ));
+        assert!(has(
+            &obs,
+            "decision/adr/0067#1",
+            "decision.predicate",
+            "egress_only"
+        ));
+        assert!(
+            has(&obs, "decision/adr/0067#1", "decision.lines", "16-21"),
+            "{obs:?}"
+        );
+        assert!(has(
+            &obs,
+            "document/adr/0067",
+            "doc.decides",
+            "decision/adr/0067#1"
+        ));
+        assert!(
+            has(
+                &obs,
+                "statement/adr/0067@13-14",
+                "statement.text",
+                "The paging service must reach only Apple's push service."
+            ),
+            "{obs:?}"
+        );
+        assert_eq!(
+            found,
+            Found {
+                documents: 1,
+                decided: 1,
+                constraints: 1,
+                refused: vec![]
+            }
+        );
     }
 
     #[test]
@@ -640,8 +732,19 @@ mod tests {
         let all = format!("{obs:?}");
         assert!(!all.contains("secret") && !all.contains("hidden"), "{all}");
         assert_eq!(found.decided, 1);
-        assert!(has(&obs, "decision/adr/0001#1", "decision.lines", "19-24"), "{obs:?}");
-        assert!(has(&obs, "statement/adr/0001@7-8", "statement.text", "We must use for it."), "{obs:?}");
+        assert!(
+            has(&obs, "decision/adr/0001#1", "decision.lines", "19-24"),
+            "{obs:?}"
+        );
+        assert!(
+            has(
+                &obs,
+                "statement/adr/0001@7-8",
+                "statement.text",
+                "We must use for it."
+            ),
+            "{obs:?}"
+        );
     }
 
     #[test]
@@ -654,9 +757,18 @@ mod tests {
 
     #[test]
     fn keys_and_kinds_come_from_the_path() {
-        assert_eq!(doc_key("rfc", Path::new("docs/rfcs/0074.1-paging.md")).as_deref(), Some("rfc/0074.1"));
-        assert_eq!(doc_key("adr", Path::new("docs/adrs/0024-atlas-store.md")).as_deref(), Some("adr/0024"));
-        assert_eq!(doc_key("adr", Path::new("adr-9001-paging.md")).as_deref(), Some("adr/9001"));
+        assert_eq!(
+            doc_key("rfc", Path::new("docs/rfcs/0074.1-paging.md")).as_deref(),
+            Some("rfc/0074.1")
+        );
+        assert_eq!(
+            doc_key("adr", Path::new("docs/adrs/0024-atlas-store.md")).as_deref(),
+            Some("adr/0024")
+        );
+        assert_eq!(
+            doc_key("adr", Path::new("adr-9001-paging.md")).as_deref(),
+            Some("adr/9001")
+        );
         assert_eq!(kind_in_name(Path::new("adr-9001-paging.md")), Some("adr"));
         assert_eq!(kind_for(Path::new("docs/adrs/0024-x.md")), Some("adr"));
         assert_eq!(kind_for(Path::new("docs/adrs/README.md")), None);
@@ -666,13 +778,26 @@ mod tests {
     #[test]
     fn a_directory_of_documents_is_read_whatever_its_layout() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("adr-9001-paging.md"), ADR.replace("kind: adr\n", "")).unwrap();
-        std::fs::write(dir.path().join("README.md"), "# not a document; must be skipped\n").unwrap();
+        std::fs::write(
+            dir.path().join("adr-9001-paging.md"),
+            ADR.replace("kind: adr\n", ""),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("README.md"),
+            "# not a document; must be skipped\n",
+        )
+        .unwrap();
         let mut sink = Sink::default();
         let found = observe_dir(dir.path(), &mut sink, &ObservedNow::now()).unwrap();
         assert_eq!((found.documents, found.decided), (1, 1));
         let obs = observations(&sink);
         assert!(has(&obs, "document/adr/9001", "doc.kind", "adr"));
-        assert!(has(&obs, "deployment/tbd/paging", "decided.egress_only", "api.push.apple.com:443"));
+        assert!(has(
+            &obs,
+            "deployment/tbd/paging",
+            "decided.egress_only",
+            "api.push.apple.com:443"
+        ));
     }
 }

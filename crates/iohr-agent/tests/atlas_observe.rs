@@ -409,7 +409,11 @@ async fn a_checkout_and_a_cluster_give_one_linked_record_set() {
     assert_eq!(found.decided.documents, 1, "the README is not a document");
     assert_eq!(found.decided.decided, 1);
     assert_eq!(found.decided.constraints, 1);
-    assert!(found.decided.refused.is_empty(), "{:?}", found.decided.refused);
+    assert!(
+        found.decided.refused.is_empty(),
+        "{:?}",
+        found.decided.refused
+    );
     assert_eq!(summary.components, Some((1, 1)));
     let f = facts(records);
     assert!(has(
