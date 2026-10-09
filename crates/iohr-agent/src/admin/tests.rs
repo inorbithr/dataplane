@@ -119,6 +119,7 @@ async fn sign_in(addr: SocketAddr, token: &str) -> String {
 /// origin with the form's token; the platform has no way in. A good change rewrites
 /// `[share]` and reloads the agent.
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // every refusal, then the change
 async fn what_inorbit_sees_changes_only_from_this_machine_signed_in() {
     let d = tempfile::tempdir().unwrap();
     std::fs::write(d.path().join("policy.toml"), POLICY).unwrap();
