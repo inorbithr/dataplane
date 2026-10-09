@@ -198,13 +198,10 @@ pub async fn observe(req: &ObserveRequest, policy: Option<&Policy>) -> Result<(S
         })?;
         if m.at.is_empty() {
             return Err(Error::Atlas(
-                "--metrics needs at least one --at instant (RFC 3339)".into(),
+                "--metrics needs at least one --at instant or range (RFC 3339)".into(),
             ));
         }
-        for at in &m.at {
-            chrono::DateTime::parse_from_rfc3339(at)
-                .map_err(|e| Error::Atlas(format!("--at {at}: {e}")))?;
-        }
+        let at_all = metrics::instants(&m.at)?;
         let file = metrics::MetricsFile::load(&m.file)?;
         let (base, http) = metrics::client(&file, policy).await?;
         let ctx = Ctx::new(
@@ -217,9 +214,15 @@ pub async fn observe(req: &ObserveRequest, policy: Option<&Policy>) -> Result<(S
             &clock,
         )?;
         for q in &file.metrics {
-            for at in &m.at {
+            let histogram = q.histogram();
+            for at in &at_all {
                 let answer = metrics::fetch(&http, &base, &q.query, at).await?;
                 metrics::observe_answer(&ctx, &mut sink, q, at, &file.endpoint, &answer)?;
+                if let Some(h) = &histogram {
+                    let answer =
+                        metrics::fetch(&http, &base, &metrics::buckets_query(h), at).await?;
+                    metrics::observe_bounds(&ctx, &mut sink, q, h, at, &answer)?;
+                }
             }
         }
     }

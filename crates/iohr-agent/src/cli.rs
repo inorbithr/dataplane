@@ -241,7 +241,9 @@ pub struct AtlasObserveArgs {
     /// evaluate at each `--at` (aggregates only; see docs/atlas.md, Metrics).
     #[arg(long)]
     pub metrics: Option<PathBuf>,
-    /// An instant to evaluate the metric queries at, RFC 3339; repeat for more.
+    /// An instant to evaluate the metric queries at, RFC 3339, or a range
+    /// `START..END[/STEP]` (hourly by default, `15m` or `2h` steps, at most a week of
+    /// hours); repeat for more.
     #[arg(long = "at")]
     pub at: Vec<String>,
     /// Where to write the records (default: standard output).
