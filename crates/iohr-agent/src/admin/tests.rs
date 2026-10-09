@@ -702,7 +702,7 @@ fn never_lists_what_the_policy_turns_off() {
     );
     assert!(all.contains("[share] targets = \"hash\""), "{all}");
     let page = render_all(&ctx);
-    assert!(page.contains("What the platform is told"));
+    assert!(page.contains("What InOrbit sees"));
     assert!(page.contains("a keyed hash; the target stays on this agent"));
 }
 
