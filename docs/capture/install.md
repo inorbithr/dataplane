@@ -88,6 +88,58 @@ Drops are always counted, never queued: `drops.rate_limited` (over the token buc
 table, 16384 flows by default, was full). Memory is bounded by those sizes; `memory.rss_kib`
 reports what the process uses.
 
+## Several interfaces
+
+One companion attaches the same two programs to every interface it is given (at most
+16): `--interface` is repeatable, `IOHR_CAPTURE_INTERFACES` takes a list (commas or
+spaces; the older `IOHR_CAPTURE_INTERFACE` still works), and `--all`
+(`IOHR_CAPTURE_ALL_INTERFACES=true`) picks every interface that is up and physical, a
+bond or a VLAN. `iohr-capture interfaces` lists this host's interfaces with what `--all`
+would do and why:
+
+```
+- br-1a2b3c   virtual (br-*: containers, Kubernetes networking or a VPN); name it to include it
+- docker0     virtual (docker*: containers, Kubernetes networking or a VPN); name it to include it
++ enp70s0     a physical NIC, up
+- lo          loopback
+- veth9f1     virtual (veth*: containers, Kubernetes networking or a VPN); name it to include it
+
+--all picks: enp70s0
+```
+
+- **Skipped by `--all`, allowed by name:** loopback, a bond's members (the bond is
+  picked), bridges, veth pairs, and devices named like those of Docker, Podman, k3d,
+  Kubernetes CNIs (cni, flannel, cali, cilium, weave, kube-, nodelocaldns), libvirt, VXLAN
+  and Geneve overlays, tun/tap, WireGuard, Tailscale and ZeroTier.
+- **Counts:** the totals cover every attached interface; `counts` also carries each
+  interface's packets and bytes by slot (numbers only). The names of the slots are only
+  in `stats --tables`, for a person on the host; `iohr agent capture status` and the
+  agent's page show the slots as `#0`, `#1`, ... Nothing about interfaces leaves the
+  host: the platform still sees only the `capture:<layer>` strings (control DAT-10; the
+  privacy test plants interface names and checks they never reach a frame).
+- **Protocols, owners, TCP health and timing** are aggregated across the interfaces. A
+  flow crossing two attached interfaces (a bridge and its member, say) is seen twice: pick
+  interfaces that don't carry the same traffic.
+- **Whole packets** (`--packets`) need interfaces of one link type (all Ethernet-like, or
+  all L3 devices): a pcap file has one link type.
+- **Hot-plug:** an interface that goes away takes its programs with it; the others keep
+  counting, the log says so, and cleanup skips it. An interface that appears later, or
+  comes back, is attached at the next start (`systemctl restart iohr-capture`; with
+  `--all` the selection is made again then).
+
+### Kubernetes hosts: the host NIC or the pods' interfaces
+
+- **The host's NIC** (eth0, enp*, a bond) sees north-south traffic: what enters and leaves
+  the node, including pod traffic to and from outside the node, already SNAT'ed or
+  encapsulated by the CNI (VXLAN or Geneve shows as UDP 4789/6081 between nodes).
+- **cni0 / the pod bridge, or a pod's veth** sees east-west traffic between pods on the
+  node, with pod addresses, before NAT. Traffic between pods on different nodes crosses
+  both.
+- **Recommendation:** start with the host NIC only (what `--all` picks). Add `cni0` (or
+  your CNI's bridge) by name when you want pod-to-pod protocols and timing on that node.
+  Don't attach to every veth: they come and go with pods (each restart would need a
+  restart of capture), and the bridge already sees their traffic.
+
 ## Requirements
 
 | Requirement | Why | Check |
@@ -139,6 +191,27 @@ capture can run on this host
 
 ## Install
 
+### With iohr (any Linux with systemd)
+
+```sh
+iohr ext install inorbit/capture          # fetches, verifies signature, provenance and digest; shows the three capabilities and asks
+iohr ext service capture --interface eth0   # sets up the system service (runs the installed program with sudo);
+                                            # --interface is repeatable, or --all
+```
+
+`iohr ext install` offers the second step itself after installing (it runs it with `sudo`
+when you say yes, or with `--yes`); `iohr ext service capture` runs it again later, as
+`sudo <installed program> service install --agent-user <you> [--interface ...]`. `service install` sets up exactly what the packages
+set up, from the same unit, settings file and tmpfiles rule, with the program copied to
+`/usr/local/bin/iohr-capture`: the user `iohr-capture`, the group `iohr-capture-read`,
+`/etc/iohr-capture/capture.env` with the interfaces (`--interface`, repeatable; `--all`;
+default: the one the default route uses), the unit, then `systemctl enable --now`. `--agent-user` puts the agent's user in
+the read group (`iohr-agent` joins too when it exists). It refuses on a host where the
+package is installed. `sudo iohr-capture service remove` stops and removes it
+(`--purge` also removes the settings, the user and the group). Then turn it on in the
+agent ([below](#turn-it-on-in-the-agent)).
+
+
 ### Debian, Ubuntu, RHEL, Fedora (package and systemd)
 
 Download the `.deb` or `.rpm` from the [release](https://github.com/inorbithr/dataplane/releases),
@@ -146,7 +219,7 @@ Download the `.deb` or `.rpm` from the [release](https://github.com/inorbithr/da
 
 ```sh
 sudo apt install ./iohr-capture_<version>_amd64.deb   # or: sudo dnf install ./iohr-capture-<version>.x86_64.rpm
-sudo sed -i 's/^IOHR_CAPTURE_INTERFACE=.*/IOHR_CAPTURE_INTERFACE=eth0/' /etc/iohr-capture/capture.env
+sudo sed -i 's/^IOHR_CAPTURE_INTERFACES=.*/IOHR_CAPTURE_INTERFACES=eth0/' /etc/iohr-capture/capture.env   # a list: eth0,bond0; or IOHR_CAPTURE_ALL_INTERFACES=true
 sudo systemctl enable --now iohr-capture
 ```
 
@@ -303,9 +376,7 @@ spec:
 
 ### As an iohr extension
 
-Coming: `iohr ext install capture` will install the user commands (`iohr capture status`,
-`pcap`, `dissect`) and control the system service, and will show the three capabilities
-before it installs anything. Until then, use the package.
+`iohr ext install inorbit/capture`: see [With iohr](#with-iohr-any-linux-with-systemd).
 
 ## Whole packets and pcap files (layer 3)
 

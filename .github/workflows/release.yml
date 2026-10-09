@@ -88,6 +88,7 @@ jobs:
       image_digest: ${{ steps.push.outputs.image_digest }}
       chart_digest: ${{ steps.push.outputs.chart_digest }}
       ext_digest: ${{ steps.push.outputs.ext_digest }}
+      ext_capture_digest: ${{ steps.push.outputs.ext_capture_digest }}
       capture_digest: ${{ steps.push.outputs.capture_digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -157,12 +158,19 @@ jobs:
           oras cp --from-oci-layout "dist/oci/ext-agent:$VERSION" "$REGISTRY/iohr-ext/agent:$VERSION"
           [[ "$ext_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "bad extension digest: $ext_digest"; exit 1; }
           echo "ext_digest=$ext_digest" >> "$GITHUB_OUTPUT"
+          # The capture companion as an iohr extension too (`iohr ext install inorbit/capture`),
+          # Linux only, declaring the capabilities its system service holds.
+          ext_capture_digest="$(python3 tools/ext_artifact.py --version "$VERSION" --revision "$REVISION" --extension capture --out dist/oci/ext-capture)"
+          oras cp --from-oci-layout "dist/oci/ext-capture:$VERSION" "$REGISTRY/iohr-ext/capture:$VERSION"
+          [[ "$ext_capture_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "bad capture extension digest: $ext_capture_digest"; exit 1; }
+          echo "ext_capture_digest=$ext_capture_digest" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release
           path: |
             dist/release/
             dist/oci/ext-agent/
+            dist/oci/ext-capture/
           if-no-files-found: error
 
   sign:
@@ -180,6 +188,7 @@ jobs:
       IMAGE_DIGEST: ${{ needs.assemble.outputs.image_digest }}
       CHART_DIGEST: ${{ needs.assemble.outputs.chart_digest }}
       EXT_DIGEST: ${{ needs.assemble.outputs.ext_digest }}
+      EXT_CAPTURE_DIGEST: ${{ needs.assemble.outputs.ext_capture_digest }}
       CAPTURE_DIGEST: ${{ needs.assemble.outputs.capture_digest }}
       BUNDLE: application/vnd.dev.sigstore.bundle.v0.3+json
     steps:
@@ -227,6 +236,28 @@ jobs:
           cp "$BUNDLE_PATH" provenance.sigstore.json
           mise x -- oras attach --artifact-type "$BUNDLE" \
             "$REGISTRY/iohr-ext/agent@$EXT_DIGEST" "provenance.sigstore.json:$BUNDLE"
+      - name: Capture extension signature bundle (DSSE over the index digest, OCI referrer)
+        run: |
+          index="dist/oci/ext-capture/blobs/sha256/${EXT_CAPTURE_DIGEST#sha256:}"
+          [ "sha256:$(sha256sum "$index" | cut -d' ' -f1)" = "$EXT_CAPTURE_DIGEST" ]
+          printf '{}' > empty.json
+          mise x -- cosign attest-blob --yes --new-bundle-format \
+            --type https://sigstore.dev/cosign/sign/v1 --predicate empty.json \
+            --bundle signature-capture.sigstore.json "$index"
+          mise x -- oras attach --artifact-type "$BUNDLE" \
+            "$REGISTRY/iohr-ext/capture@$EXT_CAPTURE_DIGEST" "signature-capture.sigstore.json:$BUNDLE"
+      - id: prov-ext-capture
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/iohr-ext/capture
+          subject-digest: ${{ env.EXT_CAPTURE_DIGEST }}
+      - name: Capture extension provenance bundle (OCI referrer)
+        env:
+          BUNDLE_PATH: ${{ steps.prov-ext-capture.outputs.bundle-path }}
+        run: |
+          cp "$BUNDLE_PATH" provenance-capture.sigstore.json
+          mise x -- oras attach --artifact-type "$BUNDLE" \
+            "$REGISTRY/iohr-ext/capture@$EXT_CAPTURE_DIGEST" "provenance-capture.sigstore.json:$BUNDLE"
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ env.REGISTRY }}/iohr-agent
@@ -280,6 +311,8 @@ jobs:
         run: |
           cp signature.sigstore.json dist/release/iohr-ext-agent.signature.sigstore.json
           cp provenance.sigstore.json dist/release/iohr-ext-agent.provenance.sigstore.json
+          cp signature-capture.sigstore.json dist/release/iohr-ext-capture.signature.sigstore.json
+          cp provenance-capture.sigstore.json dist/release/iohr-ext-capture.provenance.sigstore.json
           # release-please makes the release when it tags; a tag pushed by hand has none yet.
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             pre=(); [[ "$TAG" == *-* ]] && pre=(--prerelease)

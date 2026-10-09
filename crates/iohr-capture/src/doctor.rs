@@ -33,8 +33,8 @@ pub(crate) struct Facts {
     pub(crate) status: Option<String>,
     /// `/proc/self/limits`.
     pub(crate) limits: Option<String>,
-    /// The interface asked for, and whether `/sys/class/net/<name>` exists.
-    pub(crate) interface: Option<(String, bool)>,
+    /// The interfaces asked for, and whether `/sys/class/net/<name>` exists for each.
+    pub(crate) interfaces: Vec<(String, bool)>,
     /// `/sys/kernel/security/lockdown`.
     pub(crate) lockdown: Option<String>,
     /// `/proc/sys/kernel/unprivileged_bpf_disabled`.
@@ -59,7 +59,7 @@ pub(crate) struct Facts {
 impl Facts {
     /// Reads the facts from this host. Never writes anything.
     pub(crate) fn gather(
-        interface: Option<&str>,
+        interfaces: &[String],
         socket_group: &str,
         pcap_dir: Option<&Path>,
     ) -> Self {
@@ -82,12 +82,12 @@ impl Facts {
             socket_group: socket_group.to_owned(),
             tshark,
             pcap,
-            ..Self::gather_from(Path::new("/"), interface)
+            ..Self::gather_from(Path::new("/"), interfaces)
         }
     }
 
     /// Reads the facts below `root` (a fixture tree in tests).
-    pub(crate) fn gather_from(root: &Path, interface: Option<&str>) -> Self {
+    pub(crate) fn gather_from(root: &Path, interfaces: &[String]) -> Self {
         let read = |p: &str| fs::read_to_string(root.join(p)).ok();
         let exists = |p: &str| root.join(p).exists();
         Self {
@@ -96,13 +96,16 @@ impl Facts {
             mounts: read("proc/self/mounts"),
             status: read("proc/self/status"),
             limits: read("proc/self/limits"),
-            interface: interface.map(|name| {
-                let valid = !name.is_empty() && !name.contains('/') && name != "." && name != "..";
-                (
-                    name.to_owned(),
-                    valid && exists(&format!("sys/class/net/{name}")),
-                )
-            }),
+            interfaces: interfaces
+                .iter()
+                .map(|name| {
+                    let valid = crate::ifaces::valid(name);
+                    (
+                        name.clone(),
+                        valid && exists(&format!("sys/class/net/{name}")),
+                    )
+                })
+                .collect(),
             lockdown: read("sys/kernel/security/lockdown"),
             unprivileged_bpf_disabled: read("proc/sys/kernel/unprivileged_bpf_disabled"),
             cgroup2: exists("sys/fs/cgroup/cgroup.controllers"),
@@ -167,7 +170,7 @@ pub(crate) fn evaluate(facts: &Facts) -> Vec<Check> {
         check_bpffs(facts.mounts.as_deref()),
         check_capabilities(facts.status.as_deref()),
         check_memlock(version, facts.limits.as_deref()),
-        check_interface(facts.interface.as_ref()),
+        check_interface(&facts.interfaces),
         check_lockdown(facts.lockdown.as_deref()),
         check_unprivileged_bpf(version, facts.unprivileged_bpf_disabled.as_deref()),
         check_cgroup2(facts.cgroup2),
@@ -358,12 +361,29 @@ fn check_memlock(version: Option<Version>, limits: Option<&str>) -> Check {
     }
 }
 
-fn check_interface(interface: Option<&(String, bool)>) -> Check {
-    match interface {
-        None => Check::new("interface", Status::Info, "none given (--interface)"),
-        Some((name, true)) => Check::new("interface", Status::Pass, format!("{name} exists")),
-        Some((name, false)) => Check::new("interface", Status::Fail, format!("{name} not found"))
-            .fix("pick one from `ip -br link`; in a container, run with --network host"),
+fn check_interface(interfaces: &[(String, bool)]) -> Check {
+    if interfaces.is_empty() {
+        return Check::new(
+            "interface",
+            Status::Info,
+            "none given (--interface, or --all)",
+        );
+    }
+    let missing: Vec<&str> = interfaces
+        .iter()
+        .filter(|(_, ok)| !ok)
+        .map(|(n, _)| n.as_str())
+        .collect();
+    let names: Vec<&str> = interfaces.iter().map(|(n, _)| n.as_str()).collect();
+    if missing.is_empty() {
+        Check::new(
+            "interface",
+            Status::Pass,
+            format!("{} exist", names.join(", ")),
+        )
+    } else {
+        Check::new("interface", Status::Fail, format!("{} not found", missing.join(", ")))
+            .fix("pick from `iohr-capture interfaces` or `ip -br link`; in a container, run with --network host")
     }
 }
 
@@ -565,7 +585,7 @@ mod tests {
             mounts: Some(MOUNTS.into()),
             status: Some(STATUS_ROOT.into()),
             limits: Some(LIMITS_UNLIMITED.into()),
-            interface: Some(("eth0".into(), true)),
+            interfaces: vec![("eth0".into(), true)],
             lockdown: Some("[none] integrity confidentiality\n".into()),
             unprivileged_bpf_disabled: Some("2\n".into()),
             cgroup2: true,
@@ -711,9 +731,11 @@ mod tests {
     #[test]
     fn interface() {
         let mut facts = host("6.8.0");
-        facts.interface = Some(("eth9".into(), false));
+        facts.interfaces = vec![("eth0".into(), true), ("eth9".into(), false)];
         assert_eq!(find(&evaluate(&facts), "interface").status, Status::Fail);
-        facts.interface = None;
+        facts.interfaces = vec![("eth0".into(), true), ("eth1".into(), true)];
+        assert_eq!(find(&evaluate(&facts), "interface").status, Status::Pass);
+        facts.interfaces = vec![];
         assert_eq!(find(&evaluate(&facts), "interface").status, Status::Info);
     }
 
@@ -774,11 +796,11 @@ mod tests {
         w("proc/self/mounts", MOUNTS);
         w("sys/class/net/veth0/ifindex", "4\n");
         w("sys/fs/cgroup/cgroup.controllers", "cpu memory\n");
-        let facts = Facts::gather_from(&dir, Some("veth0"));
+        let facts = Facts::gather_from(&dir, &["veth0".to_owned()]);
         let checks = evaluate(&facts);
         assert!(can_run(&checks), "{}", render(&checks));
-        let escape = Facts::gather_from(&dir, Some("../../../etc"));
-        assert_eq!(escape.interface, Some(("../../../etc".into(), false)));
+        let escape = Facts::gather_from(&dir, &["../../../etc".to_owned()]);
+        assert_eq!(escape.interfaces, vec![("../../../etc".into(), false)]);
         let _ = fs::remove_dir_all(&dir);
     }
 }

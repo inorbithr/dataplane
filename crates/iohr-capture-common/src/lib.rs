@@ -22,6 +22,14 @@ pub const PORTS_MAP: &str = "IOHR_PORTS";
 pub const STATS_MAP: &str = "IOHR_STATS";
 /// One [`Config`], written by user space before the programs are attached.
 pub const CONFIG_MAP: &str = "IOHR_CONFIG";
+/// Most interfaces one companion attaches to.
+pub const MAX_INTERFACES: u32 = 16;
+/// Hash of an interface index to its [`Interface`] (slot and link-layer length), written
+/// by user space before attaching; a packet on an interface not in it uses
+/// [`Config::l2_len`] and is counted only in the totals.
+pub const INTERFACES_MAP: &str = "IOHR_INTERFACES";
+/// Per-CPU [`Counters`] per interface slot and direction (`slot * DIRECTIONS + direction`).
+pub const INTERFACE_COUNTERS_MAP: &str = "IOHR_INTERFACE_COUNTERS";
 /// The ring buffer of [`RecordHeader`] + bytes.
 pub const EVENTS_MAP: &str = "IOHR_EVENTS";
 /// The second ring buffer (layer 3, only filled with [`CONFIG_PACKETS`]): one
@@ -207,6 +215,16 @@ impl PortCounters {
     }
 }
 
+/// One attached interface, as the programs look it up by `skb->ifindex`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Interface {
+    /// Its slot in [`INTERFACE_COUNTERS_MAP`], below [`MAX_INTERFACES`].
+    pub slot: u32,
+    /// Its link-layer header length: 14 on Ethernet-like devices, 0 on L3 devices.
+    pub l2_len: u32,
+}
+
 /// Settings user space writes before attaching.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -333,6 +351,9 @@ unsafe impl aya::Pod for PortCounters {}
 #[cfg(all(feature = "user", target_os = "linux"))]
 #[allow(unsafe_code)]
 unsafe impl aya::Pod for Config {}
+#[cfg(all(feature = "user", target_os = "linux"))]
+#[allow(unsafe_code)]
+unsafe impl aya::Pod for Interface {}
 
 #[cfg(test)]
 mod tests {
@@ -345,6 +366,7 @@ mod tests {
         assert_eq!(size_of::<PortKey>(), 4);
         assert_eq!(size_of::<PortCounters>(), 32);
         assert_eq!(size_of::<Config>(), 48);
+        assert_eq!(size_of::<Interface>(), 8);
         assert_eq!(size_of::<PacketHeader>(), PACKET_HEADER_BYTES);
         assert_eq!(
             size_of::<PacketRecord<256>>(),

@@ -5,10 +5,18 @@ layout: one image index per version, one manifest per platform, each with the co
 `application/vnd.inorbit.iohr.extension.layer.v1.tar+gzip` holding the binary.
 
     tools/ext_artifact.py --version 0.1.0 --out dist/oci/ext-agent
+    tools/ext_artifact.py --version 0.1.0 --extension capture --out dist/oci/ext-capture
 
-Binaries are read from dist/bin/<os>-<arch>/iohr-agent[.exe]. Output is deterministic:
+Binaries are read from dist/bin/<os>-<arch>/<program>[.exe]. Output is deterministic:
 the same binaries give the same digests. Push with
-`oras cp --from-oci-layout dist/oci/ext-agent:<version> <registry>/iohr-ext/agent:<version>`.
+`oras cp --from-oci-layout dist/oci/ext-<name>:<version> <registry>/iohr-ext/<name>:<version>`.
+
+What each extension declares (its config) is fixed here, per extension, never passed in:
+the agent's config is unchanged from before capture was added (same digests for the same
+binaries). Capture is Linux only, asks for no API scope, and declares the three
+capabilities its system service holds (RFC 0061; `iohr ext install` shows them in plain
+words and asks), plus `service`: after installing, `iohr` offers
+`sudo iohr-capture service install`.
 """
 import argparse
 import gzip
@@ -25,8 +33,27 @@ LAYER_TYPE = "application/vnd.inorbit.iohr.extension.layer.v1.tar+gzip"
 MANIFEST_TYPE = "application/vnd.oci.image.manifest.v1+json"
 INDEX_TYPE = "application/vnd.oci.image.index.v1+json"
 PLATFORMS = ["linux/amd64", "linux/arm64", "darwin/arm64", "darwin/amd64", "windows/amd64", "windows/arm64"]
-SCOPES = ["agents:write", "domains:read"]
 SOURCE = "https://github.com/inorbithr/dataplane"
+EXTENSIONS = {
+    "agent": {
+        "program": "iohr-agent",
+        "platforms": PLATFORMS,
+        "config": {
+            "scopes": ["agents:write", "domains:read"],
+            "description": "The InOrbit agent: dials out, obeys a local policy, runs checks in your network.",
+        },
+    },
+    "capture": {
+        "program": "iohr-capture",
+        "platforms": ["linux/amd64", "linux/arm64"],
+        "config": {
+            "scopes": [],
+            "description": "Traffic seen from inside your network: eBPF counters on one interface, counts only, nothing leaves the host.",
+            "privileges": ["CAP_BPF", "CAP_PERFMON", "CAP_NET_ADMIN"],
+            "service": True,
+        },
+    },
+}
 
 
 def blob(out: pathlib.Path, data: bytes, media_type: str, **extra) -> dict:
@@ -61,6 +88,7 @@ def layer(binary: pathlib.Path, name: str) -> bytes:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--version", required=True)
+    ap.add_argument("--extension", choices=sorted(EXTENSIONS), default="agent")
     ap.add_argument("--bin-dir", default="dist/bin")
     ap.add_argument("--out", default="dist/oci/ext-agent")
     ap.add_argument("--revision", default=os.environ.get("GITHUB_SHA", ""))
@@ -71,20 +99,15 @@ def main() -> int:
             p.unlink() if p.is_file() else p.rmdir()
     out.mkdir(parents=True, exist_ok=True)
 
+    ext = EXTENSIONS[args.extension]
     manifests = []
-    for platform in PLATFORMS:
+    for platform in ext["platforms"]:
         os_, arch = platform.split("/")
-        exe = "iohr-agent.exe" if os_ == "windows" else "iohr-agent"
+        exe = f"{ext['program']}.exe" if os_ == "windows" else ext["program"]
         binary = pathlib.Path(args.bin_dir) / f"{os_}-{arch}" / exe
         if not binary.exists():
             continue
-        config = {
-            "name": "agent",
-            "version": args.version,
-            "entrypoint": exe,
-            "scopes": SCOPES,
-            "description": "The InOrbit agent: dials out, obeys a local policy, runs checks in your network.",
-        }
+        config = {"name": args.extension, "version": args.version, "entrypoint": exe, **ext["config"]}
         cfg = blob(out, canonical(config), CONFIG_TYPE)
         lay = blob(out, layer(binary, exe), LAYER_TYPE,
                    annotations={"org.opencontainers.image.title": exe})

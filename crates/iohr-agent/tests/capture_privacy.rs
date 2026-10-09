@@ -52,7 +52,7 @@ use iohr_agent::keys::KeyAlg;
 const COUNT_CANARIES: [&str; 2] = ["7391846205", "4602917383"];
 
 /// Values a capture snapshot can hold. None may leave the companion's socket.
-const CANARIES: [&str; 11] = [
+const CANARIES: [&str; 13] = [
     "canary-sni.example",
     "canary-host.example",
     "canary-dns.example",
@@ -64,6 +64,8 @@ const CANARIES: [&str; 11] = [
     "/canary/route/{id}",
     "cgroup:/canary-owner.slice",
     "/var/lib/iohr-capture/pcap/canary.pcapng",
+    "canary-nic0",
+    "canary-bond9",
 ];
 
 fn poisoned_answer() -> Value {
@@ -76,6 +78,11 @@ fn poisoned_answer() -> Value {
         "layers": ["headers", "protocols", "owners", "tcp", "timing", "packets", "canary-dns.example"],
         "headers": {"ingress": {"packets": 7_391_846_205_u64, "bytes": 99}, "egress": {"packets": 7, "bytes": 8},
                     "note": "canary-sni.example"},
+        // Several interfaces: numbers per slot; a companion that adds names must not leak them.
+        "interfaces": [
+            {"slot": 0, "name": "canary-nic0", "ingress": {"packets": 7_391_846_205_u64, "bytes": 1}, "egress": {"packets": 2, "bytes": 3}},
+            {"slot": 1, "name": "canary-bond9", "ingress": {"packets": 4, "bytes": 5}, "egress": {"packets": 6, "bytes": 7}},
+        ],
         "drops": {"rate_limited": 0, "ring_buffer_full": 0, "flows_evicted": 0, "who": "10.99.88.77"},
         "protocols": {"http1_requests": 4_602_917_383_u64, "tls_client_hellos": 2, "dns_queries": 3,
                       "http2_connections": 1, "grpc_calls": 1, "top_path": "/canary/path"},
@@ -88,6 +95,7 @@ fn poisoned_answer() -> Value {
         "packets": {"enabled": true, "copied": 9, "rate_limited": 0, "ring_buffer_full": 0, "pcaps_written": 1,
                     "last_file": "/var/lib/iohr-capture/pcap/canary.pcapng"},
         "tables": {
+            "interfaces": [{"slot": 0, "name": "canary-nic0"}, {"slot": 1, "name": "canary-bond9"}],
             "tls": {"sni": rows("canary-sni.example")},
             "http1": {"hosts": rows("canary-host.example"), "paths": rows("GET /canary/path")},
             "dns": {"names": rows("canary-dns.example")},

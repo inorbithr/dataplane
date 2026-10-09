@@ -22,7 +22,7 @@ use std::{fs, io, path::PathBuf, time::Duration};
 
 use aya::{
     EbpfLoader,
-    maps::{Array, MapData, PerCpuArray, PerCpuHashMap, RingBuf},
+    maps::{Array, HashMap, MapData, PerCpuArray, PerCpuHashMap, RingBuf},
     programs::{
         LinkOrder, SchedClassifier, TcAttachType,
         tc::{self, NlOptions, TcAttachOptions},
@@ -30,9 +30,9 @@ use aya::{
 };
 use iohr_capture_common::{
     CLASS_SLOTS, CLASSES_MAP, CONFIG_HEADERS, CONFIG_MAP, CONFIG_PACKETS, CONFIG_PROTOCOLS,
-    CONFIG_TIMING, COUNTERS_MAP, Config, Counters, EGRESS, EGRESS_PROGRAM, EVENTS_MAP, FLAG_SLOTS,
-    FLAGS_MAP, INGRESS, INGRESS_PROGRAM, MAX_SNAPLEN, PACKETS_MAP, PORT_ENTRIES, PORTS_MAP,
-    PortCounters, PortKey, STATS_MAP,
+    CONFIG_TIMING, COUNTERS_MAP, Config, Counters, DIRECTIONS, EGRESS, EGRESS_PROGRAM, EVENTS_MAP,
+    FLAG_SLOTS, FLAGS_MAP, INGRESS, INGRESS_PROGRAM, INTERFACE_COUNTERS_MAP, INTERFACES_MAP,
+    Interface, MAX_SNAPLEN, PACKETS_MAP, PORT_ENTRIES, PORTS_MAP, PortCounters, PortKey, STATS_MAP,
 };
 use rustix::thread::CapabilitySet;
 use serde::Serialize;
@@ -75,10 +75,13 @@ pub(crate) enum Error {
     Runtime(#[from] io::Error),
 }
 
+const _: () = assert!(crate::ifaces::MAX == iohr_capture_common::MAX_INTERFACES as usize);
+
 /// What `run` is asked to do.
 #[derive(Debug, Clone)]
 pub(crate) struct Options {
-    pub(crate) interface: String,
+    /// One or more (at most `MAX_INTERFACES`); each gets the same two programs.
+    pub(crate) interfaces: Vec<String>,
     pub(crate) duration: Option<Duration>,
     pub(crate) mode: AttachMode,
     pub(crate) layers: Layers,
@@ -122,7 +125,7 @@ pub(crate) struct Direction {
 /// What `run` prints on exit. Counts only.
 #[derive(Debug, Serialize)]
 pub(crate) struct Report {
-    pub(crate) interface: String,
+    pub(crate) interfaces: Vec<String>,
     pub(crate) kernel: Version,
     /// `tcx` or `netlink`.
     pub(crate) attach: AttachMode,
@@ -134,6 +137,8 @@ pub(crate) struct Report {
     pub(crate) packet_unit: &'static str,
     pub(crate) ingress: Direction,
     pub(crate) egress: Direction,
+    /// The same totals per interface, in the order given.
+    pub(crate) per_interface: Vec<InterfaceTotals>,
     /// Capabilities left while counting, read back after the drop.
     pub(crate) capabilities_after_attach: Remaining,
     pub(crate) detached: bool,
@@ -141,8 +146,18 @@ pub(crate) struct Report {
     pub(crate) counts: serde_json::Value,
 }
 
+/// One interface's totals at exit.
+#[derive(Debug, Serialize)]
+pub(crate) struct InterfaceTotals {
+    pub(crate) name: String,
+    pub(crate) ingress: Direction,
+    pub(crate) egress: Direction,
+}
+
 struct Maps {
     counters: PerCpuArray<MapData, Counters>,
+    per_interface: PerCpuArray<MapData, Counters>,
+    interfaces: u32,
     classes: PerCpuArray<MapData, Counters>,
     flags: PerCpuArray<MapData, u64>,
     stats: PerCpuArray<MapData, u64>,
@@ -166,6 +181,23 @@ pub(crate) fn run(opts: &Options) -> Result<Report, Error> {
     if version < kernel::MEMCG_ACCOUNTING {
         raise_memlock();
     }
+    if opts.interfaces.is_empty() {
+        return Err(Error::Unsupported("no interface given".into()));
+    }
+    if opts.interfaces.len() > iohr_capture_common::MAX_INTERFACES as usize {
+        return Err(Error::Unsupported(format!(
+            "at most {} interfaces",
+            iohr_capture_common::MAX_INTERFACES
+        )));
+    }
+    let l2_lens: Vec<u32> = opts.interfaces.iter().map(|i| l2_len(i)).collect();
+    // A pcap file has one link type: whole packets need every interface to have the same
+    // link-layer header (all Ethernet-like, or all L3 devices).
+    if opts.packets.is_some() && l2_lens.iter().any(|l| *l != l2_lens[0]) {
+        return Err(Error::Unsupported(
+            "whole packets (--packets) need interfaces of one link type; these mix Ethernet-like and L3 devices".into(),
+        ));
+    }
     let events_size = ring_bytes(opts.ring_buffer_kib);
     // Packets off: the second ring is one page (its programs never reach it).
     let whole_size = opts
@@ -181,17 +213,32 @@ pub(crate) fn run(opts: &Options) -> Result<Report, Error> {
             .map_mut(CONFIG_MAP)
             .ok_or(Error::MissingMap(CONFIG_MAP))?
             .try_into()?;
-        config.set(0, kernel_config(opts, l2_len(&opts.interface)), 0)?;
+        config.set(0, kernel_config(opts, l2_lens[0]), 0)?;
+    }
+    {
+        let mut table: HashMap<&mut MapData, u32, Interface> = ebpf
+            .map_mut(INTERFACES_MAP)
+            .ok_or(Error::MissingMap(INTERFACES_MAP))?
+            .try_into()?;
+        for (slot, (name, l2)) in opts.interfaces.iter().zip(&l2_lens).enumerate() {
+            let index = ifindex(name).ok_or_else(|| {
+                Error::Unsupported(format!("{name}: no such interface (it went away?)"))
+            })?;
+            let slot = u32::try_from(slot).unwrap_or(u32::MAX);
+            table.insert(index, Interface { slot, l2_len: *l2 }, 0)?;
+        }
     }
     let mut stale = 0;
     if mode == AttachMode::Netlink {
-        // A clsact qdisc may already be there (ours from before, or someone else's).
-        if let Err(e) = tc::qdisc_add_clsact(&opts.interface) {
-            tracing::debug!(error = %e, "clsact qdisc not added (usually: already present)");
+        for interface in &opts.interfaces {
+            // A clsact qdisc may already be there (ours from before, or someone else's).
+            if let Err(e) = tc::qdisc_add_clsact(interface) {
+                tracing::debug!(interface, error = %e, "clsact qdisc not added (usually: already present)");
+            }
+            stale += cleanup(interface)?;
         }
-        stale = cleanup(&opts.interface)?;
     }
-    let mut links = Vec::with_capacity(2);
+    let mut links = Vec::with_capacity(2 * opts.interfaces.len());
     for (name, hook) in [
         (INGRESS_PROGRAM, TcAttachType::Ingress),
         (EGRESS_PROGRAM, TcAttachType::Egress),
@@ -202,21 +249,25 @@ pub(crate) fn run(opts: &Options) -> Result<Report, Error> {
             .try_into()
             .map_err(|e| Error::Program(name, e))?;
         program.load().map_err(|e| Error::Program(name, e))?;
-        let options = if mode == AttachMode::Tcx {
-            TcAttachOptions::TcxOrder(LinkOrder::default())
-        } else {
-            TcAttachOptions::Netlink(NlOptions::default())
-        };
-        let link = program
-            .attach_with_options(&opts.interface, hook, options)
-            .map_err(|e| Error::Program(name, e))?;
-        links.push((name, link));
+        for interface in &opts.interfaces {
+            let options = if mode == AttachMode::Tcx {
+                TcAttachOptions::TcxOrder(LinkOrder::default())
+            } else {
+                TcAttachOptions::Netlink(NlOptions::default())
+            };
+            let link = program
+                .attach_with_options(interface, hook, options)
+                .map_err(|e| Error::Program(name, e))?;
+            links.push((name, interface.clone(), link));
+        }
     }
     let take = |ebpf: &mut aya::Ebpf, name: &'static str| {
         ebpf.take_map(name).ok_or(Error::MissingMap(name))
     };
     let maps = Maps {
         counters: take(&mut ebpf, COUNTERS_MAP)?.try_into()?,
+        per_interface: take(&mut ebpf, INTERFACE_COUNTERS_MAP)?.try_into()?,
+        interfaces: u32::try_from(opts.interfaces.len()).unwrap_or(0),
         classes: take(&mut ebpf, CLASSES_MAP)?.try_into()?,
         flags: take(&mut ebpf, FLAGS_MAP)?.try_into()?,
         stats: take(&mut ebpf, STATS_MAP)?.try_into()?,
@@ -254,7 +305,8 @@ pub(crate) fn run(opts: &Options) -> Result<Report, Error> {
     let keep = keep_after_attach(mode, version);
     let started = std::time::Instant::now();
     let worker = crate::worker::Config {
-        interface: opts.interface.clone(),
+        interface: opts.interfaces.join(","),
+        interfaces: opts.interfaces.clone(),
         layers: opts.layers.names().join(","),
         max_flows: opts.max_flows,
         poll_ms: u64::try_from(opts.poll.as_millis()).unwrap_or(2000),
@@ -274,11 +326,7 @@ pub(crate) fn run(opts: &Options) -> Result<Report, Error> {
             dir_max_bytes: p.pcap_dir_max_bytes,
             retention_secs: p.pcap_retention_secs,
             snaplen: p.snaplen,
-            linktype: if l2_len(&opts.interface) == 14 {
-                1
-            } else {
-                101
-            },
+            linktype: if l2_lens[0] == 14 { 1 } else { 101 },
         }),
     };
     let (counts, remaining) = tokio::runtime::Builder::new_current_thread()
@@ -296,22 +344,39 @@ pub(crate) fn run(opts: &Options) -> Result<Report, Error> {
 
     let ingress = total(&maps.counters, INGRESS)?;
     let egress = total(&maps.counters, EGRESS)?;
+    let mut per_interface = Vec::with_capacity(opts.interfaces.len());
+    for (slot, name) in (0u32..).zip(&opts.interfaces) {
+        per_interface.push(InterfaceTotals {
+            name: name.clone(),
+            ingress: total(&maps.per_interface, slot * DIRECTIONS + INGRESS)?,
+            egress: total(&maps.per_interface, slot * DIRECTIONS + EGRESS)?,
+        });
+    }
 
     let mut detached = true;
-    for (name, link) in links {
+    for (name, interface, link) in links {
+        // An interface that went away took its link with it: nothing to detach there.
+        if ifindex(&interface).is_none() {
+            tracing::warn!(
+                interface,
+                program = name,
+                "interface gone; its link went with it"
+            );
+            continue;
+        }
         let program: Result<&mut SchedClassifier, _> = ebpf
             .program_mut(name)
             .ok_or(Error::MissingProgram(name))?
             .try_into();
         if let Err(e) = program.and_then(|p| p.detach(link)) {
-            tracing::warn!(program = name, error = %e, "detach failed; run `iohr-capture cleanup`");
+            tracing::warn!(interface, program = name, error = %e, "detach failed; run `iohr-capture cleanup`");
             detached = false;
         }
     }
     drop(ebpf);
 
     Ok(Report {
-        interface: opts.interface.clone(),
+        interfaces: opts.interfaces.clone(),
         kernel: version,
         attach: mode,
         seconds,
@@ -319,6 +384,7 @@ pub(crate) fn run(opts: &Options) -> Result<Report, Error> {
         packet_unit: "skb",
         ingress,
         egress,
+        per_interface,
         capabilities_after_attach: remaining,
         detached,
         counts,
@@ -369,6 +435,15 @@ fn kernel_config(opts: &Options, l2_len: u32) -> Config {
         pkt_interval_ns,
         pkt_burst_ns: pkt_interval_ns.saturating_mul(pkt_burst),
     }
+}
+
+/// The interface's index, `None` when it does not exist (or went away).
+fn ifindex(interface: &str) -> Option<u32> {
+    let valid = crate::ifaces::valid(interface);
+    valid
+        .then(|| fs::read_to_string(format!("/sys/class/net/{interface}/ifindex")).ok())
+        .flatten()
+        .and_then(|s| s.trim().parse().ok())
 }
 
 /// 14 on interfaces with 6-byte link-layer addresses (Ethernet, Wi-Fi, veth, loopback
@@ -516,7 +591,7 @@ async fn relay(
     let mut poll = tokio::time::interval(opts.poll);
     let mut last_warn: Option<std::time::Instant> = None;
     tracing::info!(
-        interface = %opts.interface, attach = ?mode, kept = ?remaining.kept,
+        interfaces = ?opts.interfaces, attach = ?mode, kept = ?remaining.kept,
         parser_pid = ?child.id(), layers = ?opts.layers.names(),
         aggregates = %opts.aggregates.display(),
         "attached; capabilities dropped; the parser process has none; counting"
@@ -529,6 +604,9 @@ async fn relay(
     };
     tokio::pin!(timer);
     let mut batch: Vec<u8> = Vec::with_capacity(1024 * 1024);
+    // Hot-plug: an interface that goes away takes its links with it (counting goes on on
+    // the others); one that comes back has a new index and is attached at the next start.
+    let mut present: Vec<bool> = vec![true; opts.interfaces.len()];
     let outcome: Result<(), Error> = loop {
         tokio::select! {
             () = &mut timer => break Ok(()),
@@ -560,6 +638,17 @@ async fn relay(
                 }
             }
             _ = poll.tick() => {
+                for (seen, name) in present.iter_mut().zip(&opts.interfaces) {
+                    let now = ifindex(name).is_some();
+                    if now != *seen {
+                        if now {
+                            tracing::warn!(interface = %name, "interface is back; it is attached again at the next start (systemctl restart iohr-capture)");
+                        } else {
+                            tracing::warn!(interface = %name, "interface went away; the others are still counted");
+                        }
+                        *seen = now;
+                    }
+                }
                 match read_kernel(maps) {
                     Ok(r) => {
                         batch.clear();
@@ -622,6 +711,12 @@ fn read_kernel(m: &Maps) -> Result<KernelReading, Error> {
         for (i, slot) in r.flags[di].iter_mut().enumerate() {
             *slot = sum_u64(&m.flags, d * FLAG_SLOTS + u32::try_from(i).unwrap_or(0))?;
         }
+    }
+    for slot in 0..m.interfaces {
+        let i = total(&m.per_interface, slot * DIRECTIONS + INGRESS)?;
+        let e = total(&m.per_interface, slot * DIRECTIONS + EGRESS)?;
+        r.interfaces
+            .push([(i.packets, i.bytes), (e.packets, e.bytes)]);
     }
     for (i, slot) in r.stats.iter_mut().enumerate() {
         *slot = sum_u64(&m.stats, u32::try_from(i).unwrap_or(0))?;
@@ -755,7 +850,7 @@ mod tests {
     #[test]
     fn token_bucket_settings() {
         let opts = Options {
-            interface: "lo".into(),
+            interfaces: vec!["lo".into()],
             duration: None,
             mode: AttachMode::Auto,
             layers: Layers::parse("headers,protocols,owners,tcp").unwrap(),

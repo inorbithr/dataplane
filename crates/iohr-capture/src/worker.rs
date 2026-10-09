@@ -74,7 +74,11 @@ pub(crate) async fn read_frame<R: AsyncRead + Unpin>(
 /// What the worker is told (one JSON argument).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Config {
+    /// The interfaces joined with commas, for people.
     pub(crate) interface: String,
+    /// The interfaces in slot order.
+    #[serde(default)]
+    pub(crate) interfaces: Vec<String>,
     pub(crate) layers: String,
     pub(crate) max_flows: usize,
     pub(crate) poll_ms: u64,
@@ -131,6 +135,7 @@ pub(crate) fn run(config: &str) -> Result<serde_json::Value, String> {
     let engine = Arc::new(Mutex::new(Engine::new(
         Settings {
             interface: cfg.interface.clone(),
+            interfaces: cfg.interfaces.clone(),
             layers,
             max_flows: cfg.max_flows,
             idle: Duration::from_secs(60),

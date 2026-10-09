@@ -105,7 +105,10 @@ impl Layers {
 /// Settings of the user-space side.
 #[derive(Debug, Clone)]
 pub(crate) struct Settings {
+    /// The interfaces joined with commas, for people.
     pub(crate) interface: String,
+    /// The interfaces in slot order (the kernel's per-interface counters follow it).
+    pub(crate) interfaces: Vec<String>,
     pub(crate) layers: Layers,
     pub(crate) max_flows: usize,
     pub(crate) idle: Duration,
@@ -141,6 +144,9 @@ pub(crate) struct KernelReading {
     /// copied, bytes copied, rate limited, ring buffer full.
     pub(crate) stats: [u64; STATS_USED],
     pub(crate) ports: Vec<PortRow>,
+    /// `[slot][direction] -> (packets, bytes)`, one per attached interface.
+    #[serde(default)]
+    pub(crate) interfaces: Vec<[(u64, u64); 2]>,
 }
 
 #[derive(Debug)]
@@ -857,6 +863,19 @@ impl Engine {
     pub(crate) fn counts(&self) -> Value {
         let k = &self.kernel;
         let dir = |d: usize| json!({"packets": k.totals[d].0, "bytes": k.totals[d].1});
+        // Numbers per interface slot; the names are only in the tables (for a person).
+        let per_interface: Vec<Value> = k
+            .interfaces
+            .iter()
+            .enumerate()
+            .map(|(slot, v)| {
+                json!({
+                    "slot": slot,
+                    "ingress": {"packets": v[0].0, "bytes": v[0].1},
+                    "egress": {"packets": v[1].0, "bytes": v[1].1},
+                })
+            })
+            .collect();
         let mut classes = serde_json::Map::new();
         for (i, name) in CLASS_NAMES.iter().enumerate() {
             classes.insert(
@@ -917,6 +936,7 @@ impl Engine {
             "version": WIRE_VERSION,
             "companion_version": env!("CARGO_PKG_VERSION"),
             "interface": self.settings.interface,
+            "interfaces": per_interface,
             "started_unix_ms": self.started_ms,
             "updated_unix_ms": self.updated_ms,
             "uptime_secs": self.started.elapsed().as_secs(),
@@ -1085,6 +1105,9 @@ impl Engine {
             })
             .collect();
         v["tables"] = json!({
+            "interfaces": self.settings.interfaces.iter().enumerate()
+                .map(|(slot, name)| json!({"slot": slot, "name": name}))
+                .collect::<Vec<_>>(),
             "http1": {
                 "methods": p.http1_methods, "versions": p.http1_versions,
                 "status_classes": p.http1_status,
@@ -1355,6 +1378,7 @@ mod tests {
         Engine::new(
             Settings {
                 interface: "veth0".into(),
+                interfaces: vec!["veth0".into()],
                 layers: Layers::parse("headers,protocols,owners,tcp").unwrap(),
                 max_flows: 64,
                 idle: Duration::from_secs(60),
@@ -1579,6 +1603,7 @@ mod tests {
         Engine::new(
             Settings {
                 interface: "veth0".into(),
+                interfaces: vec!["veth0".into()],
                 layers: Layers::parse("headers,protocols,owners,tcp,timing").unwrap(),
                 max_flows,
                 idle: Duration::from_secs(60),

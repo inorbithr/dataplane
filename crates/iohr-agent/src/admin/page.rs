@@ -1471,6 +1471,22 @@ fn traffic(h: &mut String, t: &crate::capture::TrafficInfo) {
                 c.headers.egress.packets, c.headers.egress.bytes
             ),
         ));
+        if c.interfaces.len() > 1 {
+            rows.push((
+                "Per interface",
+                c.interfaces
+                    .iter()
+                    .enumerate()
+                    .map(|(i, h)| {
+                        format!(
+                            "#{i}: in {} skb / {} B, out {} skb / {} B",
+                            h.ingress.packets, h.ingress.bytes, h.egress.packets, h.egress.bytes
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ));
+        }
         rows.push((
             "Drops",
             format!(
