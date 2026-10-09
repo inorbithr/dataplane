@@ -412,6 +412,40 @@ pub struct RunArgs {
     /// Log as JSON lines.
     #[arg(long)]
     pub json_logs: bool,
+    /// Run the declared checks once and exit: 0 all passed, 1 one failed, 2 something
+    /// could not be judged. No daemon, no session, nothing sent to the platform.
+    #[arg(long)]
+    pub once: bool,
+    /// With --once: only this check (its name in checks.toml); repeat for more.
+    #[arg(long = "check", requires = "once")]
+    pub checks: Vec<String>,
+    /// With --once: only checks carrying this tag, `key=value`; repeat to require more.
+    #[arg(long = "tag", requires = "once", value_parser = crate::run_once::parse_tag)]
+    pub tags: Vec<(String, String)>,
+    /// With --once: every declared check (the default when no --check or --tag is given).
+    #[arg(long, requires = "once")]
+    pub all: bool,
+    /// With --once: the report's format.
+    #[arg(long, value_enum, default_value_t, requires = "once")]
+    pub format: crate::run_once::Format,
+    /// With --once: seconds the whole run may take.
+    #[arg(long, default_value_t = 120, requires = "once")]
+    pub timeout: u64,
+    /// With --once: what fails the run; `degraded` also fails on checks near their `max_ms`.
+    #[arg(long, value_enum, default_value_t, requires = "once")]
+    pub fail_on: crate::run_once::FailOn,
+    /// With --once: write the report to this file too.
+    #[arg(long, requires = "once")]
+    pub out: Option<PathBuf>,
+    /// With --once: write the report signed with this agent's key (a compact JWS) here.
+    #[arg(long, requires = "once")]
+    pub evidence: Option<PathBuf>,
+    /// With --once: the checks file (default: the one agent.toml names).
+    #[arg(long = "checks-file", requires = "once")]
+    pub checks_file: Option<PathBuf>,
+    /// With --once: the policy (default: the one agent.toml names).
+    #[arg(long, requires = "once")]
+    pub policy: Option<PathBuf>,
 }
 
 /// `status`.
@@ -944,6 +978,27 @@ fn http_client(cfg: Option<&AgentConfig>) -> Result<reqwest::Client> {
 }
 
 fn run(config_path: &Path, args: &RunArgs) -> Result<ExitCode> {
+    if args.once {
+        // Any error here is "could not judge": CI reads 2, never 1 (which means a check failed).
+        let result = crate::run_once::run(
+            config_path,
+            &crate::run_once::Options {
+                names: args.checks.clone(),
+                tags: args.tags.clone(),
+                checks: args.checks_file.clone(),
+                policy: args.policy.clone(),
+                timeout: Duration::from_secs(args.timeout.max(1)),
+                format: args.format,
+                fail_on: args.fail_on,
+                out: args.out.clone(),
+                evidence: args.evidence.clone(),
+            },
+        );
+        return Ok(result.unwrap_or_else(|e| {
+            let _ = writeln!(std::io::stderr(), "iohr-agent: {e}");
+            ExitCode::from(2)
+        }));
+    }
     let cfg = AgentConfig::load(config_path)?;
     let telemetry = crate::telemetry::init(&cfg.telemetry, args.json_logs)?;
     let result = runtime()?.block_on(run_async(cfg));

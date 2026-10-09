@@ -26,6 +26,7 @@ pub mod platform;
 pub mod policy;
 pub mod protocol;
 pub mod redact;
+pub mod run_once;
 pub mod secrets;
 pub mod session;
 pub mod share;
