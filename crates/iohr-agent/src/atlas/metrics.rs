@@ -61,6 +61,11 @@ pub struct MetricQuery {
     /// Label values kept in the entity key (everything else is dropped).
     #[serde(default)]
     pub keep_labels: Vec<String>,
+    /// The histogram the query reads, without `_bucket` (e.g.
+    /// `envoy_cluster_upstream_rq_time`), whose bucket bounds are recorded beside the
+    /// answer. Default: the one `_bucket` series the query names, if exactly one.
+    #[serde(default)]
+    pub histogram: Option<String>,
 }
 
 /// What a query answers in.
@@ -102,6 +107,14 @@ impl MetricsFile {
             {
                 return Err(Error::Atlas(format!(
                     "metric name {:?} is malformed",
+                    m.name
+                )));
+            }
+            if let Some(h) = &m.histogram
+                && !is_metric_name(h)
+            {
+                return Err(Error::Atlas(format!(
+                    "metric {}: histogram {h:?} is not a metric name",
                     m.name
                 )));
             }
@@ -239,6 +252,193 @@ pub fn observe_answer(
     Ok(samples.len())
 }
 
+/// A Prometheus metric name: `[a-zA-Z_:][a-zA-Z0-9_:]*`. The only text the agent puts
+/// into a query of its own, so nothing else can reach the endpoint.
+#[must_use]
+pub fn is_metric_name(s: &str) -> bool {
+    let mut cs = s.chars();
+    cs.next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == ':')
+        && cs.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+}
+
+impl MetricQuery {
+    /// The histogram whose buckets this query reads: the file's `histogram`, else the one
+    /// `<name>_bucket` series the query names. None when it names none, or several.
+    #[must_use]
+    pub fn histogram(&self) -> Option<String> {
+        if let Some(h) = &self.histogram {
+            return Some(h.clone());
+        }
+        let mut found: Vec<String> = Vec::new();
+        let bytes = self.query.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if c.is_ascii_alphabetic() || c == b'_' || c == b':' {
+                let start = i;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b':')
+                {
+                    i += 1;
+                }
+                if let Some(base) = self.query[start..i].strip_suffix("_bucket")
+                    && is_metric_name(base)
+                    && !found.iter().any(|f| f == base)
+                {
+                    found.push(base.to_owned());
+                }
+            } else {
+                i += 1;
+            }
+        }
+        (found.len() == 1).then(|| found.remove(0))
+    }
+}
+
+/// The query that lists a histogram's bucket bounds: one series per `le`.
+#[must_use]
+pub fn buckets_query(histogram: &str) -> String {
+    format!("count by (le) ({histogram}_bucket)")
+}
+
+/// The bucket bounds in a `count by (le)` answer, ascending, `+Inf` last, as Prometheus
+/// writes them (`0.5`, `1`, `+Inf`).
+///
+/// # Errors
+/// Not a successful vector answer, more than [`MAX_SERIES`] buckets, or no bucket.
+pub fn parse_bounds(bytes: &[u8]) -> Result<Vec<String>> {
+    let samples = parse_answer(bytes, &["le".to_owned()])?;
+    let mut bounds: Vec<(f64, String)> = samples
+        .iter()
+        .filter_map(|s| s.labels.iter().find_map(|l| l.strip_prefix("le=")))
+        .filter_map(|le| {
+            let v = if le == "+Inf" {
+                f64::INFINITY
+            } else {
+                le.parse::<f64>().ok()?
+            };
+            Some((v, le.to_owned()))
+        })
+        .collect();
+    if bounds.is_empty() {
+        return Err(Error::Atlas("the histogram answered no buckets".into()));
+    }
+    bounds.sort_by(|a, b| a.0.total_cmp(&b.0));
+    bounds.dedup_by(|a, b| a.1 == b.1);
+    Ok(bounds.into_iter().map(|b| b.1).collect())
+}
+
+/// Records a histogram's bucket bounds at `at`: `bucket_bounds` (the `le` values,
+/// ascending, comma-separated) and `bucket_count` on `metric/<name>@<at>`, from the
+/// answer's digest. A quantile from this histogram cannot be finer than its buckets.
+///
+/// # Errors
+/// The answer is not a bucket list, or an observation could not be built.
+pub fn observe_bounds(
+    ctx: &Ctx,
+    sink: &mut Sink,
+    q: &MetricQuery,
+    histogram: &str,
+    at: &str,
+    answer: &[u8],
+) -> Result<usize> {
+    let bounds = parse_bounds(answer)?;
+    let answer_key = format!("query/{}.buckets@{at}", q.name);
+    let digest = ctx.observe(
+        sink,
+        &answer_key,
+        "answer_digest",
+        EvValue::Digest(ContentDigest::of_bytes(answer)),
+        &[],
+    )?;
+    let from = [EvidenceRef::Observation(digest)];
+    let key = format!("{}@{at}", series_key(&q.name, &[]));
+    ctx.observe_from(
+        sink,
+        &key,
+        "histogram",
+        EvValue::Text(histogram.to_owned()),
+        &from,
+    )?;
+    ctx.observe_from(
+        sink,
+        &key,
+        "bucket_bounds",
+        EvValue::Text(bounds.join(",")),
+        &from,
+    )?;
+    ctx.observe_from(
+        sink,
+        &key,
+        "bucket_count",
+        EvValue::Int(i64::try_from(bounds.len()).unwrap_or(i64::MAX)),
+        &from,
+    )?;
+    Ok(bounds.len())
+}
+
+/// The most instants one run evaluates: a week, hourly.
+pub const MAX_INSTANTS: usize = 169;
+
+/// Expands `--at` values into instants (RFC 3339, UTC, `Z`). A value is one instant, or
+/// a range `START..END/STEP` (`STEP` in `m` or `h`, default `1h`), both ends included:
+/// `2026-10-09T00:00:00Z..2026-10-09T12:00:00Z` is the 13 hours from midnight to noon.
+///
+/// # Errors
+/// A malformed instant or step, an end before its start, or more than
+/// [`MAX_INSTANTS`] instants in all.
+pub fn instants(values: &[String]) -> Result<Vec<String>> {
+    use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
+    let parse = |s: &str| -> Result<DateTime<Utc>> {
+        DateTime::parse_from_rfc3339(s)
+            .map(|t| t.with_timezone(&Utc))
+            .map_err(|e| Error::Atlas(format!("--at {s}: {e}")))
+    };
+    let mut out = Vec::new();
+    for v in values {
+        let Some((start, rest)) = v.split_once("..") else {
+            out.push(parse(v)?.to_rfc3339_opts(SecondsFormat::Secs, true));
+            continue;
+        };
+        let (end, step) = rest.split_once('/').unwrap_or((rest, "1h"));
+        let (n, unit) = step.split_at(step.len().saturating_sub(1));
+        let n: i64 = n.parse().ok().filter(|n| *n > 0).ok_or_else(|| {
+            Error::Atlas(format!("--at {v}: the step {step:?} is not like 1h or 15m"))
+        })?;
+        let step = match unit {
+            "h" => TimeDelta::hours(n),
+            "m" => TimeDelta::minutes(n),
+            _ => {
+                return Err(Error::Atlas(format!(
+                    "--at {v}: the step {step:?} is not like 1h or 15m"
+                )));
+            }
+        };
+        let (from, to) = (parse(start)?, parse(end)?);
+        if to < from {
+            return Err(Error::Atlas(format!(
+                "--at {v}: the end is before the start"
+            )));
+        }
+        let mut t = from;
+        while t <= to {
+            out.push(t.to_rfc3339_opts(SecondsFormat::Secs, true));
+            if out.len() > MAX_INSTANTS {
+                break;
+            }
+            t += step;
+        }
+    }
+    if out.len() > MAX_INSTANTS {
+        return Err(Error::Atlas(format!(
+            "--at names more than {MAX_INSTANTS} instants: narrow the range or widen the step"
+        )));
+    }
+    out.dedup();
+    Ok(out)
+}
+
 /// A client for the file's endpoint, after the policy admitted it.
 ///
 /// # Errors
@@ -322,6 +522,7 @@ mod tests {
             query: "histogram_quantile(0.95, sum by (envoy_cluster_name, le) (rate(envoy_cluster_upstream_rq_time_bucket[1h])))".into(),
             unit: Unit::Ms,
             keep_labels: vec!["envoy_cluster_name".into()],
+            histogram: None,
         }
     }
 
@@ -395,6 +596,127 @@ mod tests {
                 if o.statement().predicate.name.as_str() == "answer_digest")),
             "the answer is evidence by digest"
         );
+    }
+
+    // A `count by (le)` answer for envoy's upstream request time, out of order, with a
+    // label that must not matter.
+    const BUCKETS: &[u8] = br#"{"status":"success","data":{"resultType":"vector","result":[
+      {"metric":{"le":"+Inf"},"value":[1791539151,"12"]},
+      {"metric":{"le":"0.5"},"value":[1791539151,"12"]},
+      {"metric":{"le":"1000"},"value":[1791539151,"12"]},
+      {"metric":{"le":"25"},"value":[1791539151,"12"]},
+      {"metric":{"le":"250","pod":"x"},"value":[1791539151,"12"]}]}}"#;
+
+    #[test]
+    fn a_query_names_its_histogram_or_the_file_does() {
+        assert_eq!(
+            q().histogram().as_deref(),
+            Some("envoy_cluster_upstream_rq_time")
+        );
+        let mut two = q();
+        two.query = "a_bucket / b_bucket".into();
+        assert_eq!(
+            two.histogram(),
+            None,
+            "two histograms: ambiguous, the file must say"
+        );
+        two.histogram = Some("a".into());
+        assert_eq!(two.histogram().as_deref(), Some("a"));
+        let mut none = q();
+        none.query = "up".into();
+        assert_eq!(none.histogram(), None);
+        assert_eq!(buckets_query("envoy_x"), "count by (le) (envoy_x_bucket)");
+        assert!(is_metric_name("envoy_cluster:rate5m"));
+        for bad in ["", "1x", "x{a=\"b\"}", "x) or vector(1", "x y"] {
+            assert!(!is_metric_name(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn bucket_bounds_are_recorded_ascending_with_inf_last() {
+        assert_eq!(
+            parse_bounds(BUCKETS).unwrap(),
+            vec!["0.5", "25", "250", "1000", "+Inf"]
+        );
+        let mut sink = Sink::default();
+        let ctx = Ctx::new(
+            &mut sink,
+            "metrics-reader",
+            ObserverClass::ExternalSystem,
+            method(METHOD, MethodCategory::Metrics).unwrap(),
+            "probe",
+            &["query"],
+            &ObservedNow::now(),
+        )
+        .unwrap();
+        let n = observe_bounds(
+            &ctx,
+            &mut sink,
+            &q(),
+            "envoy_cluster_upstream_rq_time",
+            "2026-10-09T09:00:00Z",
+            BUCKETS,
+        )
+        .unwrap();
+        assert_eq!(n, 5);
+        let bounds: Vec<String> = sink
+            .records()
+            .iter()
+            .filter_map(|r| match r {
+                Record::Observation(o)
+                    if o.statement().predicate.name.as_str() == "bucket_bounds" =>
+                {
+                    match o.statement().value {
+                        EvValue::Text(t) => Some(t),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bounds, vec!["0.5,25,250,1000,+Inf"]);
+        let empty = br#"{"status":"success","data":{"resultType":"vector","result":[]}}"#;
+        assert!(
+            parse_bounds(empty).is_err(),
+            "no buckets is not an empty list of bounds"
+        );
+    }
+
+    #[test]
+    fn envoy_s_real_buckets_parse_in_order() {
+        // `count by (le) (envoy_cluster_upstream_rq_time_bucket)` at 2026-10-09T09:00:00Z,
+        // from VictoriaMetrics on nevio-server.
+        let real = include_bytes!("../../tests/fixtures/metrics-envoy-buckets.json");
+        let b = parse_bounds(real).unwrap();
+        assert_eq!(b.first().map(String::as_str), Some("0.5"));
+        assert_eq!(b.last().map(String::as_str), Some("+Inf"));
+        let finite: Vec<f64> = b[..b.len() - 1].iter().map(|x| x.parse().unwrap()).collect();
+        assert!(finite.windows(2).all(|w| w[0] < w[1]), "{b:?}");
+    }
+
+    #[test]
+    fn hourly_ranges_expand_and_are_bounded() {
+        let v = instants(&["2026-10-09T00:00:00Z..2026-10-09T03:00:00Z".into()]).unwrap();
+        assert_eq!(
+            v,
+            vec![
+                "2026-10-09T00:00:00Z",
+                "2026-10-09T01:00:00Z",
+                "2026-10-09T02:00:00Z",
+                "2026-10-09T03:00:00Z"
+            ]
+        );
+        let q = instants(&["2026-10-09T00:00:00Z..2026-10-09T00:30:00Z/15m".into()]).unwrap();
+        assert_eq!(q.len(), 3);
+        let one = instants(&["2026-10-09T11:45:51+02:00".into()]).unwrap();
+        assert_eq!(one, vec!["2026-10-09T09:45:51Z"], "instants are UTC");
+        assert!(instants(&["2026-10-09T03:00:00Z..2026-10-09T00:00:00Z".into()]).is_err());
+        assert!(
+            instants(&["2026-10-01T00:00:00Z..2026-10-09T00:00:00Z".into()]).is_err(),
+            "over a week hourly"
+        );
+        assert!(instants(&["2026-10-09T00:00:00Z..2026-10-09T01:00:00Z/1d".into()]).is_err());
+        assert!(instants(&["2026-10-09T00:00:00Z..2026-10-09T01:00:00Z/0h".into()]).is_err());
     }
 
     #[test]
