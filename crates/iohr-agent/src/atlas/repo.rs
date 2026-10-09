@@ -312,13 +312,24 @@ pub fn observe(repo: &Repo, sink: &mut Sink, clock: &ObservedNow) -> Result<Foun
     for (doc, artifact) in &envoy {
         found.envoy_routes += observe_envoy(&envoy_ctx, doc, *artifact, &objects, sink)?;
     }
+    found.decided = observe_decided(repo, sink, clock, &principal)?;
+    Ok(found)
+}
 
+/// The PRDs, ADRs and RFCs under the checkout's `docs/` ([`super::decided`]).
+fn observe_decided(
+    repo: &Repo,
+    sink: &mut Sink,
+    clock: &ObservedNow,
+    principal: &str,
+) -> Result<super::decided::Found> {
+    let mut found = super::decided::Found::default();
     let decided_ctx = Ctx::new(
         sink,
         "decided-document-reader",
         ObserverClass::DeterministicExtractor,
         method(super::decided::METHOD, MethodCategory::Configuration)?,
-        &principal,
+        principal,
         &["read"],
         clock,
     )?;
@@ -336,7 +347,7 @@ pub fn observe(repo: &Repo, sink: &mut Sink, clock: &ObservedNow) -> Result<Foun
             kind,
             &bytes,
             artifact,
-            &mut found.decided,
+            &mut found,
         )?;
     }
     Ok(found)

@@ -160,18 +160,11 @@ pub fn cut_classified(text: &str) -> String {
     let mut rest = kept.as_str();
     while let Some(start) = rest.find("[[classified:") {
         out.push_str(&rest[..start]);
-        let span = match rest[start..].find("[[/classified]]") {
-            Some(end) => {
-                let s = &rest[start..start + end + "[[/classified]]".len()];
-                rest = &rest[start + end + "[[/classified]]".len()..];
-                s
-            }
-            None => {
-                let s = &rest[start..];
-                rest = "";
-                s
-            }
-        };
+        let end = rest[start..]
+            .find("[[/classified]]")
+            .map_or(rest.len(), |e| start + e + "[[/classified]]".len());
+        let span = &rest[start..end];
+        rest = &rest[end..];
         out.extend(std::iter::repeat_n('\n', span.matches('\n').count()));
     }
     out.push_str(rest);
@@ -533,7 +526,10 @@ pub fn observe_document(
 pub fn kind_for(rel: &Path) -> Option<&'static str> {
     let parent: PathBuf = rel.parent()?.to_path_buf();
     let name = rel.file_name()?.to_str()?;
-    if !name.ends_with(".md") || name.eq_ignore_ascii_case("README.md") {
+    let is_md = Path::new(name)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("md"));
+    if !is_md || name.eq_ignore_ascii_case("README.md") {
         return None;
     }
     DIRS.iter()
