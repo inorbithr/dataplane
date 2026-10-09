@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>__SITE__/docs/intro/</loc><lastmod>2026-10-01T09:00:00+00:00</lastmod><changefreq>weekly</changefreq></url>
+  <url><loc>__SITE__/docs/deploy/</loc><lastmod>2026-10-05</lastmod></url>
+  <url><loc>__SITE__/docs/private/keys/</loc><lastmod>2026-10-05</lastmod></url>
+  <url><loc>__SITE__/blog/launch/</loc><lastmod>2026-10-05</lastmod></url>
+  <url><loc>__SITE__/docs/moved/</loc><lastmod>2026-10-06</lastmod></url>
+  <url><loc>__SITE__/docs/api.html</loc></url>
+</urlset>

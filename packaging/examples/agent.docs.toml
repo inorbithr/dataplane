@@ -3,7 +3,7 @@
 # under [secrets] allow and each provider host under [networks] allow, for example:
 #
 #   [networks]
-#   allow = ["api.notion.com", "api.atlassian.com"]
+#   allow = ["api.notion.com", "api.atlassian.com", "docs.acme.example"]
 #   [secrets]
 #   allow = ["vault:kv/iohr/notion#token", "vault:kv/iohr/confluence#token"]
 #
@@ -43,3 +43,10 @@ base_url = "https://api.atlassian.com/ex/confluence/1324a887-45db-1bf4-1e99-ef0f
 account = "atlas-reader@acme.example"
 token = "vault:kv/iohr/confluence#token"
 spaces = ["ENG", "OPS"]
+
+# A static documentation site (Docusaurus, MkDocs, Sphinx, ReadMe, ...): no credential;
+# robots.txt and the sitemap decide what is read, and nothing outside base_url is.
+[[docs.sources]]
+id = "handbook"
+provider = "site"
+base_url = "https://docs.acme.example/handbook/"
