@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.0-alpha.11](https://github.com/inorbithr/dataplane/compare/v0.1.0-alpha.10...v0.1.0-alpha.11) (2026-10-10)
+
+
+### Features
+
+* **agent:** the console in the agent, slice 1: a local API, trial storage and the console bundle (RFC 0100.4) ([#45](https://github.com/inorbithr/dataplane/issues/45)) ([c3b3ebd](https://github.com/inorbithr/dataplane/commit/c3b3ebd7956073db1bac52279aed08d586bb796b))
+
 ## [0.1.0-alpha.10](https://github.com/inorbithr/dataplane/compare/v0.1.0-alpha.9...v0.1.0-alpha.10) (2026-10-09)
 
 
