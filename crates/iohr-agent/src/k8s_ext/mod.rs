@@ -1,4 +1,4 @@
-//! The Kubernetes extension (RFC 0101): cluster evidence, read-only by design.
+//! The Kubernetes extension (RFC 0112): cluster evidence, read-only by design.
 //!
 //! What it reads is decided in three places, and all three must agree: the policy's
 //! `[kubernetes]` section (namespaces and kinds), the RBAC the customer applied (printed

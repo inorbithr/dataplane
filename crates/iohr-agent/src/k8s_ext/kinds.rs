@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 
 /// A kind of object the extension reads. All namespaced; cluster-wide kinds (nodes) need a
-/// ClusterRole and come later (RFC, slice 3).
+/// ClusterRole and come later (RFC 0112, slice 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
