@@ -104,7 +104,7 @@ footer{max-width:1120px;margin:0 auto;padding:8px 24px 40px;color:var(--muted);f
 @media (max-width:600px){.top{padding:12px 16px}main{padding:16px}nav{padding:0 8px}.nums{grid-template-columns:repeat(2,minmax(0,1fr))}.checks{grid-template-columns:1fr}footer{padding:8px 16px 32px}.hide-sm{display:none}}
 "#;
 
-const NAV: [(&str, &str); 7] = [
+const NAV: [(&str, &str); 8] = [
     ("/", "Overview"),
     ("/checks", "Checks"),
     ("/policy", "Policy"),
@@ -112,10 +112,11 @@ const NAV: [(&str, &str); 7] = [
     ("/jobs", "Jobs"),
     ("/host", "Host"),
     ("/logs", "Logs"),
+    ("/kubernetes", "Kubernetes"),
 ];
 
 /// The JSON twin of each section.
-const API: [(&str, &str); 7] = [
+const API: [(&str, &str); 8] = [
     ("/api/v1/overview.json", "overview"),
     ("/api/v1/checks.json", "checks"),
     ("/api/v1/policy.json", "policy"),
@@ -123,6 +124,7 @@ const API: [(&str, &str); 7] = [
     ("/api/v1/jobs.json", "jobs"),
     ("/api/v1/host.json", "host"),
     ("/api/v1/logs.json", "logs"),
+    ("/api/v1/kubernetes.json", "kubernetes"),
 ];
 
 /// The Content-Security-Policy: nothing but this page's own stylesheet and icon.
@@ -174,6 +176,8 @@ pub(super) fn route(
         "/jobs" => (HTML, html("/jobs", jobs(&s))),
         "/host" => (HTML, html("/host", host(ctx, &s))),
         "/logs" => (HTML, html("/logs", logs())),
+        "/kubernetes" => (HTML, html("/kubernetes", kubernetes(ctx))),
+        "/kubernetes/rbac.yaml" => ("text/plain; charset=utf-8", kubernetes_rbac(ctx)?),
         "/status.json" => (JSON, serde_json::to_string_pretty(&s).unwrap_or_default()),
         p => {
             let (_, name) = API.iter().find(|(a, _)| *a == p)?;
@@ -1568,8 +1572,125 @@ fn logs() -> String {
 
 // ---------------------------------------------------------------- JSON
 
+/// The RBAC for the policy's `[kubernetes]`, or nothing when there is none.
+fn kubernetes_rbac(ctx: &Context) -> Option<String> {
+    let k = ctx.policy.kubernetes.as_ref()?;
+    crate::k8s_ext::rbac::generate(&crate::k8s_ext::rbac::Request {
+        namespaces: &k.namespaces,
+        kinds: &k.kinds,
+        account: "iohr-k8s-reader",
+        account_namespace: "inorbit",
+    })
+    .ok()
+}
+
+/// `/kubernetes`: what the extension may read, the RBAC to apply, and every query.
+fn kubernetes(ctx: &Context) -> String {
+    use crate::k8s_ext::{self, audit, kinds::Kind};
+    let mut h = String::from(
+        "<h1>Kubernetes</h1><p class=lede>The Kubernetes extension reads workloads, pods, rollouts and events in the namespaces your policy names, as facts with counts, states and reasons. It cannot read secrets or config maps, run anything in a pod, forward a port or read logs: there is no request for them in the agent, and the RBAC below does not grant them. It changes nothing in the cluster. What it reads stays on this machine.</p>",
+    );
+    let dir = k8s_ext::state_dir(std::path::Path::new(&ctx.state_dir));
+    let Some(k) = &ctx.policy.kubernetes else {
+        let _ = write!(
+            h,
+            "<div class=card><h3>Off</h3><p>The policy has no <code>[kubernetes]</code> section, so the extension reads nothing. To turn it on, name the namespaces in the policy:</p><pre>[kubernetes]\nnamespaces = [\"shop\", \"payments\"]\n# kinds = [\"deployments\", \"statefulsets\", \"daemonsets\", \"replicasets\", \"pods\", \"events\"]\n# max_items = 500\n# queries_per_minute = 60</pre><p class=muted>Then print the RBAC with <code>iohr-agent k8s rbac</code>, review it, and apply it yourself.</p></div>"
+        );
+        return h;
+    };
+    let kinds: Vec<String> = Kind::ALL
+        .iter()
+        .map(|kind| {
+            if k.kinds.contains(kind) {
+                pill("ok", kind.as_str())
+            } else {
+                pill("", &format!("{} (off)", kind.as_str()))
+            }
+        })
+        .collect();
+    let _ = write!(
+        h,
+        "<div class=grid><div class=card><h3>What it may read</h3>{}</div><div class=card><h3>Limits</h3>{}</div></div>",
+        kv(&[
+            ("Status", pill("ok", "on: read-only")),
+            (
+                "Namespaces",
+                k.namespaces.iter().map(|n| format!("<code>{}</code>", esc(n))).collect::<Vec<_>>().join(" ")
+            ),
+            ("Kinds", kinds.join(" ")),
+            ("Never", "secrets, config maps, exec, attach, port-forward, logs, proxies, tokens, any write".into()),
+        ]),
+        kv(&[
+            ("Per list", format!("at most {} objects", k.max_items)),
+            ("Rate", format!("at most {} queries a minute", k.queries_per_minute)),
+            ("Events kept", format!("{} per namespace", k.max_events)),
+            ("Masked", "secrets, tokens, emails, IP addresses".into()),
+            ("Sent to InOrbit", "nothing (the manifest's <code>leaves</code> is empty)".into()),
+        ])
+    );
+    let rbac = kubernetes_rbac(ctx).unwrap_or_default();
+    let _ = write!(
+        h,
+        "<h2>RBAC to apply</h2><p class=muted>One ServiceAccount, and in each namespace a Role with <code>get</code>, <code>list</code> and <code>watch</code> on the kinds above, bound to it. The agent never applies it: review it, then <code>kubectl apply -f</code> it. Download: <a href=/kubernetes/rbac.yaml download=iohr-k8s-rbac.yaml>rbac.yaml</a> · or print it with <code>iohr-agent k8s rbac</code>.</p><details open><summary>The YAML</summary><pre>{}</pre></details>",
+        esc(&rbac)
+    );
+    let ledger = crate::ledger::verify(&dir.join("ledger"));
+    let _ = write!(
+        h,
+        "<h2>Queries</h2><p class=muted>Every request is written to the extension's own chained ledger before it is sent (<code>{}</code>: {}, {} entries; check it with <code>iohr-agent ledger verify --dir</code>), and here with its outcome after.</p>",
+        esc(&dir.join("ledger").display().to_string()),
+        if ledger.entries == 0 {
+            pill("", "empty")
+        } else if ledger.ok() {
+            pill("ok", "intact")
+        } else {
+            pill("bad", "broken")
+        },
+        ledger.entries
+    );
+    let recent = audit::recent(&dir, 50);
+    if recent.is_empty() {
+        h.push_str("<p class=muted>No queries yet. Run <code>iohr-agent k8s read</code>.</p>");
+        return h;
+    }
+    h.push_str("<div class=scroll><table class=t><tr><th>When</th><th>Kind</th><th>Namespace</th><th>Outcome</th><th class=n>Objects</th><th class=hide-sm>Path</th></tr>");
+    for l in recent {
+        let outcome = match l.outcome {
+            audit::Outcome::Read => pill("ok", "read"),
+            audit::Outcome::Denied => pill(
+                "warn",
+                &format!("denied by RBAC ({})", l.status.unwrap_or(403)),
+            ),
+            audit::Outcome::Missing => pill("", "not served"),
+            audit::Outcome::Refused => pill("warn", "refused by policy"),
+            audit::Outcome::Limited => pill("warn", "over the rate cap"),
+            audit::Outcome::Failed => pill("bad", "failed"),
+        };
+        let _ = write!(
+            h,
+            "<tr><td>{}</td><td>{}</td><td><code>{}</code></td><td>{outcome}</td><td class=n>{}</td><td class=hide-sm><code>{}</code></td></tr>",
+            esc(&l.at),
+            esc(&l.kind),
+            esc(&l.namespace),
+            l.items,
+            esc(&l.path)
+        );
+    }
+    h.push_str("</table></div>");
+    h
+}
+
 fn api(ctx: &Context, s: &Snapshot, name: &str) -> Value {
     match name {
+        "kubernetes" => {
+            let dir = crate::k8s_ext::state_dir(std::path::Path::new(&ctx.state_dir));
+            json!({
+                "extension": crate::k8s_ext::ID,
+                "manifest": crate::k8s_ext::MANIFEST,
+                "policy": ctx.policy.kubernetes,
+                "recent": crate::k8s_ext::audit::recent(&dir, 50),
+            })
+        }
         "overview" => json!({
             "agent": s.agent,
             "api": ctx.api,

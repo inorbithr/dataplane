@@ -62,6 +62,10 @@ pub struct Policy {
     /// defaults: targets as a keyed hash and a label, no host name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub share: Option<SharePolicy>,
+    /// What the Kubernetes extension may read (`docs/kubernetes.md`). Absent: it reads
+    /// nothing. Left out of the hashed form while absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kubernetes: Option<crate::k8s_ext::KubernetesPolicy>,
     /// Everything else at the top level, sorted out by [`Policy::from_toml`].
     #[serde(flatten, skip_serializing)]
     unknown: std::collections::BTreeMap<String, toml::Value>,
@@ -471,6 +475,9 @@ impl Policy {
             }
         }
         check_environment(&self.environment)?;
+        if let Some(k) = &mut self.kubernetes {
+            k.validate().map_err(|e| format!("kubernetes: {e}"))?;
+        }
         let mut bound = Vec::with_capacity(self.domains.bound.len());
         for d in &self.domains.bound {
             bound.push(normalize_host(d).map_err(|e| format!("domains.bound: {e}"))?);
