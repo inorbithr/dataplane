@@ -38,7 +38,16 @@ fn context_with(
     require_token: bool,
     reload: Option<tokio::sync::mpsc::Sender<crate::agent::Reload>>,
 ) -> Arc<Context> {
-    let policy = Policy::from_toml(POLICY).unwrap();
+    context_policy(dir, require_token, reload, POLICY)
+}
+
+fn context_policy(
+    dir: &Path,
+    require_token: bool,
+    reload: Option<tokio::sync::mpsc::Sender<crate::agent::Reload>>,
+    policy_text: &str,
+) -> Arc<Context> {
+    let policy = Policy::from_toml(policy_text).unwrap();
     let checks = DeclaredChecks::from_toml(CHECKS).unwrap();
     let state = Arc::new(AgentState::new(
         AgentInfo {
@@ -794,4 +803,92 @@ async fn the_ledger_export_is_the_files_and_verifies() {
     crate::ledger::export(l.dir(), &mut exported).unwrap();
     assert_eq!(body.as_bytes(), exported.as_slice());
     assert_eq!(body.lines().count(), 3);
+}
+
+const K8S: &str = "[kubernetes]\nnamespaces = [\"shop\", \"payments\"]\nkinds = [\"deployments\", \"replicasets\", \"pods\", \"events\"]\n";
+
+#[test]
+fn the_kubernetes_page_says_off_without_the_policy_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path(), false);
+    let (_, html) = page::route(&ctx, "/kubernetes", None, &page::View::default()).unwrap();
+    assert!(html.contains("reads nothing") && html.contains("[kubernetes]"));
+    assert!(page::route(&ctx, "/kubernetes/rbac.yaml", None, &page::View::default()).is_none());
+}
+
+#[test]
+fn the_kubernetes_page_shows_the_scope_the_rbac_and_the_queries() {
+    use crate::k8s_ext::audit::{Audit, Line, Outcome};
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context_policy(dir.path(), false, None, &format!("{POLICY}{K8S}"));
+    let a = Audit::open(&crate::k8s_ext::state_dir(dir.path())).unwrap();
+    for (kind, outcome, status) in [
+        ("pods", Outcome::Denied, Some(403)),
+        ("events", Outcome::Read, None),
+    ] {
+        a.append(&Line {
+            at: "2026-10-10T08:00:00Z".into(),
+            kind: kind.into(),
+            namespace: "shop".into(),
+            path: format!("api/v1/namespaces/shop/{kind}?limit=500"),
+            outcome,
+            items: 3,
+            status,
+        })
+        .unwrap();
+    }
+    let (_, html) = page::route(&ctx, "/kubernetes", None, &page::View::default()).unwrap();
+    for want in [
+        "<code>payments</code>",
+        "statefulsets (off)",
+        "denied by RBAC (403)",
+        "kind: RoleBinding",
+        "/kubernetes/rbac.yaml",
+    ] {
+        assert!(html.contains(want), "{want} missing");
+    }
+    let (ctype, yaml) =
+        page::route(&ctx, "/kubernetes/rbac.yaml", None, &page::View::default()).unwrap();
+    assert!(ctype.starts_with("text/plain"));
+    assert!(yaml.contains("namespace: payments") && !yaml.contains("statefulsets"));
+    assert!(!yaml.contains("\"secrets\"") && !yaml.contains("delete"));
+    let (_, json) = page::route(
+        &ctx,
+        "/api/v1/kubernetes.json",
+        None,
+        &page::View::default(),
+    )
+    .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["recent"].as_array().unwrap().len(), 2);
+    assert_eq!(v["policy"]["namespaces"][0], "payments");
+}
+
+/// Writes the Kubernetes page to `$K8S_PAGE_OUT` for screenshots, reading the queries from
+/// `$K8S_STATE` (an agent state directory) when set.
+#[test]
+#[ignore = "writes the page for screenshots"]
+fn kubernetes_page_snapshot() {
+    let out = std::path::PathBuf::from(std::env::var("K8S_PAGE_OUT").unwrap());
+    std::fs::create_dir_all(&out).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let state =
+        std::env::var("K8S_STATE").map_or_else(|_| tmp.path().to_owned(), std::path::PathBuf::from);
+    let ns = std::env::var("K8S_NAMESPACES").unwrap_or_else(|_| "shop".into());
+    let k8s = format!(
+        "[kubernetes]\nnamespaces = [{}]\n",
+        ns.split(',')
+            .map(|n| format!("\"{n}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    for (name, policy) in [("off", POLICY.to_owned()), ("on", format!("{POLICY}{k8s}"))] {
+        let ctx = context_policy(&state, false, None, &policy);
+        let (_, html) = page::route(&ctx, "/kubernetes", None, &page::View::default()).unwrap();
+        std::fs::write(
+            out.join(format!("kubernetes-{name}.html")),
+            crate::redact::redact(&html),
+        )
+        .unwrap();
+    }
 }

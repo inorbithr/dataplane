@@ -36,6 +36,8 @@ const MAX_ANSWER: usize = 32 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// The method every reading here carries.
 pub const METHOD: &str = "k8s.api.read";
+/// Where Kubernetes mounts a pod's service account.
+const SA_MOUNT: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
 
 /// A kubeconfig, reduced to what one context needs.
 #[derive(Debug, Clone)]
@@ -256,6 +258,61 @@ impl KubeContext {
         })
     }
 
+    /// The pod's own service account: the token and CA Kubernetes mounts into every pod
+    /// that asks for them, and the API server from `KUBERNETES_SERVICE_HOST`/`_PORT`.
+    ///
+    /// # Errors
+    /// Not running in a pod, or the mount is missing or unreadable.
+    pub fn in_cluster() -> Result<Self> {
+        let host = std::env::var("KUBERNETES_SERVICE_HOST")
+            .map_err(|_| Error::Atlas("not in a pod: KUBERNETES_SERVICE_HOST is not set".into()))?;
+        let port = std::env::var("KUBERNETES_SERVICE_PORT").unwrap_or_else(|_| "443".into());
+        Self::from_mount(Path::new(SA_MOUNT), &host, &port)
+    }
+
+    /// [`Self::in_cluster`] from an explicit mount directory, host and port.
+    ///
+    /// # Errors
+    /// The token or CA cannot be read, or the address is not a URL.
+    pub fn from_mount(dir: &Path, host: &str, port: &str) -> Result<Self> {
+        let token = std::fs::read_to_string(dir.join("token"))
+            .map_err(|e| Error::io(dir.join("token"), e))?;
+        let ca_pem =
+            std::fs::read(dir.join("ca.crt")).map_err(|e| Error::io(dir.join("ca.crt"), e))?;
+        let namespace = std::fs::read_to_string(dir.join("namespace"))
+            .ok()
+            .map(|n| n.trim().to_owned());
+        let authority = if host.contains(':') {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        };
+        let server = Url::parse(&format!("https://{authority}"))
+            .map_err(|e| Error::Atlas(format!("the in-cluster API address: {e}")))?;
+        Ok(Self {
+            name: "in-cluster".into(),
+            user: "serviceaccount".into(),
+            server,
+            ca_pem,
+            auth: Auth::Token(Zeroizing::new(token.trim().to_owned())),
+            namespace,
+        })
+    }
+
+    /// A plain-HTTP context with no credential, for tests against a local fake server.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn plain_for_tests(server: Url) -> Self {
+        Self {
+            name: "test".into(),
+            user: "test".into(),
+            server,
+            ca_pem: Vec::new(),
+            auth: Auth::Token(Zeroizing::new("test-token".into())),
+            namespace: None,
+        }
+    }
+
     /// The API server's host and port, for the policy check.
     #[must_use]
     pub fn host_port(&self) -> Option<(String, u16)> {
@@ -313,6 +370,8 @@ impl KubeContext {
         let http = builder
             .user_agent(concat!("iohr-agent/", env!("CARGO_PKG_VERSION")))
             .no_proxy()
+            // A redirect would take the credential somewhere the policy never admitted.
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(TIMEOUT)
             .build()
             .map_err(|e| Error::Tls(e.to_string()))?;
@@ -357,6 +416,20 @@ impl KubeClient {
     /// # Errors
     /// The request failed, the answer was not success, too large or not JSON.
     pub async fn list(&self, path: &str) -> Result<Vec<Value>> {
+        match self.try_list(path).await? {
+            Listed::Items(items) => Ok(items),
+            Listed::Refused(code) => Err(Error::Atlas(format!(
+                "{path}: the API server answered {code}"
+            ))),
+        }
+    }
+
+    /// Like [`Self::list`], but an answer of 401, 403 or 404 is an outcome, not an error:
+    /// the RBAC the customer applied does not allow it, or the kind is not served.
+    ///
+    /// # Errors
+    /// The request failed, any other non-success answer, too large or not JSON.
+    pub async fn try_list(&self, path: &str) -> Result<Listed> {
         let url = self
             .base
             .join(path)
@@ -373,6 +446,9 @@ impl KubeClient {
             })
         })?;
         let status = resp.status();
+        if matches!(status.as_u16(), 401 | 403 | 404) {
+            return Ok(Listed::Refused(status.as_u16()));
+        }
         if !status.is_success() {
             return Err(Error::Atlas(format!(
                 "{path}: the API server answered {}",
@@ -392,11 +468,22 @@ impl KubeClient {
         }
         let v: Value = serde_json::from_slice(&buf)
             .map_err(|_| Error::Atlas(format!("{path}: the answer is not JSON")))?;
-        Ok(v.get("items")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default())
+        Ok(Listed::Items(
+            v.get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        ))
     }
+}
+
+/// What a list request came back with.
+#[derive(Debug, Clone)]
+pub enum Listed {
+    /// The items.
+    Items(Vec<Value>),
+    /// 401, 403 or 404: not allowed, or not served.
+    Refused(u16),
 }
 
 /// What one namespace holds, as the API reports it.
