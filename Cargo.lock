@@ -1244,7 +1244,7 @@ dependencies = [
 
 [[package]]
 name = "iohr-agent"
-version = "0.1.0-alpha.10"
+version = "0.1.0-alpha.11"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -1292,7 +1292,7 @@ dependencies = [
 
 [[package]]
 name = "iohr-capture"
-version = "0.1.0-alpha.10"
+version = "0.1.0-alpha.11"
 dependencies = [
  "aya",
  "aya-build",
@@ -1310,14 +1310,14 @@ dependencies = [
 
 [[package]]
 name = "iohr-capture-common"
-version = "0.1.0-alpha.10"
+version = "0.1.0-alpha.11"
 dependencies = [
  "aya",
 ]
 
 [[package]]
 name = "iohr-evidence"
-version = "0.1.0-alpha.10"
+version = "0.1.0-alpha.11"
 dependencies = [
  "chrono",
  "proptest",
