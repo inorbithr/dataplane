@@ -12,6 +12,7 @@
 //! | `GET /v1/agents/{agent}/ledger` | ADR 0049 | the egress ledger |
 //! | `GET /v1/agents/self` | agent only | which account and agent answer here |
 //! | `GET /v1/accounts/orgs/{org}/agents/{agent}/share` | agent only | the policy's `[share]` |
+//! | `GET`, `PUT /v1/accounts/orgs/{org}/layouts[/{page}]`, `POST …/{page}/reset` | `AccountsService.*Layout*` (PRD 0024) | the trial store ([`super::layouts`]) |
 //!
 //! Every answer carries `"where": "agent"` (RFC 0090.1 §3: a local-only field is added,
 //! never renamed). Errors follow the response contract (RFC 0033): `{code, error,
@@ -29,6 +30,7 @@ use serde_json::{Value, json};
 use super::Context;
 use super::auth::Person;
 use super::configs;
+use super::layouts;
 use crate::checks_file::{DeclaredCheck, Kind, RefuseBy};
 use crate::policy::Role;
 use crate::state::JobRecord;
@@ -81,6 +83,15 @@ pub(super) fn route(
                 {
                     not_found("monitor (inorbit/monitors is not installed on this agent)")
                 }
+                ["layouts", ..] if ctx.state.store().is_none() => layouts::no_store(),
+                ["layouts"] => ctx
+                    .state
+                    .store()
+                    .map_or_else(layouts::no_store, |s| layouts::list(s, person)),
+                ["layouts", page] => ctx
+                    .state
+                    .store()
+                    .map_or_else(layouts::no_store, |s| layouts::get(s, person, page)),
                 ["monitors"] => list_monitors(ctx, &q, &agent_id),
                 ["monitors", id] => match monitor(ctx, id, &agent_id) {
                     Some(m) => ok(&json!({"monitor": m})),
@@ -157,7 +168,7 @@ pub(super) fn read_only() -> Answer {
     )
 }
 
-fn ok(v: &Value) -> Answer {
+pub(super) fn ok(v: &Value) -> Answer {
     (200, v.to_string())
 }
 
@@ -165,7 +176,7 @@ fn not_found(what: &str) -> Answer {
     error(404, "not_found", &format!("no such {what} on this agent"))
 }
 
-fn error(status: u16, code: &str, msg: &str) -> Answer {
+pub(super) fn error(status: u16, code: &str, msg: &str) -> Answer {
     (
         status,
         json!({
@@ -746,6 +757,35 @@ struct ReasonBody {
     reason: String,
 }
 
+/// Dashboard layouts (PRD 0024): the person's own, or this agent's default; `None` when
+/// the path is not a layout's.
+fn write_layout(
+    ctx: &Context,
+    person: &Person,
+    method: &str,
+    parts: &[&str],
+    body: &[u8],
+) -> Option<(u16, WriteOut)> {
+    let ["v1", "accounts", "orgs", org, "layouts", page, tail @ ..] = parts else {
+        return None;
+    };
+    if *org != ctx.account_id || ctx.account_id.is_empty() {
+        return Some(out(not_found("account")));
+    }
+    let Some(store) = ctx.state.store() else {
+        return Some(out(layouts::no_store()));
+    };
+    let (answer, audit) = match (method, tail) {
+        ("PUT", []) => layouts::set(store, person, page, body),
+        ("POST", ["reset"]) => layouts::reset(store, person, page, body),
+        _ => return Some(out(read_only())),
+    };
+    Some(match audit {
+        Some((action, target, outcome)) => noted(answer, &action, &target, &outcome, ""),
+        None => out(answer),
+    })
+}
+
 /// A POST or PUT on the local API, by `person`.
 pub(super) async fn write(
     ctx: &Context,
@@ -756,6 +796,9 @@ pub(super) async fn write(
 ) -> (u16, WriteOut) {
     let parts: Vec<&str> = path.trim_end_matches('/').split('/').skip(1).collect();
     let agent_id = ctx.state.snapshot().agent.agent_id.unwrap_or_default();
+    if let Some(done) = write_layout(ctx, person, method, &parts, body) {
+        return done;
+    }
     let ["v1", "accounts", "orgs", org, "agents", agent, rest @ ..] = parts.as_slice() else {
         return out(read_only());
     };

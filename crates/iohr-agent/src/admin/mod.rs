@@ -33,6 +33,7 @@ mod api;
 mod auth;
 mod configs;
 mod console;
+mod layouts;
 mod page;
 mod verify;
 

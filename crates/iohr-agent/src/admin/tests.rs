@@ -1772,3 +1772,108 @@ async fn a_verification_judges_each_claim_before_and_after() {
     let list = json_of(&send(addr, &get(base, &host, &auth)).await);
     assert_eq!(list["verifications"].as_array().unwrap().len(), 2);
 }
+
+/// Dashboard layouts (PRD 0024): the console's layouts API answered from the trial store,
+/// saved and read back with the machine's token, audited, and never in the egress ledger.
+#[tokio::test]
+async fn a_layout_is_kept_on_this_machine_through_the_public_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context_with_store(dir.path(), 1);
+    let token = ctx.token.clone().unwrap();
+    let audit = ctx.audit.clone();
+    let (addr, _stop) = start(ctx).await;
+    let host = addr.to_string();
+    let auth = bearer(&token);
+    let path = "/v1/accounts/orgs/acc_TEST/layouts/local.overview";
+    let ledger = |addr: SocketAddr| {
+        let auth = bearer(&token);
+        async move {
+            json_of(
+                &send(
+                    addr,
+                    &get("/v1/agents/agt_01TEST/ledger", &addr.to_string(), &auth),
+                )
+                .await,
+            )
+        }
+    };
+    let before = ledger(addr).await;
+
+    let v = json_of(&send(addr, &get(path, &host, &auth)).await);
+    assert_eq!(v["origin"], "default");
+    assert_eq!(
+        v["can_set_default"], true,
+        "the machine's token is the owner"
+    );
+    let saved = r#"{"scope":"person","widgets":[{"widget":"sent","span":6,"hidden":false}],"base_version":"0"}"#;
+    let r = send(addr, &put_json(path, &host, &auth, saved)).await;
+    assert_eq!(status(&r), 200, "{r}");
+    assert_eq!(json_of(&r)["layout"]["version"], "1");
+    let r = send(addr, &put_json(path, &host, &auth, saved)).await;
+    assert_eq!(status(&r), 409, "a stale save is a conflict: {r}");
+    let v = json_of(&send(addr, &get(path, &host, &auth)).await);
+    assert_eq!(v["origin"], "person");
+    assert_eq!(v["layout"]["widgets"][0]["widget"], "sent");
+    let list = json_of(
+        &send(
+            addr,
+            &get("/v1/accounts/orgs/acc_TEST/layouts", &host, &auth),
+        )
+        .await,
+    );
+    assert_eq!(list["mine"].as_array().map(Vec::len), Some(1));
+    let r = send(
+        addr,
+        &post_json(
+            &format!("{path}/reset"),
+            &host,
+            &auth,
+            r#"{"scope":"person"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(json_of(&r)["now"]["origin"], "default", "{r}");
+
+    // Another account's layouts are not found; nothing reached the ledger.
+    let r = send(
+        addr,
+        &get(
+            "/v1/accounts/orgs/acc_OTHER/layouts/local.overview",
+            &host,
+            &auth,
+        ),
+    )
+    .await;
+    assert_eq!(status(&r), 404);
+    assert_eq!(ledger(addr).await["entries"], before["entries"]);
+    let actions: Vec<String> = audit
+        .unwrap()
+        .recent(20)
+        .into_iter()
+        .map(|e| e.action)
+        .collect();
+    assert!(
+        actions.iter().any(|a| a == "layout.set") && actions.iter().any(|a| a == "layout.reset"),
+        "{actions:?}"
+    );
+}
+
+/// Without the trial store there is nowhere to keep one: 501, and the console hides its editor.
+#[tokio::test]
+async fn without_the_store_layouts_say_so() {
+    let d = tempfile::tempdir().unwrap();
+    let ctx = context(d.path(), false);
+    let token = ctx.token.clone().unwrap();
+    let (addr, _stop) = start(ctx).await;
+    let host = addr.to_string();
+    let r = send(
+        addr,
+        &get(
+            "/v1/accounts/orgs/acc_TEST/layouts/local.overview",
+            &host,
+            &bearer(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status(&r), 501, "{r}");
+}
