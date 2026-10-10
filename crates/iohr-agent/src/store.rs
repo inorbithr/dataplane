@@ -644,7 +644,9 @@ impl Store {
                  FROM layouts WHERE who = '' OR who = ?1 ORDER BY page, who",
             )
             .map_err(sql)?;
-        let rows = stmt.query_map(params![who], LayoutRow::from_row).map_err(sql)?;
+        let rows = stmt
+            .query_map(params![who], LayoutRow::from_row)
+            .map_err(sql)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(sql)
     }

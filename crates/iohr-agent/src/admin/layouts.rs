@@ -34,13 +34,12 @@ fn is_id(s: &str) -> bool {
     !b.is_empty()
         && b.len() <= MAX_ID
         && b[0].is_ascii_lowercase()
-        && b
-            .iter()
+        && b.iter()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"-_.".contains(c))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct Widget {
+struct Placed {
     widget: String,
     #[serde(default)]
     span: i32,
@@ -53,7 +52,7 @@ struct SetBody {
     #[serde(default)]
     scope: String,
     #[serde(default)]
-    widgets: Vec<Widget>,
+    widgets: Vec<Placed>,
     /// int64 travels as a string on the public API; a number is taken too.
     #[serde(default)]
     base_version: Value,
@@ -69,11 +68,11 @@ fn invalid(msg: &str) -> Answer {
     error(400, "invalid_argument", msg)
 }
 
-fn checked(widgets: &[Widget]) -> Result<Vec<Widget>, Answer> {
+fn checked(widgets: &[Placed]) -> Result<Vec<Placed>, Answer> {
     if widgets.len() > MAX_WIDGETS {
         return Err(invalid(&format!("widgets: at most {MAX_WIDGETS}")));
     }
-    let mut out: Vec<Widget> = Vec::with_capacity(widgets.len());
+    let mut out: Vec<Placed> = Vec::with_capacity(widgets.len());
     for (i, w) in widgets.iter().enumerate() {
         let id = w.widget.trim();
         if !is_id(id) {
@@ -91,7 +90,7 @@ fn checked(widgets: &[Widget]) -> Result<Vec<Widget>, Answer> {
                 "widgets[{i}].widget: {id} is on the page twice"
             )));
         }
-        out.push(Widget {
+        out.push(Placed {
             widget: id.to_owned(),
             span: w.span,
             hidden: w.hidden,
@@ -136,7 +135,7 @@ fn may_set_default(person: &Person) -> bool {
 }
 
 fn view(r: &LayoutRow) -> Value {
-    let widgets: Vec<Widget> = serde_json::from_str(&r.widgets).unwrap_or_default();
+    let widgets: Vec<Placed> = serde_json::from_str(&r.widgets).unwrap_or_default();
     json!({
         "page": r.page,
         "scope": if r.who.is_empty() { "account" } else { "person" },
@@ -219,7 +218,11 @@ pub(super) fn set(store: &Store, person: &Person, page: &str, body: &[u8]) -> Do
                 "changing this agent's default layout needs the admin role",
             ));
         }
-        let who = if scope == "account" { "" } else { person.who.as_str() };
+        let who = if scope == "account" {
+            ""
+        } else {
+            person.who.as_str()
+        };
         let text = serde_json::to_string(&widgets).unwrap_or_else(|_| "[]".into());
         match store.set_layout(page, who, &text, base, &person.who) {
             Ok(Ok(row)) => Ok((
@@ -229,7 +232,9 @@ pub(super) fn set(store: &Store, person: &Person, page: &str, body: &[u8]) -> Do
             Ok(Err(current)) => Err(error(
                 409,
                 "aborted",
-                &format!("someone saved this layout since (version {current}); read it again and save on that"),
+                &format!(
+                    "someone saved this layout since (version {current}); read it again and save on that"
+                ),
             )),
             Err(e) => Err(error(500, "internal", &e.to_string())),
         }
@@ -254,12 +259,19 @@ pub(super) fn reset(store: &Store, person: &Person, page: &str, body: &[u8]) -> 
                 "changing this agent's default layout needs the admin role",
             ));
         }
-        let who = if scope == "account" { "" } else { person.who.as_str() };
+        let who = if scope == "account" {
+            ""
+        } else {
+            person.who.as_str()
+        };
         store
             .reset_layout(page, who)
             .map_err(|e| error(500, "internal", &e.to_string()))?;
         let v = now(store, person, page)?;
-        Ok((ok(&json!({"now": v, "where": "agent"})), format!("{page} ({scope})")))
+        Ok((
+            ok(&json!({"now": v, "where": "agent"})),
+            format!("{page} ({scope})"),
+        ))
     };
     match run() {
         Ok((a, target)) => (a, Some(("layout.reset".into(), target, "ok".into()))),
@@ -325,7 +337,10 @@ mod tests {
         let (a, _) = set(&store, &boss, page, &put(mine, "account", "0"));
         assert_eq!(a.0, 200);
         let v = body(&get(&store, &boss, page));
-        assert_eq!((v["origin"].as_str(), v["can_set_default"].as_bool()), (Some("account"), Some(true)));
+        assert_eq!(
+            (v["origin"].as_str(), v["can_set_default"].as_bool()),
+            (Some("account"), Some(true))
+        );
         let v = body(&list(&store, &ana));
         assert_eq!(v["mine"].as_array().map(Vec::len), Some(1));
         assert_eq!(v["account"].as_array().map(Vec::len), Some(1));
@@ -354,8 +369,15 @@ mod tests {
         assert_eq!(get(&store, &p, "../x").0, 400);
         let (a, _) = set(&store, &p, "local.overview", &put("[]", "team", "0"));
         assert!(a.1.contains("scope"));
-        let many: Vec<String> = (0..=MAX_WIDGETS).map(|i| format!(r#"{{"widget":"w{i}"}}"#)).collect();
-        let (a, _) = set(&store, &p, "local.overview", &put(&format!("[{}]", many.join(",")), "person", "0"));
+        let many: Vec<String> = (0..=MAX_WIDGETS)
+            .map(|i| format!(r#"{{"widget":"w{i}"}}"#))
+            .collect();
+        let (a, _) = set(
+            &store,
+            &p,
+            "local.overview",
+            &put(&format!("[{}]", many.join(",")), "person", "0"),
+        );
         assert_eq!(a.0, 400);
     }
 }

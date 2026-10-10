@@ -757,6 +757,35 @@ struct ReasonBody {
     reason: String,
 }
 
+/// Dashboard layouts (PRD 0024): the person's own, or this agent's default; `None` when
+/// the path is not a layout's.
+fn write_layout(
+    ctx: &Context,
+    person: &Person,
+    method: &str,
+    parts: &[&str],
+    body: &[u8],
+) -> Option<(u16, WriteOut)> {
+    let ["v1", "accounts", "orgs", org, "layouts", page, tail @ ..] = parts else {
+        return None;
+    };
+    if *org != ctx.account_id || ctx.account_id.is_empty() {
+        return Some(out(not_found("account")));
+    }
+    let Some(store) = ctx.state.store() else {
+        return Some(out(layouts::no_store()));
+    };
+    let (answer, audit) = match (method, tail) {
+        ("PUT", []) => layouts::set(store, person, page, body),
+        ("POST", ["reset"]) => layouts::reset(store, person, page, body),
+        _ => return Some(out(read_only())),
+    };
+    Some(match audit {
+        Some((action, target, outcome)) => noted(answer, &action, &target, &outcome, ""),
+        None => out(answer),
+    })
+}
+
 /// A POST or PUT on the local API, by `person`.
 pub(super) async fn write(
     ctx: &Context,
@@ -767,23 +796,8 @@ pub(super) async fn write(
 ) -> (u16, WriteOut) {
     let parts: Vec<&str> = path.trim_end_matches('/').split('/').skip(1).collect();
     let agent_id = ctx.state.snapshot().agent.agent_id.unwrap_or_default();
-    // Dashboard layouts (PRD 0024): the person's own, or this agent's default.
-    if let ["v1", "accounts", "orgs", org, "layouts", page, tail @ ..] = parts.as_slice() {
-        if *org != ctx.account_id || ctx.account_id.is_empty() {
-            return out(not_found("account"));
-        }
-        let Some(store) = ctx.state.store() else {
-            return out(layouts::no_store());
-        };
-        let (answer, audit) = match (method, tail) {
-            ("PUT", []) => layouts::set(store, person, page, body),
-            ("POST", ["reset"]) => layouts::reset(store, person, page, body),
-            _ => return out(read_only()),
-        };
-        return match audit {
-            Some((action, target, outcome)) => noted(answer, &action, &target, &outcome, ""),
-            None => out(answer),
-        };
+    if let Some(done) = write_layout(ctx, person, method, &parts, body) {
+        return done;
     }
     let ["v1", "accounts", "orgs", org, "agents", agent, rest @ ..] = parts.as_slice() else {
         return out(read_only());
