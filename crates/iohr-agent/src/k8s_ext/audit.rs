@@ -146,6 +146,6 @@ mod tests {
             r.iter().map(|l| l.outcome).collect::<Vec<_>>(),
             [Outcome::Refused, Outcome::Denied]
         );
-        assert!(recent(&d.path().join("none"), 5).is_empty());
+        assert_eq!(recent(&d.path().join("none"), 5), []);
     }
 }

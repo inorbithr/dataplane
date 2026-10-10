@@ -131,7 +131,7 @@ fn images(v: &Value) -> Vec<String> {
         .map(|cs| {
             cs.iter()
                 .filter_map(|c| c.get("image").and_then(Value::as_str))
-                .map(|i| crate::redact::redact(i))
+                .map(crate::redact::redact)
                 .collect()
         })
         .unwrap_or_default()
@@ -263,7 +263,7 @@ pub fn rollout(deployment: &str, replicasets: &[Value]) -> Vec<Revision> {
             })
         })
         .collect();
-    out.sort_by(|a, b| b.revision.cmp(&a.revision));
+    out.sort_by_key(|r| std::cmp::Reverse(r.revision));
     out
 }
 

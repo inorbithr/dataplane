@@ -84,7 +84,7 @@ pub enum Command {
 /// `k8s …`.
 #[derive(Debug, Subcommand)]
 pub enum K8sCommand {
-    /// Print the least-privilege RBAC (ServiceAccount, Role and RoleBinding per namespace;
+    /// Print the least-privilege RBAC (service account, Role and role binding per namespace;
     /// get, list and watch only) for you to review and apply. The agent never applies it.
     Rbac(K8sRbacArgs),
     /// Read workloads, pods, rollouts and events in the policy's namespaces as typed
@@ -101,10 +101,10 @@ pub struct K8sRbacArgs {
     /// A kind to allow; repeat for more (default: the policy's, else all the extension reads).
     #[arg(long = "kind")]
     pub kinds: Vec<String>,
-    /// The ServiceAccount's name.
+    /// The service account's name.
     #[arg(long, default_value = "iohr-k8s-reader")]
     pub service_account: String,
-    /// The namespace the ServiceAccount lives in (where the agent runs).
+    /// The namespace the service account lives in (where the agent runs).
     #[arg(long, default_value = "inorbit")]
     pub service_account_namespace: String,
     /// The policy (default: the one agent.toml names, if any).
@@ -118,7 +118,7 @@ pub struct K8sReadArgs {
     /// Only this namespace (it must be in the policy); repeat for more.
     #[arg(long = "namespace", short = 'n')]
     pub namespaces: Vec<String>,
-    /// Use the pod's own ServiceAccount (the agent runs in the cluster).
+    /// Use the pod's own service account (the agent runs in the cluster).
     #[arg(long, conflicts_with_all = ["kubeconfig", "context"])]
     pub in_cluster: bool,
     /// The kubeconfig (default: `$KUBECONFIG`, else ~/.kube/config).
@@ -1033,15 +1033,13 @@ fn k8s_rbac(args: &K8sRbacArgs, config_path: &Path) -> Result<ExitCode> {
             "name the namespaces with --namespace, or in the policy's [kubernetes]".into(),
         ));
     }
-    print!(
-        "{}",
-        rbac::generate(&rbac::Request {
-            namespaces: &namespaces,
-            kinds: &kinds,
-            account: &args.service_account,
-            account_namespace: &args.service_account_namespace,
-        })?
-    );
+    let yaml = rbac::generate(&rbac::Request {
+        namespaces: &namespaces,
+        kinds: &kinds,
+        account: &args.service_account,
+        account_namespace: &args.service_account_namespace,
+    })?;
+    out(yaml.trim_end());
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1117,7 +1115,13 @@ async fn k8s_read(args: &K8sReadArgs, config_path: &Path) -> Result<ExitCode> {
         out(&serde_json::to_string_pretty(&ev).unwrap_or_default());
         return Ok(ExitCode::SUCCESS);
     }
-    out(&format!("{} — read-only, as {}", ev.server, ctx.user));
+    print_k8s_facts(&ev, &ctx.user);
+    out(&format!("\nqueries recorded in {}", state.display()));
+    Ok(ExitCode::SUCCESS)
+}
+
+fn print_k8s_facts(ev: &crate::k8s_ext::read::Evidence, user: &str) {
+    out(&format!("{} — read-only, as {}", ev.server, user));
     for ns in &ev.namespaces {
         out(&format!("\nnamespace {}", ns.namespace));
         for w in &ns.workloads {
@@ -1177,8 +1181,6 @@ async fn k8s_read(args: &K8sReadArgs, config_path: &Path) -> Result<ExitCode> {
             ));
         }
     }
-    out(&format!("\nqueries recorded in {}", state.display()));
-    Ok(ExitCode::SUCCESS)
 }
 
 fn out(line: &str) {

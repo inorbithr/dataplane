@@ -36,7 +36,7 @@ const MAX_ANSWER: usize = 32 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// The method every reading here carries.
 pub const METHOD: &str = "k8s.api.read";
-/// Where Kubernetes mounts a pod's ServiceAccount.
+/// Where Kubernetes mounts a pod's service account.
 const SA_MOUNT: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
 
 /// A kubeconfig, reduced to what one context needs.
@@ -258,7 +258,7 @@ impl KubeContext {
         })
     }
 
-    /// The pod's own ServiceAccount: the token and CA Kubernetes mounts into every pod
+    /// The pod's own service account: the token and CA Kubernetes mounts into every pod
     /// that asks for them, and the API server from `KUBERNETES_SERVICE_HOST`/`_PORT`.
     ///
     /// # Errors

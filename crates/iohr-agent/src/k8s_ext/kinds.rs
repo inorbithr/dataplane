@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 
 /// A kind of object the extension reads. All namespaced; cluster-wide kinds (nodes) need a
-/// ClusterRole and come later (RFC 0112, slice 3).
+/// cluster role and come later (RFC 0112, slice 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
@@ -149,7 +149,9 @@ pub fn guard(path: &str) -> Result<()> {
     };
     let (p, query) = path.split_once('?').unwrap_or((path, ""));
     if !query.is_empty()
-        && !(query.starts_with("limit=") && query[6..].bytes().all(|b| b.is_ascii_digit()))
+        && query
+            .strip_prefix("limit=")
+            .is_none_or(|n| n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()))
     {
         return refuse("only ?limit= is asked");
     }
@@ -165,10 +167,8 @@ pub fn guard(path: &str) -> Result<()> {
             return refuse("a forbidden resource");
         }
     }
-    let rest = match segs.as_slice() {
-        ["api", "v1", rest @ ..] => rest,
-        ["apis", "apps", "v1", rest @ ..] => rest,
-        _ => return refuse("not a core or apps/v1 path"),
+    let (["api", "v1", rest @ ..] | ["apis", "apps", "v1", rest @ ..]) = segs.as_slice() else {
+        return refuse("not a core or apps/v1 path");
     };
     match rest {
         ["namespaces", ns, res] if valid_name(ns) => {

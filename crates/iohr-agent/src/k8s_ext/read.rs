@@ -329,16 +329,16 @@ mod tests {
     async fn reads_facts_maps_403_to_denied_and_records_every_query() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let url = fake(seen.clone()).await;
-        let p = policy("");
-        let d = tempfile::tempdir().unwrap();
-        let r = reader(&url, &p, d.path()).await;
-        let e = r.read_all().await.unwrap();
-        let ns = &e.namespaces[0];
+        let pol = policy("");
+        let dir = tempfile::tempdir().unwrap();
+        let rd = reader(&url, &pol, dir.path()).await;
+        let ev = rd.read_all().await.unwrap();
+        let ns = &ev.namespaces[0];
         assert_eq!(ns.workloads.len(), 1);
         assert!(ns.workloads[0].healthy());
         assert_eq!(ns.rollouts[0].revision, 2);
         assert_eq!(ns.denied, [Kind::Pods]);
-        assert!(ns.pods.is_empty());
+        assert_eq!(ns.pods, []);
         let msg = &ns.events[0].message;
         assert!(
             !msg.contains("Zx9!kq2Lr8") && !msg.contains("10.0.0.7"),
@@ -353,9 +353,9 @@ mod tests {
                 "{s}"
             );
         }
-        let v = crate::ledger::verify(&d.path().join("ledger"));
+        let v = crate::ledger::verify(&dir.path().join("ledger"));
         assert!(v.ok() && v.entries == seen.len() as u64, "{v:?}");
-        let audit = super::super::audit::recent(d.path(), 50);
+        let audit = super::super::audit::recent(dir.path(), 50);
         assert_eq!(audit.len(), seen.len());
         assert!(
             audit
