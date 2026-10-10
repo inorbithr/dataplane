@@ -406,7 +406,7 @@ mod tests {
     #[test]
     fn a_syntax_error_is_placed_where_the_parser_stopped() {
         let mut p = vec![Problem::error("", "bad")];
-        locate("[work]\nchecks = tru\n", &mut p);
+        locate("[work]\nchecks = yes\n", &mut p);
         assert_eq!(p[0].line, Some(2));
         assert!(p[0].column.is_some());
     }
