@@ -1267,6 +1267,25 @@ async fn a_config_change_is_checked_applied_versioned_and_rolled_back() {
     );
     assert_eq!(v["valid"], true, "{v}");
     assert_eq!(v["diff"]["added"], 1);
+    // The file as the agent parses it, for the form view.
+    assert_eq!(v["model"]["check"][0]["every"], "120s", "{v}");
+
+    // A value the console hid is never written back in place of the real one.
+    let hidden = CHECKS.replace("every = \"60s\"", "every = \"[redacted]\"");
+    let h = json_of(
+        &send(
+            addr,
+            &post_json(
+                &format!("{CHECKS_PATH}/validate"),
+                &host,
+                &auth,
+                &serde_json::json!({"text": hidden}).to_string(),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(h["valid"], false, "{h}");
+    assert!(h["problems"][0]["line"].as_u64().is_some(), "{h}");
 
     // A good one: applied, the agent reloaded, a version and an audit line.
     let good =

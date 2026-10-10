@@ -65,6 +65,12 @@ pub(super) struct Problem {
     /// The entry it is about (a check's name), or "".
     pub entry: String,
     pub message: String,
+    /// The line it points at, from 1, when it can be placed (the editor marks it there).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+    /// The column on that line, from 1, when the parser gave one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column: Option<usize>,
 }
 
 impl Problem {
@@ -73,19 +79,144 @@ impl Problem {
             level: "error",
             entry: entry.to_owned(),
             message: m.into(),
+            line: None,
+            column: None,
         }
     }
     fn warning(entry: &str, m: impl Into<String>) -> Self {
         Self {
             level: "warning",
-            entry: entry.to_owned(),
-            message: m.into(),
+            ..Self::error(entry, m)
         }
     }
 }
 
+/// Line and column (from 1) of byte `at` in `text`.
+fn line_col(text: &str, at: usize) -> (usize, usize) {
+    let before = &text[..text.floor_char_boundary(at.min(text.len()))];
+    let line = before.matches('\n').count() + 1;
+    let col = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+    (line, col)
+}
+
+/// The key a message is about: a backticked name (the parser's ``unknown field `x` ``),
+/// or the word it starts with when that word is followed by ` =` or `:`.
+fn key_of(message: &str) -> Option<&str> {
+    if let Some(i) = message.find('`')
+        && let Some(j) = message[i + 1..].find('`')
+    {
+        return Some(&message[i + 1..i + 1 + j]);
+    }
+    let word: &str = message
+        .split([' ', ':', '='])
+        .next()
+        .filter(|w| !w.is_empty() && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))?;
+    let rest = message[word.len()..].trim_start();
+    (rest.starts_with('=') || rest.starts_with(':')).then_some(word)
+}
+
+/// The key on a `key = value` line, or None.
+fn line_key(line: &str) -> Option<&str> {
+    let (k, _) = line.split_once('=')?;
+    let k = k.trim();
+    (!k.is_empty() && !k.starts_with('#') && !k.starts_with('[')).then_some(k)
+}
+
+/// Places each problem on a line: a syntax error where the parser stopped, an entry's
+/// problem on the key it names inside that entry's block (else the block's header), and
+/// a file-level problem that names a `[section]` or a key on that line.
+pub(super) fn locate(text: &str, problems: &mut [Problem]) {
+    let lines: Vec<&str> = text.lines().collect();
+    // Each [[check]] / [[refuse]] block: (header line index, end, its name).
+    let mut blocks: Vec<(usize, usize, String)> = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.trim();
+        if t.starts_with('[') {
+            if let Some(b) = blocks.last_mut()
+                && b.1 == usize::MAX
+            {
+                b.1 = i;
+            }
+            if t.starts_with("[[") {
+                blocks.push((i, usize::MAX, String::new()));
+            }
+        } else if line_key(t) == Some("name")
+            && let Some(b) = blocks.last_mut()
+            && b.1 == usize::MAX
+            && let Some(v) = t.split_once('=').map(|(_, v)| v.trim())
+            && let Ok(name) = toml::from_str::<toml::Table>(&format!("n = {v}"))
+        {
+            name["n"].as_str().unwrap_or_default().clone_into(&mut b.2);
+        }
+    }
+    let syntax = toml::from_str::<toml::Table>(text).err();
+    for p in problems.iter_mut().filter(|p| p.line.is_none()) {
+        if let Some(e) = &syntax
+            && let Some(span) = e.span()
+        {
+            let (l, c) = line_col(text, span.start);
+            p.line = Some(l);
+            p.column = Some(c);
+            continue;
+        }
+        let key = key_of(&p.message);
+        let (from, to) = blocks
+            .iter()
+            .find(|b| !p.entry.is_empty() && b.2 == p.entry)
+            .map_or((0, lines.len()), |b| (b.0, b.1.min(lines.len())));
+        let hit = key.and_then(|k| {
+            (from..to).find(|&i| {
+                let t = lines[i].trim();
+                line_key(t) == Some(k) || t == format!("[{k}]")
+            })
+        });
+        let section = p.message.find('[').and_then(|i| {
+            let s = &p.message[i..];
+            let end = s.find(']')?;
+            let header = &s[..=end];
+            lines.iter().position(|l| l.trim() == header)
+        });
+        p.line = hit
+            .or(if p.entry.is_empty() {
+                section
+            } else {
+                Some(from)
+            })
+            .map(|i| i + 1);
+    }
+}
+
+/// The document as plain JSON, for the console's form view; null when it does not parse.
+pub(super) fn model(text: &str) -> serde_json::Value {
+    toml::from_str::<toml::Table>(text)
+        .ok()
+        .and_then(|t| serde_json::to_value(t).ok())
+        .unwrap_or(serde_json::Value::Null)
+}
+
 /// Checks `text` as `name` would be checked when the agent starts.
 pub(super) fn validate(ctx: &Context, name: &str, text: &str) -> Vec<Problem> {
+    let mut out = validate_unplaced(ctx, name, text);
+    locate(text, &mut out);
+    out
+}
+
+fn validate_unplaced(ctx: &Context, name: &str, text: &str) -> Vec<Problem> {
+    // The console showed this file through the redactor: a value it hid must not be
+    // written back in place of the real one.
+    if let Some(at) = text.find(crate::redact::MARK) {
+        let mut p = Problem::error(
+            "",
+            format!(
+                "{} stands where the console hid a value; change that value on the machine itself",
+                crate::redact::MARK
+            ),
+        );
+        let (l, c) = line_col(text, at);
+        p.line = Some(l);
+        p.column = Some(c);
+        return vec![p];
+    }
     if text.len() > MAX_TEXT {
         return vec![Problem::error(
             "",
@@ -256,6 +387,52 @@ pub(super) fn export(ctx: &Context) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CHECKS: &str = "# watched\n[[check]]\nname = \"web\"\ntarget = \"https://example.com\"\nevery = \"60s\"\n\n[[check]]\nname = \"api\"\ntarget = \"https://example.com/api\"\nevery = \"5s\"\nfoo = 1\n";
+
+    #[test]
+    fn problems_are_placed_on_their_lines() {
+        let mut p = vec![
+            Problem::error("api", "every = \"5s\": must be 60s to 24h"),
+            Problem::error("api", "unknown field `foo`, expected one of …"),
+            Problem::error("api", "missing field `rfc`"),
+            Problem::error("web", "the target answers nothing"),
+        ];
+        locate(CHECKS, &mut p);
+        let lines: Vec<_> = p.iter().map(|p| p.line).collect();
+        assert_eq!(lines, [Some(10), Some(11), Some(7), Some(2)]);
+    }
+
+    #[test]
+    fn a_syntax_error_is_placed_where_the_parser_stopped() {
+        let mut p = vec![Problem::error("", "bad")];
+        locate("[work]\nchecks = tru\n", &mut p);
+        assert_eq!(p[0].line, Some(2));
+        assert!(p[0].column.is_some());
+    }
+
+    #[test]
+    fn a_section_named_in_a_message_is_found() {
+        let mut p = vec![Problem::warning(
+            "",
+            "[later] is not a section this agent version knows",
+        )];
+        locate("environment = \"x\"\n\n[later]\na = 1\n", &mut p);
+        assert_eq!(p[0].line, Some(3));
+    }
+
+    #[test]
+    fn a_value_the_console_hid_is_never_written_back() {
+        let mut p = vec![Problem::error("", "x")];
+        locate("a = 1\nb = [redacted]\n", &mut p);
+        assert_eq!(p[0].line, Some(2));
+    }
+
+    #[test]
+    fn the_model_is_the_document_as_json() {
+        assert_eq!(model(CHECKS)["check"][1]["every"], "5s");
+        assert!(model("a = ").is_null());
+    }
 
     #[test]
     fn the_diff_is_minimal() {

@@ -777,6 +777,7 @@ pub(super) async fn write(
                 "valid": problems.iter().all(|p| p.level != "error"),
                 "diff": configs::diff_json(&now, &b.text),
                 "sha": configs::sha(&now),
+                "model": configs::model(&b.text),
             })))
         }
         ("PUT", ["config", "files", name]) => {
