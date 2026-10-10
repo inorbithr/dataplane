@@ -58,6 +58,9 @@ pub enum Error {
     /// An Atlas observer could not read what it was asked to, or could not build a record.
     #[error("atlas: {0}")]
     Atlas(String),
+    /// The local trial store (`store.rs`) could not be opened, read or written.
+    #[error("trial store: {0}")]
+    Store(String),
 }
 
 impl Error {

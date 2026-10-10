@@ -29,7 +29,12 @@
 //! - **Bounded**: 8 KiB of request headers, no bodies, 5 s to send them, 10 s per write,
 //!   64 connections, a token bucket per client address, embedded assets only.
 
+mod api;
+mod auth;
+mod configs;
+mod console;
 mod page;
+mod verify;
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -65,18 +70,27 @@ const MAX_CONNECTIONS: usize = 64;
 const BURST: f64 = 40.0;
 /// Requests a client may make per second, sustained.
 const PER_SECOND: f64 = 10.0;
+/// Every connection, the console's files included (a page of the console loads a few dozen
+/// small files): a looser bucket checked before the request is read.
+const CONN_BURST: f64 = 400.0;
+/// Connections a client may open per second, sustained.
+const CONN_PER_SECOND: f64 = 100.0;
 /// Client addresses tracked by the rate limit.
 const MAX_CLIENTS: usize = 1024;
-/// Browser sessions kept after `/auth`.
-const MAX_SESSIONS: usize = 16;
-/// How long one lasts.
-const SESSION_TTL: Duration = Duration::from_hours(12);
+/// Browser sessions kept at once.
+const MAX_SESSIONS: usize = 64;
+/// How long one lasts at most (the cookie's own lifetime).
+const SESSION_TTL: Duration = auth::ABSOLUTE;
 /// The session cookie.
 const COOKIE: &str = "iohr_agent_page";
 /// The token file in the state directory.
 pub const TOKEN_FILE: &str = "admin.token";
 /// The only paths that take a POST.
 const CHANGE_PATHS: [&str; 2] = ["/policy/share", "/policy/reload"];
+/// The sign-in forms: the machine's token, and signing out.
+const AUTH_FORMS: [&str; 2] = ["/auth", "/auth/logout"];
+/// The largest JSON body a local API write takes (a managed file and its reason).
+const MAX_JSON: usize = configs::MAX_TEXT + 16 * 1024;
 /// The largest form accepted.
 const MAX_FORM: usize = 512;
 /// How long a change waits for the agent to reload.
@@ -122,6 +136,18 @@ pub struct Context {
     pub share_key: Vec<u8>,
     /// The policy file `[share]` is written to.
     pub policy_path: std::path::PathBuf,
+    /// The account this agent belongs to: the `{org_id}` the local API answers for.
+    pub account_id: String,
+    /// The checks file the console edits.
+    pub checks_path: std::path::PathBuf,
+    /// The local audit log (RFC 0100.2), when it could be opened.
+    pub audit: Option<Arc<crate::audit::Audit>>,
+    /// For the company's identity provider (sign-in) only.
+    pub http: Option<reqwest::Client>,
+    /// Resolves `[console.oidc] client_secret`.
+    pub secrets: Option<crate::secrets::SecretResolver>,
+    /// The extensions lock this generation runs with.
+    pub lock: crate::extensions::Lock,
 }
 
 impl std::fmt::Debug for Context {
@@ -140,8 +166,10 @@ struct Server {
     ctx: watch::Receiver<Arc<Context>>,
     local: Option<SocketAddr>,
     tls: bool,
-    sessions: Mutex<Vec<(String, Instant)>>,
+    sessions: Mutex<Vec<auth::Session>>,
+    pending: Mutex<Vec<auth::Pending>>,
     buckets: Mutex<HashMap<IpAddr, (f64, Instant)>>,
+    conn_buckets: Mutex<HashMap<IpAddr, (f64, Instant)>>,
     slots: Arc<Semaphore>,
 }
 
@@ -238,7 +266,9 @@ pub async fn serve_watch(
         local: listener.local_addr().ok(),
         tls: tls.is_some(),
         sessions: Mutex::new(Vec::new()),
+        pending: Mutex::new(Vec::new()),
         buckets: Mutex::new(HashMap::new()),
+        conn_buckets: Mutex::new(HashMap::new()),
         slots: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
     });
     loop {
@@ -355,12 +385,14 @@ fn parse(buf: &[u8]) -> std::result::Result<Request, (u16, &'static str)> {
         Some(Ok(n)) => n,
         Some(Err(_)) => return Err((400, "bad request")),
     };
-    let form_post = req.method == "POST" && CHANGE_PATHS.contains(&req.path.as_str());
-    if req.header("transfer-encoding").is_some() || (len > 0 && !form_post) {
+    let form_post = req.method == "POST"
+        && (CHANGE_PATHS.contains(&req.path.as_str()) || AUTH_FORMS.contains(&req.path.as_str()));
+    let json_write = matches!(req.method.as_str(), "POST" | "PUT") && api::is_api(&req.path);
+    if req.header("transfer-encoding").is_some() || (len > 0 && !form_post && !json_write) {
         return Err((413, "request bodies are not accepted"));
     }
-    if len > MAX_FORM {
-        return Err((413, "the form is too large"));
+    if (form_post && len > MAX_FORM) || (json_write && len > MAX_JSON) {
+        return Err((413, "the body is too large"));
     }
     req.content_length = len;
     Ok(req)
@@ -403,9 +435,26 @@ impl Server {
             .is_some_and(|h| self.host_allowed(h))
     }
 
-    /// A token bucket per client address.
+    /// The page's token bucket per client address: every request but the console's files.
     fn rate_ok(&self, ip: IpAddr) -> bool {
-        let mut b = match self.buckets.lock() {
+        bucket_ok(&self.buckets, ip, BURST, PER_SECOND)
+    }
+
+    /// The looser bucket every connection takes from, before its request is read.
+    fn conn_rate_ok(&self, ip: IpAddr) -> bool {
+        bucket_ok(&self.conn_buckets, ip, CONN_BURST, CONN_PER_SECOND)
+    }
+}
+
+/// A token bucket per client address in `buckets`: `burst` at most, `per_second` back.
+fn bucket_ok(
+    buckets: &Mutex<HashMap<IpAddr, (f64, Instant)>>,
+    ip: IpAddr,
+    burst: f64,
+    per_second: f64,
+) -> bool {
+    {
+        let mut b = match buckets.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
@@ -416,9 +465,9 @@ impl Server {
                 return false;
             }
         }
-        let (tokens, last) = b.entry(ip).or_insert((BURST, now));
-        let refill = now.duration_since(*last).as_secs_f64() * PER_SECOND;
-        *tokens = (*tokens + refill).min(BURST);
+        let (tokens, last) = b.entry(ip).or_insert((burst, now));
+        let refill = now.duration_since(*last).as_secs_f64() * per_second;
+        *tokens = (*tokens + refill).min(burst);
         *last = now;
         if *tokens < 1.0 {
             return false;
@@ -426,8 +475,12 @@ impl Server {
         *tokens -= 1.0;
         true
     }
+}
 
-    fn session_ok(&self, req: &Request) -> bool {
+impl Server {
+    /// Who is asking: the machine's token as a bearer (the CLI), or a live session's
+    /// cookie (a browser), with the session's id. A session's idle time restarts here.
+    fn person(&self, req: &Request) -> Option<(Option<String>, auth::Person)> {
         // A local client (`iohr agent status`) may present the token itself. A browser
         // cannot add this header cross-site without a CORS preflight, which is never
         // answered.
@@ -436,30 +489,39 @@ impl Server {
                 .and_then(|a| a.strip_prefix("Bearer ")),
             &self.ctx().token,
         ) {
-            return constant_time_eq(token.as_bytes(), given.trim().as_bytes());
+            return constant_time_eq(token.as_bytes(), given.trim().as_bytes())
+                .then(|| (None, auth::Person::machine()));
         }
-        let Some(id) = req.cookie(COOKIE) else {
-            return false;
-        };
+        let id = req.cookie(COOKIE)?;
         let mut s = match self.sessions.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        s.retain(|(_, t)| t.elapsed() < SESSION_TTL);
+        s.retain(auth::Session::alive);
         // Compare against every session, each in constant time.
-        s.iter().fold(false, |ok, (k, _)| {
-            constant_time_eq(k.as_bytes(), id.as_bytes()) | ok
-        })
+        let mut found = None;
+        for (i, x) in s.iter().enumerate() {
+            if constant_time_eq(x.id.as_bytes(), id.as_bytes()) {
+                found = Some(i);
+            }
+        }
+        let i = found?;
+        s[i].last = Instant::now();
+        Some((Some(s[i].id.clone()), s[i].person.clone()))
+    }
+
+    fn session_ok(&self, req: &Request) -> bool {
+        self.person(req).is_some()
     }
 
     /// The form token for the session this request's cookie names.
     fn csrf(&self, req: &Request) -> Option<String> {
-        req.cookie(COOKIE)
-            .filter(|_| self.session_ok(req))
-            .map(csrf_for)
+        self.person(req)
+            .and_then(|(id, _)| id)
+            .map(|id| csrf_for(&id))
     }
 
-    fn new_session(&self) -> String {
+    fn new_session(&self, person: auth::Person) -> String {
         let mut raw = [0u8; 32];
         let _ = getrandom::fill(&mut raw);
         let id = raw.iter().fold(String::with_capacity(64), |mut s, b| {
@@ -470,11 +532,42 @@ impl Server {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
+        s.retain(auth::Session::alive);
         if s.len() >= MAX_SESSIONS {
             s.remove(0);
         }
-        s.push((id.clone(), Instant::now()));
+        let now = Instant::now();
+        s.push(auth::Session {
+            id: id.clone(),
+            person,
+            created: now,
+            last: now,
+        });
         id
+    }
+
+    fn end_session(&self, id: &str) {
+        let mut s = match self.sessions.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        s.retain(|x| !constant_time_eq(x.id.as_bytes(), id.as_bytes()));
+    }
+
+    fn audit(&self, p: &auth::Person, action: &str, target: &str, outcome: &str, reason: &str) {
+        if let Some(a) = &self.ctx().audit
+            && let Err(e) = a.record(crate::audit::Record {
+                who: &p.who,
+                name: &p.name,
+                role: p.role.as_str(),
+                action,
+                target,
+                outcome,
+                reason,
+            })
+        {
+            tracing::warn!(error = %e, "the audit log could not be written");
+        }
     }
 }
 
@@ -484,10 +577,16 @@ fn fetch_site_ok(req: &Request) -> bool {
     match req.header("sec-fetch-site") {
         None | Some("same-origin" | "none") => true,
         Some(_) => {
+            // A top-level navigation cannot read what it opens: the page's views, the
+            // console's pages (code, no data), and the identity provider sending the browser
+            // back to the sign-in callback, which is cross-site by nature (its `state` is the
+            // check there).
             req.method == "GET"
                 && req.header("sec-fetch-mode") == Some("navigate")
                 && req.header("sec-fetch-dest") == Some("document")
-                && page::is_html_route(&req.path)
+                && (page::is_html_route(&req.path)
+                    || console::is_console(&req.path)
+                    || req.path == "/auth/oidc/callback")
         }
     }
 }
@@ -520,7 +619,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
     peer: SocketAddr,
     srv: &Server,
 ) -> std::io::Result<()> {
-    if !srv.rate_ok(peer.ip()) {
+    if !srv.conn_rate_ok(peer.ip()) {
         return respond(
             &mut sock,
             srv,
@@ -560,6 +659,11 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         }
     };
     let head = req.method == "HEAD";
+    // The page's own budget for everything but the console's files, which a page of the
+    // console loads by the dozen (they took from the connection's bucket above).
+    if !console::is_console(&req.path) && !srv.rate_ok(peer.ip()) {
+        return respond(&mut sock, srv, 429, "text/plain", b"slow down\n", &[], head).await;
+    }
     // DNS rebinding: a page on another name that resolves here is refused.
     if !req.header("host").is_some_and(|h| srv.host_allowed(h)) {
         return respond(
@@ -601,6 +705,102 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         };
         return change(&mut sock, srv, &req, peer, &body).await;
     }
+    // The sign-in forms: the machine's token, and signing out.
+    if req.method == "POST" && AUTH_FORMS.contains(&req.path.as_str()) {
+        let Some(body) = read_body(&mut sock, &buf, req.content_length).await else {
+            return respond(
+                &mut sock,
+                srv,
+                400,
+                "text/plain",
+                b"bad request\n",
+                &[],
+                false,
+            )
+            .await;
+        };
+        return if req.path == "/auth" {
+            auth(&mut sock, srv, &req, Some(&body), false).await
+        } else {
+            logout(&mut sock, srv, &req).await
+        };
+    }
+    // Writes to the local API: a person with a role, and from a browser the session's
+    // CSRF token and this page's own origin.
+    if matches!(req.method.as_str(), "POST" | "PUT") && api::is_api(&req.path) {
+        let Some((sid, person)) = srv.person(&req) else {
+            let (code, body) = api::unauthenticated();
+            return respond(
+                &mut sock,
+                srv,
+                code,
+                "application/json",
+                body.as_bytes(),
+                &[],
+                false,
+            )
+            .await;
+        };
+        if let Some(sid) = &sid {
+            let token_ok = req
+                .header("x-csrf-token")
+                .is_some_and(|t| constant_time_eq(t.as_bytes(), csrf_for(sid).as_bytes()));
+            if !token_ok || req.header("origin").is_none() {
+                let (code, body) = api::forbidden("this change needs the page's own form token");
+                return respond(
+                    &mut sock,
+                    srv,
+                    code,
+                    "application/json",
+                    body.as_bytes(),
+                    &[],
+                    false,
+                )
+                .await;
+            }
+        }
+        let Some(body) = read_body(&mut sock, &buf, req.content_length).await else {
+            return respond(
+                &mut sock,
+                srv,
+                400,
+                "text/plain",
+                b"bad request\n",
+                &[],
+                false,
+            )
+            .await;
+        };
+        let ctx = srv.ctx();
+        let (code, out) = api::write(&ctx, &person, &req.method, &req.path, &body).await;
+        if let Some(a) = out.audit {
+            srv.audit(&person, &a.action, &a.target, &a.outcome, &a.reason);
+        }
+        let out = crate::redact::redact_json(&out.body);
+        return respond(
+            &mut sock,
+            srv,
+            code,
+            "application/json",
+            out.as_bytes(),
+            &[],
+            false,
+        )
+        .await;
+    }
+    if req.method != "GET" && !head && api::is_api(&req.path) {
+        let (code, body) = api::read_only();
+        return respond(
+            &mut sock,
+            srv,
+            code,
+            "application/json",
+            body.as_bytes(),
+            &[("Allow", "GET, HEAD, POST, PUT")],
+            false,
+        )
+        .await;
+    }
     if req.method != "GET" && !head {
         return respond(
             &mut sock,
@@ -627,10 +827,73 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
             )
             .await;
         }
-        "/auth" => return auth(&mut sock, srv, &req, head).await,
+        "/auth" => return auth(&mut sock, srv, &req, None, head).await,
+        "/auth/options" => {
+            let body = auth_options(&srv.ctx());
+            return respond(
+                &mut sock,
+                srv,
+                200,
+                "application/json",
+                body.as_bytes(),
+                &[],
+                head,
+            )
+            .await;
+        }
+        "/auth/oidc/start" => return oidc_start(&mut sock, srv, &req).await,
+        "/auth/oidc/callback" => return oidc_callback(&mut sock, srv, &req).await,
         _ => {}
     }
     let ctx = srv.ctx();
+    // The local API: always signed in, loopback too (RFC 0100.4 1.6).
+    if api::is_api(&req.path) {
+        let (code, body) = match srv.person(&req) {
+            Some((sid, person)) => {
+                let csrf = sid.as_deref().map(csrf_for);
+                api::route(&ctx, &req.path, &req.query, &person, csrf.as_deref())
+            }
+            None => api::unauthenticated(),
+        };
+        let body = crate::redact::redact_json(&body);
+        return respond(
+            &mut sock,
+            srv,
+            code,
+            "application/json",
+            body.as_bytes(),
+            &[],
+            head,
+        )
+        .await;
+    }
+    // The console bundle: code, no data (every datum comes through the API above, which
+    // always asks who is there), so its pages load for the sign-in page to show. It is an
+    // extension like any other (RFC 0073.1): served only when licence, policy and lock
+    // all admit `inorbit/console`.
+    if console::is_console(&req.path) {
+        if !crate::extensions::running("inorbit/console", &ctx.policy, &ctx.lock) {
+            return respond(
+                &mut sock,
+                srv,
+                404,
+                "text/plain",
+                b"the local console (inorbit/console) is not installed on this agent\n",
+                &[],
+                head,
+            )
+            .await;
+        }
+        let found = ctx
+            .admin
+            .console_dir
+            .as_deref()
+            .and_then(|dir| console::file(dir, &req.path));
+        return match found {
+            Some(f) => respond_csp(&mut sock, srv, 200, f.ctype, &f.body, &f.csp, head).await,
+            None => respond(&mut sock, srv, 404, "text/plain", b"not found\n", &[], head).await,
+        };
+    }
     if ctx.admin.token_required() && !srv.session_ok(&req) {
         let body = page::locked(&ctx);
         return respond(
@@ -660,29 +923,71 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         Some((ctype, body)) => {
             // Last line of defence: whatever reached the agent's memory, no secret
             // leaves through this page.
-            let body = crate::redact::redact(&body);
+            let body = if ctype.starts_with("application/json") {
+                crate::redact::redact_json(&body)
+            } else {
+                crate::redact::redact(&body)
+            };
             respond(&mut sock, srv, 200, ctype, body.as_bytes(), &[], head).await
         }
         None => respond(&mut sock, srv, 404, "text/plain", b"not found\n", &[], head).await,
     }
 }
 
-/// `/auth?token=…`: the token from `<state_dir>/admin.token` becomes a cookie for this
-/// browser (`HttpOnly`, SameSite=Strict, Secure over TLS), then back to the page.
+/// Where a sign-in goes back to: a console page that asked, never anywhere else.
+fn next_of(n: Option<String>) -> String {
+    n.filter(|n| console::is_console(n) && !n.contains("//") && !n.contains('\\'))
+        .unwrap_or_else(|| "/".to_owned())
+}
+
+/// The session cookie for `id`, or one that clears it.
+fn session_cookie(srv: &Server, id: &str, max_age: u64) -> String {
+    format!(
+        "{COOKIE}={id}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{}",
+        if srv.tls { "; Secure" } else { "" }
+    )
+}
+
+/// `/auth?token=…` (a link from `iohr agent page --open`) or `POST /auth` with the token in
+/// a form: the token from `<state_dir>/admin.token` becomes a session for the machine's
+/// owner (`HttpOnly`, SameSite=Strict, Secure over TLS), then back to the page.
 async fn auth<S: AsyncWrite + Unpin>(
     sock: &mut S,
     srv: &Server,
     req: &Request,
+    form: Option<&[u8]>,
     head: bool,
 ) -> std::io::Result<()> {
-    let given = req.query_param("token").unwrap_or_default();
-    let ok = srv
-        .ctx()
-        .token
-        .as_ref()
-        .is_some_and(|t| constant_time_eq(t.as_bytes(), given.as_bytes()));
+    let fields: HashMap<String, String> = form
+        .map(|b| url::form_urlencoded::parse(b).into_owned().collect())
+        .unwrap_or_default();
+    let field = |k: &str| fields.get(k).cloned().or_else(|| req.query_param(k));
+    let given = field("token").unwrap_or_default();
+    let ctx = srv.ctx();
+    let machine_ok = ctx
+        .policy
+        .console()
+        .users
+        .contains(&crate::policy::SignInMode::Machine);
+    let ok = machine_ok
+        && ctx
+            .token
+            .as_ref()
+            .is_some_and(|t| constant_time_eq(t.as_bytes(), given.trim().as_bytes()));
     if !ok {
-        let body = page::locked(&srv.ctx());
+        if form.is_some() {
+            return respond(
+                sock,
+                srv,
+                303,
+                "text/plain",
+                b"not signed in\n",
+                &[("Location", "/console/signin/?error=token")],
+                head,
+            )
+            .await;
+        }
+        let body = page::locked(&ctx);
         return respond(
             sock,
             srv,
@@ -694,20 +999,215 @@ async fn auth<S: AsyncWrite + Unpin>(
         )
         .await;
     }
-    let id = srv.new_session();
-    let cookie = format!(
-        "{COOKIE}={id}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
-        SESSION_TTL.as_secs(),
-        if srv.tls { "; Secure" } else { "" }
-    );
+    let person = auth::Person::machine();
+    srv.audit(&person, "sign_in", "machine token", "ok", "");
+    let id = srv.new_session(person);
+    let next = next_of(field("next"));
+    let cookie = session_cookie(srv, &id, SESSION_TTL.as_secs());
     respond(
         sock,
         srv,
         303,
         "text/plain",
         b"signed in\n",
-        &[("Location", "/"), ("Set-Cookie", &cookie)],
+        &[("Location", &next), ("Set-Cookie", &cookie)],
         head,
+    )
+    .await
+}
+
+/// `POST /auth/logout`: ends this browser's session.
+async fn logout<S: AsyncWrite + Unpin>(
+    sock: &mut S,
+    srv: &Server,
+    req: &Request,
+) -> std::io::Result<()> {
+    if let Some((Some(id), p)) = srv.person(req) {
+        srv.audit(&p, "sign_out", p.mode, "ok", "");
+        srv.end_session(&id);
+    }
+    let cookie = session_cookie(srv, "", 0);
+    respond(
+        sock,
+        srv,
+        303,
+        "text/plain",
+        b"signed out\n",
+        &[("Location", "/console/signin/"), ("Set-Cookie", &cookie)],
+        false,
+    )
+    .await
+}
+
+/// `GET /auth/options`: the ways in this machine's policy allows, for the sign-in page.
+fn auth_options(ctx: &Context) -> String {
+    let c = ctx.policy.console();
+    serde_json::json!({
+        "modes": c.users,
+        "oidc": c.oidc.as_ref().map(|o| serde_json::json!({
+            "name": o.name.clone().unwrap_or_else(|| o.issuer.host_str().unwrap_or("your identity provider").to_owned()),
+        })),
+    })
+    .to_string()
+}
+
+/// The redirect URI this request's host gives (the host was already checked).
+fn redirect_uri(srv: &Server, req: &Request) -> String {
+    format!(
+        "{}://{}/auth/oidc/callback",
+        if srv.tls { "https" } else { "http" },
+        req.header("host").unwrap_or("127.0.0.1")
+    )
+}
+
+/// `GET /auth/oidc/start`: off to the company's identity provider, with PKCE.
+async fn oidc_start<S: AsyncWrite + Unpin>(
+    sock: &mut S,
+    srv: &Server,
+    req: &Request,
+) -> std::io::Result<()> {
+    let ctx = srv.ctx();
+    let c = ctx.policy.console();
+    let (Some(o), Some(http)) = (c.oidc.as_ref(), ctx.http.as_ref()) else {
+        return oidc_fail(sock, srv, "not_configured").await;
+    };
+    if !c.users.contains(&crate::policy::SignInMode::Oidc) {
+        return oidc_fail(sock, srv, "not_configured").await;
+    }
+    let d = match auth::discover(http, o).await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(error = %e, "sign-in: the identity provider's discovery failed");
+            return oidc_fail(sock, srv, "unreachable").await;
+        }
+    };
+    let pending = auth::Pending {
+        state: auth::random(),
+        verifier: auth::random(),
+        nonce: auth::random(),
+        next: next_of(req.query_param("next")),
+        created: Instant::now(),
+    };
+    let url = auth::authorize_url(&d, o, &redirect_uri(srv, req), &pending);
+    {
+        let mut p = match srv.pending.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        p.retain(auth::Pending::alive);
+        if p.len() >= auth::MAX_PENDING {
+            p.remove(0);
+        }
+        p.push(pending);
+    }
+    respond(
+        sock,
+        srv,
+        303,
+        "text/plain",
+        b"to the identity provider\n",
+        &[("Location", url.as_str())],
+        false,
+    )
+    .await
+}
+
+/// `GET /auth/oidc/callback?code=…&state=…`: the code for a person, a role and a session.
+async fn oidc_callback<S: AsyncWrite + Unpin>(
+    sock: &mut S,
+    srv: &Server,
+    req: &Request,
+) -> std::io::Result<()> {
+    let ctx = srv.ctx();
+    let c = ctx.policy.console();
+    let (Some(o), Some(http), Some(secrets)) =
+        (c.oidc.as_ref(), ctx.http.as_ref(), ctx.secrets.as_ref())
+    else {
+        return oidc_fail(sock, srv, "not_configured").await;
+    };
+    let state = req.query_param("state").unwrap_or_default();
+    let pending = {
+        let mut p = match srv.pending.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        p.retain(auth::Pending::alive);
+        let i = p
+            .iter()
+            .position(|x| constant_time_eq(x.state.as_bytes(), state.as_bytes()));
+        i.map(|i| p.remove(i))
+    };
+    let Some(pending) = pending else {
+        return oidc_fail(sock, srv, "expired").await;
+    };
+    let Some(code) = req.query_param("code") else {
+        return oidc_fail(sock, srv, "refused").await;
+    };
+    let secret = match o.client_secret.parse::<crate::secrets::SecretRef>() {
+        Ok(r) => secrets.resolve(&r).await,
+        Err(e) => Err(e),
+    };
+    let Ok(secret) = secret else {
+        tracing::warn!("sign-in: [console.oidc] client_secret could not be read");
+        return oidc_fail(sock, srv, "not_configured").await;
+    };
+    let person = match auth::discover(http, o).await {
+        Ok(d) => {
+            auth::finish(
+                http,
+                &d,
+                o,
+                &secret,
+                &redirect_uri(srv, req),
+                &pending,
+                &code,
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
+    match person {
+        Ok(p) => {
+            srv.audit(&p, "sign_in", "oidc", "ok", "");
+            let id = srv.new_session(p);
+            let cookie = session_cookie(srv, &id, auth::ABSOLUTE.as_secs());
+            respond(
+                sock,
+                srv,
+                303,
+                "text/plain",
+                b"signed in\n",
+                &[("Location", &pending.next), ("Set-Cookie", &cookie)],
+                false,
+            )
+            .await
+        }
+        Err(e) => {
+            tracing::info!(reason = %e, "sign-in refused");
+            let why = if e.contains("no role") {
+                "no_role"
+            } else {
+                "refused"
+            };
+            oidc_fail(sock, srv, why).await
+        }
+    }
+}
+
+async fn oidc_fail<S: AsyncWrite + Unpin>(
+    sock: &mut S,
+    srv: &Server,
+    why: &str,
+) -> std::io::Result<()> {
+    let to = format!("/console/signin/?error={why}");
+    respond(
+        sock,
+        srv,
+        303,
+        "text/plain",
+        b"not signed in\n",
+        &[("Location", &to)],
+        false,
     )
     .await
 }
@@ -745,6 +1245,7 @@ async fn export<S: AsyncWrite + Unpin>(
             "Content-Disposition",
             "attachment; filename=\"iohr-agent-ledger.jsonl\"",
         )],
+        page::csp(),
     );
     write_timed(sock, header.as_bytes()).await?;
     if !head {
@@ -857,7 +1358,7 @@ async fn change<S: AsyncWrite + Unpin>(
             (
                 code,
                 "application/json",
-                crate::redact::redact(&v.to_string()),
+                crate::redact::redact_json(&v.to_string()),
             )
         } else {
             let view = page::View {
@@ -969,12 +1470,20 @@ fn reason(status: u16) -> &'static str {
         421 => "Misdirected Request",
         429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
+        500 => "Internal Server Error",
         _ => "Error",
     }
 }
 
 /// The response head: the same security headers on every answer, and never a CORS one.
-fn headers(srv: &Server, status: u16, ctype: &str, len: u64, extra: &[(&str, &str)]) -> String {
+fn headers(
+    srv: &Server,
+    status: u16,
+    ctype: &str,
+    len: u64,
+    extra: &[(&str, &str)],
+    csp: &str,
+) -> String {
     let mut h = format!(
         "HTTP/1.1 {status} {}\r\nContent-Type: {ctype}\r\nContent-Length: {len}\r\n\
 Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\n\
@@ -982,7 +1491,7 @@ Referrer-Policy: same-origin\r\nContent-Security-Policy: {}\r\n\
 Cross-Origin-Opener-Policy: same-origin\r\nCross-Origin-Resource-Policy: same-origin\r\n\
 Permissions-Policy: camera=(), microphone=(), geolocation=(), interest-cohort=()\r\n",
         reason(status),
-        page::csp()
+        csp
     );
     if srv.tls {
         h.push_str("Strict-Transport-Security: max-age=31536000\r\n");
@@ -1003,7 +1512,25 @@ async fn respond<S: AsyncWrite + Unpin>(
     extra: &[(&str, &str)],
     head: bool,
 ) -> std::io::Result<()> {
-    let header = headers(srv, status, ctype, body.len() as u64, extra);
+    let header = headers(srv, status, ctype, body.len() as u64, extra, page::csp());
+    write_timed(sock, header.as_bytes()).await?;
+    if !head {
+        write_timed(sock, body).await?;
+    }
+    sock.shutdown().await
+}
+
+/// [`respond`] with a CSP of its own (the console bundle's).
+async fn respond_csp<S: AsyncWrite + Unpin>(
+    sock: &mut S,
+    srv: &Server,
+    status: u16,
+    ctype: &str,
+    body: &[u8],
+    csp: &str,
+    head: bool,
+) -> std::io::Result<()> {
+    let header = headers(srv, status, ctype, body.len() as u64, &[], csp);
     write_timed(sock, header.as_bytes()).await?;
     if !head {
         write_timed(sock, body).await?;
