@@ -776,7 +776,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         if let Some(a) = out.audit {
             srv.audit(&person, &a.action, &a.target, &a.outcome, &a.reason);
         }
-        let out = crate::redact::redact(&out.body);
+        let out = crate::redact::redact_json(&out.body);
         return respond(
             &mut sock,
             srv,
@@ -855,7 +855,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
             }
             None => api::unauthenticated(),
         };
-        let body = crate::redact::redact(&body);
+        let body = crate::redact::redact_json(&body);
         return respond(
             &mut sock,
             srv,
@@ -923,7 +923,11 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         Some((ctype, body)) => {
             // Last line of defence: whatever reached the agent's memory, no secret
             // leaves through this page.
-            let body = crate::redact::redact(&body);
+            let body = if ctype.starts_with("application/json") {
+                crate::redact::redact_json(&body)
+            } else {
+                crate::redact::redact(&body)
+            };
             respond(&mut sock, srv, 200, ctype, body.as_bytes(), &[], head).await
         }
         None => respond(&mut sock, srv, 404, "text/plain", b"not found\n", &[], head).await,
@@ -1354,7 +1358,7 @@ async fn change<S: AsyncWrite + Unpin>(
             (
                 code,
                 "application/json",
-                crate::redact::redact(&v.to_string()),
+                crate::redact::redact_json(&v.to_string()),
             )
         } else {
             let view = page::View {
