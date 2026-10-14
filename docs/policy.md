@@ -234,3 +234,83 @@ kinds its manifest needs), and the agent's lock (`<state_dir>/extensions.lock`) 
 local console's Extensions page shows all three for each one. The console cannot add to this
 list: changing the policy is an admin's edit of this file, audited and noted in the egress
 ledger (`policy_set`, hashes only).
+
+## `[actions]`
+
+Signed read-only HTTP actions (PRD 0117 in inorbithr/core): the platform asks this agent
+to call an API only it can reach, a self-hosted Grafana first (`grafana-self-hosted`).
+Off unless `enabled = true`; an agent before this version ignores the section (see above)
+and runs no actions.
+
+```toml
+[secrets]
+allow = ["k8s:observability/grafana-inorbit-sa#token"]
+
+[actions]
+enabled = true
+platform_keys = ["ed25519:<the platform's job-signing public key, base64url>"]
+account_id = "<your account id>"          # optional: must repeat the enrolled account
+hosts = ["grafana.observability.svc.cluster.local"]
+datasources = ["victoriametrics"]         # the only datasource uids a query may use; empty: none
+max_bytes = 1048576                       # the largest answer read, 1 KiB to 8 MiB
+
+[[actions.sensors]]
+name = "api-error-rate"
+template = "error-rate"                   # the connection's saved query template
+base_url = "http://grafana.observability.svc.cluster.local:3000"
+auth = "k8s:observability/grafana-inorbit-sa#token"
+datasource_uid = "victoriametrics"
+expr = "sum(rate(http_requests_total{code=~\"5..\"}[5m]))"
+interval_secs = 60                        # 15 to 3600
+range_secs = 300
+step_secs = 60                            # at least 15; range / step at most 1000 points
+labels = ["job"]
+warn = 1.0
+crit = 5.0
+below = false                             # true: the thresholds are floors
+```
+
+Every action job is refused unless all of these hold, before anything is resolved or
+connected:
+
+- its envelope is signed with Ed25519 by a key in `platform_keys`, names this agent and
+  this job and the account this agent enrolled in (always; `account_id`, when set, must be
+  the same), was issued no more than 60 s ahead of this clock,
+  lives at most 600 s and has not expired; a job id runs once;
+- the method is `GET`, the base URL is `http(s)://host[:port]` (no trailing dot) with its host in `hosts`
+  (and allowed by `[networks]`), and the path is one of the connector's fixed routes:
+  `/api/search`, `/api/dashboards/uid/<uid>`, `/api/datasources`, and
+  `/api/datasources/proxy/uid/<uid>/api/v1/query_range` with a range of at most 7 days,
+  a step of at least 15 s and at most 1000 points, the datasource in `datasources` (an empty list allows no query);
+- the token is a secret reference in `[secrets] allow`.
+
+The address is resolved once and pinned (no second lookup), no proxy is used, redirects
+are never followed (a 3xx is a failed job of class `status`), the answer is read up to
+`max_bytes` and the job ends at its deadline (`[ceilings] max_job_ms`), and never after its envelope
+expires. The token is
+resolved here and sent only to that host, marked sensitive; it never reaches the platform.
+
+### What leaves the machine
+
+The result of an action carries an `output` the agent shapes in code, whatever the job
+asks for, at most 48 KiB (so its result frame fits the platform's 64 KiB session frame;
+a larger answer fails with class `answer`):
+
+| Route | `output` |
+|---|---|
+| `/api/search` | dashboards: uid, title, folder, url, tags (at most 500) |
+| `/api/dashboards/uid/<uid>` | uid, title, folder, url, and each panel's id, title, type, datasource uid and queries (ref id, expression, datasource uid); never panel data or snapshots (at most 200 panels) |
+| `/api/datasources` | uid, name, type, whether it is the default (no URL, no credentials, no settings) |
+| `query_range` | only `series`, `points` (counts) and the label names on the job's allowlist |
+
+A query's series values leave only when the job names a template this policy made a
+sensor (`[[actions.sensors]]` with the same template, base URL, token reference,
+datasource and expression): then at most 50
+series, 1000 points each, with only the labels on the job's allowlist.
+
+A sensor runs here on its interval (kept across reconnects, and counted against
+`[ceilings] max_jobs_per_minute`) and sends a `signal` frame (sensor, template, the worst
+latest value, its level `ok`, `warn`, `crit` or `unknown`, the number of series, the time),
+only when the platform's welcome says it accepts `signal`. Every result and signal is in
+the [egress ledger](ledger.md), under the rule `actions.grafana-self-hosted` or
+`actions.sensors`.

@@ -40,6 +40,15 @@ pub struct Executor {
     monitors_off: bool,
     slots: Arc<Semaphore>,
     window: Mutex<VecDeque<Instant>>,
+    /// This agent's id: a signed action names it (PRD 0117).
+    agent_id: String,
+    /// The account this agent enrolled in: a signed action must name it.
+    account_id: String,
+    /// When each sensor is next due. Kept here, not in a session, so a reconnect does
+    /// not run every sensor again at once.
+    sensor_due: Mutex<std::collections::HashMap<String, Instant>>,
+    /// Action job ids seen, against replay.
+    replay: crate::actions::Replay,
     jobs: Counter<u64>,
     duration: Histogram<f64>,
 }
@@ -54,11 +63,21 @@ pub struct Admitted {
     _permit: OwnedSemaphorePermit,
 }
 
+/// A signed action the policy accepted, holding its concurrency slot.
+#[derive(Debug)]
+pub struct ActionAdmitted {
+    plan: crate::actions::Plan,
+    deadline: Duration,
+    _permit: OwnedSemaphorePermit,
+}
+
 /// Run it, or refuse it with a reason.
 #[derive(Debug)]
 pub enum Admission {
     /// Accepted.
     Run(Box<Admitted>),
+    /// A signed `http_action`, accepted (PRD 0117).
+    RunAction(Box<ActionAdmitted>),
     /// Refused; the reason goes to the platform.
     Refuse(String),
 }
@@ -89,6 +108,10 @@ impl Executor {
             monitors_off: false,
             slots,
             window: Mutex::new(VecDeque::new()),
+            agent_id: String::new(),
+            account_id: String::new(),
+            sensor_due: Mutex::new(std::collections::HashMap::new()),
+            replay: crate::actions::Replay::default(),
             jobs: meter
                 .u64_counter("iohr_agent.jobs")
                 .with_description("Jobs finished, by kind, surface and verdict")
@@ -176,6 +199,20 @@ impl Executor {
         }
     }
 
+    /// This agent's id, which a signed action must name.
+    #[must_use]
+    pub fn with_agent_id(mut self, id: impl Into<String>) -> Self {
+        self.agent_id = id.into();
+        self
+    }
+
+    /// The account this agent enrolled in, which a signed action must name.
+    #[must_use]
+    pub fn with_account_id(mut self, id: impl Into<String>) -> Self {
+        self.account_id = id.into();
+        self
+    }
+
     /// Whether `inorbit/monitors` runs here (RFC 0073.1): without it, check jobs are refused.
     #[must_use]
     pub fn with_monitors(mut self, on: bool) -> Self {
@@ -235,15 +272,212 @@ impl Executor {
     /// Capabilities to announce: what this version can do and the policy allows.
     #[must_use]
     pub fn capabilities(&self) -> Vec<String> {
-        checks::Surface::ALL
+        let mut caps: Vec<String> = checks::Surface::ALL
             .iter()
             .filter(|s| self.policy.surface_allowed(**s))
             .map(|s| format!("check:{}", s.as_str()))
-            .collect()
+            .collect();
+        if self.policy.actions.as_ref().is_some_and(|a| a.enabled) {
+            caps.push(crate::actions::CAPABILITY.into());
+        }
+        caps
+    }
+
+    /// Admits a signed action: every check in [`crate::actions::admit`], then the
+    /// policy's ceilings.
+    fn admit_action(&self, job: &Job) -> Admission {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let plan = match crate::actions::admit(
+            &self.policy,
+            &self.account_id,
+            &self.agent_id,
+            &job.job_id,
+            &job.spec,
+            &self.replay,
+            now,
+        ) {
+            Ok(p) => p,
+            Err(reason) => return Admission::Refuse(reason),
+        };
+        if let Err(reason) = self.take_rate_slot() {
+            return Admission::Refuse(reason);
+        }
+        let Ok(permit) = Arc::clone(&self.slots).try_acquire_owned() else {
+            return Admission::Refuse(format!(
+                "ceiling: {} jobs are already running ([ceilings] max_concurrent_jobs)",
+                self.policy.ceilings.max_concurrent_jobs
+            ));
+        };
+        // The deadline frame is not signed, so the run also ends when the envelope does.
+        let left_ms = u64::try_from(plan.expires_at.saturating_sub(now))
+            .unwrap_or(0)
+            .saturating_mul(1000);
+        let ceiling = self.policy.ceilings.max_job_ms.min(left_ms);
+        let deadline =
+            Duration::from_millis(job.deadline_ms.map_or(ceiling, |d| d.min(ceiling)).max(1));
+        Admission::RunAction(Box::new(ActionAdmitted {
+            plan,
+            deadline,
+            _permit: permit,
+        }))
+    }
+
+    /// Runs an admitted action to its end or its deadline. The output is the fixed shape
+    /// [`crate::actions::shape`] gives; the token never leaves.
+    pub async fn execute_action(&self, job_id: String, a: ActionAdmitted) -> Finished {
+        let span = tracing::info_span!("job", job_id = %job_id, kind = crate::actions::KIND, connector = %a.plan.connector, target.host = %a.plan.host);
+        async move {
+            let started_at = now_rfc3339();
+            let started = Instant::now();
+            let outcome = tokio::time::timeout(
+                a.deadline,
+                crate::actions::fetch(&self.policy, &self.tls, &self.secrets, &a.plan, a.deadline),
+            )
+            .await;
+            let (status, detail, refusal, output) = match outcome {
+                Err(_) => (
+                    ResultStatus::Failed,
+                    crate::actions::detail(started, None, Some(ErrorClass::Timeout)),
+                    None,
+                    None,
+                ),
+                Ok(Err(crate::actions::Fail::Refused(reason))) => (
+                    ResultStatus::Refused,
+                    CheckDetail {
+                        error_class: Some(ErrorClass::RefusedByPolicy),
+                        ..CheckDetail::default()
+                    },
+                    Some(Refusal { reason }),
+                    None,
+                ),
+                Ok(Err(crate::actions::Fail::Failed(class, code))) => (
+                    ResultStatus::Failed,
+                    crate::actions::detail(started, code, Some(class)),
+                    None,
+                    None,
+                ),
+                Ok(Ok((code, out))) => (
+                    ResultStatus::Ok,
+                    crate::actions::detail(started, Some(code), None),
+                    None,
+                    Some(out),
+                ),
+            };
+            self.jobs.add(
+                1,
+                &[
+                    KeyValue::new("kind", crate::actions::KIND),
+                    KeyValue::new("surface", a.plan.connector.clone()),
+                    KeyValue::new("verdict", status.as_str()),
+                ],
+            );
+            tracing::info!(verdict = status.as_str(), latency_ms = detail.latency_ms, error_class = ?detail.error_class, "action finished");
+            let finished_at = now_rfc3339();
+            let error_class = detail.error_class.and_then(|c| {
+                serde_json::to_value(c)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_owned))
+            });
+            Finished {
+                record: JobRecord {
+                    at: finished_at.clone(),
+                    kind: crate::actions::KIND.into(),
+                    surface: None,
+                    target_host: Some(a.plan.host.clone()),
+                    verdict: status.as_str().into(),
+                    latency_ms: detail.latency_ms,
+                    job_id: Some(job_id.clone()),
+                    key: None,
+                    reason: refusal.as_ref().map(|r| r.reason.clone()),
+                    error_class,
+                    status_code: detail.status_code,
+                    tls_expires_at: None,
+                },
+                result: JobResult {
+                    job_id,
+                    status,
+                    started_at,
+                    finished_at,
+                    detail,
+                    refusal,
+                    output,
+                },
+            }
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Whether the sensor is due now; when it is, its next run is set `interval` ahead.
+    pub fn sensor_due(&self, name: &str, interval: Duration) -> bool {
+        let mut due = match self.sensor_due.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let now = Instant::now();
+        if due.get(name).is_some_and(|d| *d > now) {
+            return false;
+        }
+        due.insert(name.to_owned(), now + interval);
+        true
+    }
+
+    /// Runs one sensor from the local policy and judges it. A sensor holds a slot like a
+    /// job; when none is free it is skipped this round (`None`).
+    pub async fn run_sensor(
+        &self,
+        s: &crate::actions::SensorPolicy,
+    ) -> Option<crate::actions::Signal> {
+        let actions = self.policy.actions.as_ref().filter(|a| a.enabled)?;
+        // Sensors count against the same per-minute ceiling as jobs.
+        if let Err(reason) = self.take_rate_slot() {
+            tracing::info!(sensor = %s.name, %reason, "sensor skipped this round");
+            return None;
+        }
+        let _permit = Arc::clone(&self.slots).try_acquire_owned().ok()?;
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let at = now_rfc3339();
+        let deadline = Duration::from_millis(self.policy.ceilings.max_job_ms.max(1));
+        let (value, series) = match crate::actions::sensor_plan(s, actions.max_bytes, now) {
+            Ok(plan) => match tokio::time::timeout(
+                deadline,
+                crate::actions::fetch(&self.policy, &self.tls, &self.secrets, &plan, deadline),
+            )
+            .await
+            {
+                Ok(Ok((_, shaped))) => (
+                    crate::actions::latest(&shaped, s.below),
+                    shaped
+                        .get("series")
+                        .and_then(serde_json::Value::as_array)
+                        .map_or(0, Vec::len),
+                ),
+                Ok(Err(e)) => {
+                    tracing::info!(sensor = %s.name, error = ?e, "sensor run failed");
+                    (None, 0)
+                }
+                Err(_) => (None, 0),
+            },
+            Err(e) => {
+                tracing::warn!(sensor = %s.name, error = %e, "sensor is misconfigured");
+                (None, 0)
+            }
+        };
+        Some(crate::actions::Signal {
+            sensor: s.name.clone(),
+            template: s.template.clone(),
+            value,
+            level: crate::actions::evaluate(value, s.warn, s.crit, s.below),
+            series,
+            at,
+        })
     }
 
     /// Decides whether a job may run. Nothing is resolved or connected here.
     pub fn admit(&self, job: &Job) -> Admission {
+        if job.kind == crate::actions::KIND {
+            return self.admit_action(job);
+        }
         match job.kind.as_str() {
             "check" => {}
             "load" if !self.policy.work.load => {
@@ -389,6 +623,7 @@ impl Executor {
                 refusal: Some(Refusal {
                     reason: reason.clone(),
                 }),
+                output: None,
             },
             record: JobRecord {
                 at,
@@ -482,6 +717,7 @@ impl Executor {
                 finished_at,
                 detail,
                 refusal,
+                output: None,
             },
         }
     }

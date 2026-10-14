@@ -70,6 +70,11 @@ pub struct Policy {
     /// out of the hashed form while absent; absent means InOrbit's built-ins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extensions: Option<ExtensionsPolicy>,
+    /// Signed HTTP actions the platform may ask for through a connection, and the sensors
+    /// that run them here (PRD 0117). Left out of the hashed form while absent; absent
+    /// means no action job is accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actions: Option<crate::actions::ActionsPolicy>,
     /// Everything else at the top level, sorted out by [`Policy::from_toml`].
     #[serde(flatten, skip_serializing)]
     unknown: std::collections::BTreeMap<String, toml::Value>,
@@ -702,6 +707,9 @@ impl Policy {
             && e.allow.iter().any(|a| !a.contains('/'))
         {
             return Err("extensions.allow lists ids as publisher/name (or publisher/*)".into());
+        }
+        if let Some(a) = &mut self.actions {
+            a.compile(&self.secrets)?;
         }
         self.compiled = c;
         Ok(())
