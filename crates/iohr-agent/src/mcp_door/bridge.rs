@@ -92,6 +92,15 @@ impl std::fmt::Debug for Bridge {
     }
 }
 
+/// Marks an error whose request was sent but whose reply never arrived.
+const REPLY_LOST: &str = " (reply lost)";
+
+fn lost_reply_note(why: &str) -> String {
+    format!(
+        "The InOrbit API did not answer in time ({why}). The call was sent and may have run: check the result before trying again."
+    )
+}
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -254,7 +263,7 @@ impl Bridge {
                             if may_resend {
                                 continue;
                             }
-                            return Err(last);
+                            return Err(format!("{last}{REPLY_LOST}"));
                         }
                     };
                     let transient = TRANSIENT.contains(&code) || EDGE_DOWN.contains(&code);
@@ -394,14 +403,16 @@ impl Bridge {
         pv: Option<&str>,
     ) -> Reply {
         let Some(id) = msg.get("id").filter(|i| !i.is_null()).cloned() else {
-            // A notification: acknowledge at once, forward when there is a sign-in.
+            // A notification: acknowledge at once, forward when there is a sign-in. A
+            // `tools/call` without an id is never resent either.
             if self.tokens.auth().ok {
                 let me = Arc::clone(self);
+                let may_resend = method != "tools/call";
                 let (body, pv) = (body.to_vec(), pv.map(str::to_owned));
                 tokio::spawn(async move {
                     if let Some(t) = me.tokens.access().await {
                         let _ = me
-                            .forward(&body, &t, pv.as_deref(), Duration::from_secs(5), true)
+                            .forward(&body, &t, pv.as_deref(), Duration::from_secs(5), may_resend)
                             .await;
                     }
                 });
@@ -462,7 +473,9 @@ impl Bridge {
                 if let Some(v) = self.offline_answer(method, &id, &client_pv) {
                     return Reply::json(200, &v);
                 }
-                if method == "tools/call" {
+                if method == "tools/call" && why.ends_with(REPLY_LOST) {
+                    Reply::json(200, &tool_error(&id, &lost_reply_note(&why)))
+                } else if method == "tools/call" {
                     Reply::json(
                         200,
                         &tool_error(

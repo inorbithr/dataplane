@@ -16,7 +16,7 @@ use crate::admin::constant_time_eq;
 use crate::error::{Error, Result};
 
 const MAX_HEAD: usize = 16 * 1024;
-const MAX_BODY: usize = 8 * 1024 * 1024;
+const MAX_BODY: usize = 2 * 1024 * 1024;
 const HEAD_TIMEOUT: Duration = Duration::from_secs(5);
 const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONNECTIONS: usize = 64;
@@ -88,7 +88,10 @@ pub async fn serve_on(listener: TcpListener, door: Door) -> Result<()> {
     }
 }
 
-async fn read_request(sock: &mut TcpStream) -> std::result::Result<Request, u16> {
+async fn read_request(
+    sock: &mut TcpStream,
+    gate: &(dyn Fn(&Request) -> bool + Sync),
+) -> std::result::Result<Request, u16> {
     let mut buf = Vec::with_capacity(2048);
     let mut chunk = [0_u8; 4096];
     let head_end = tokio::time::timeout(HEAD_TIMEOUT, async {
@@ -124,6 +127,10 @@ async fn read_request(sock: &mut TcpStream) -> std::result::Result<Request, u16>
         headers,
         body: Vec::new(),
     };
+    // Who is asking is checked before any body is read.
+    if !gate(&req) {
+        return Err(403);
+    }
     if req.header("transfer-encoding").is_some() {
         return Err(501);
     }
@@ -188,11 +195,23 @@ fn plain(status: u16, v: &serde_json::Value) -> Reply {
 }
 
 async fn connection(mut sock: TcpStream, door: &Door, hosts: &[String]) {
-    let reply = match read_request(&mut sock).await {
+    let gate = |req: &Request| req.method != "POST" || authorised(req, door, hosts);
+    let reply = match read_request(&mut sock, &gate).await {
         Err(code) => plain(code, &serde_json::json!({"error": "bad request"})),
         Ok(req) => route(&req, door, hosts).await,
     };
     respond(&mut sock, &reply).await;
+}
+
+/// The local gate: no Origin, a known Host, the local secret.
+fn authorised(req: &Request, door: &Door, hosts: &[String]) -> bool {
+    let host_ok = req
+        .header("host")
+        .is_some_and(|h| hosts.iter().any(|a| a == h));
+    let secret_ok = req
+        .header("x-iohr-bridge")
+        .is_some_and(|s| constant_time_eq(s.as_bytes(), door.secret.as_bytes()));
+    req.header("origin").is_none() && host_ok && secret_ok
 }
 
 async fn route(req: &Request, door: &Door, hosts: &[String]) -> Reply {
@@ -206,13 +225,7 @@ async fn route(req: &Request, door: &Door, hosts: &[String]) -> Reply {
     if path != "/mcp" && path != "/login" {
         return plain(404, &serde_json::json!({"error": "not found"}));
     }
-    let host_ok = req
-        .header("host")
-        .is_some_and(|h| hosts.iter().any(|a| a == h));
-    let secret_ok = req
-        .header("x-iohr-bridge")
-        .is_some_and(|s| constant_time_eq(s.as_bytes(), door.secret.as_bytes()));
-    if req.header("origin").is_some() || !host_ok || !secret_ok {
+    if !authorised(req, door, hosts) {
         return plain(
             403,
             &serde_json::json!({"error": "local secret missing or wrong"}),

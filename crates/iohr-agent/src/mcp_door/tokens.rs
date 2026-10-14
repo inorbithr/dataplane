@@ -34,9 +34,11 @@ pub fn now_s() -> f64 {
 #[must_use]
 pub fn random_urlsafe(n: usize) -> String {
     let mut buf = vec![0_u8; n];
-    // A failure here would mean the operating system has no randomness; an empty verifier
-    // would be refused by the identity provider, so the sign-in fails closed.
-    let _ = getrandom::fill(&mut buf);
+    // No randomness means no safe verifier, state or local secret: stop rather than use zeros.
+    if getrandom::fill(&mut buf).is_err() {
+        tracing::error!("the operating system has no randomness; stopping");
+        std::process::abort();
+    }
     let s = URL_SAFE_NO_PAD.encode(&buf);
     buf.zeroize();
     s

@@ -58,3 +58,12 @@ the launchd output file externally.
 - Nothing here claims compliance with any framework; the controls it keeps are the edge as
   the only authenticator, secrets only in the keychain, default deny locally, and no
   content in logs.
+
+## Limits worth knowing
+
+- The keychain items are written through `/usr/bin/security`; another process of the same
+  user can read them the same way. The door does not isolate the sign-in from the user's own
+  processes, it keeps it out of files, argv and logs.
+- The local secret, Host and Origin checks run before a request body is read; bodies are
+  capped at 2 MiB.
+- A `tools/call` is never resent; when its reply is lost the door says the call may have run.
