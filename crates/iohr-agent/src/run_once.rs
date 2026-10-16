@@ -370,6 +370,8 @@ async fn judge(executor: &Executor, entry: &DeclaredCheck, deadline: Instant) ->
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
             Admission::Refuse(reason) => break Err(reason),
+            // The job above is a `check`; a signed `http_action` is never admitted for it.
+            Admission::RunAction(_) => break Err("not a declared check".into()),
         }
     };
     let by_policy = entry.kind == Kind::Refuse && entry.refuse_by == Some(RefuseBy::Policy);
