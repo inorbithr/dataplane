@@ -62,6 +62,14 @@ pub struct Policy {
     /// defaults: targets as a keyed hash and a label, no host name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub share: Option<SharePolicy>,
+    /// Who may sign in to the local console and how (RFC 0100.2). Left out of the hashed
+    /// form while absent; absent means the machine's token only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console: Option<ConsolePolicy>,
+    /// Which extensions this machine allows (RFC 0073.1, the policy's yes of three). Left
+    /// out of the hashed form while absent; absent means InOrbit's built-ins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<ExtensionsPolicy>,
     /// Everything else at the top level, sorted out by [`Policy::from_toml`].
     #[serde(flatten, skip_serializing)]
     unknown: std::collections::BTreeMap<String, toml::Value>,
@@ -70,6 +78,112 @@ pub struct Policy {
     ignored: Vec<String>,
     #[serde(skip)]
     compiled: Compiled,
+}
+
+/// `[console]`: who may sign in to the local console (RFC 0100.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsolePolicy {
+    /// The ways in: `machine` (the token file, always the break-glass owner) and `oidc`
+    /// (the company's identity provider). Default: `machine` only.
+    #[serde(default = "machine_only")]
+    pub users: Vec<SignInMode>,
+    /// The company's identity provider, for `oidc`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc: Option<OidcPolicy>,
+}
+
+fn machine_only() -> Vec<SignInMode> {
+    vec![SignInMode::Machine]
+}
+
+/// A way to sign in to the local console.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignInMode {
+    /// The machine's token (`<state_dir>/admin.token`): the break-glass owner.
+    Machine,
+    /// The company's own identity provider over OpenID Connect.
+    Oidc,
+}
+
+/// A role in the local console, lowest first (RFC 0100.2, the account's roles plus viewer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    /// Reads everything the console shows; changes nothing.
+    Viewer,
+    /// Edits declared checks.
+    Member,
+    /// Edits the policy and the extensions.
+    Admin,
+    /// Everything; the machine's token is always this.
+    Owner,
+}
+
+impl Role {
+    /// The word.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Viewer => "viewer",
+            Self::Member => "member",
+            Self::Admin => "admin",
+            Self::Owner => "owner",
+        }
+    }
+}
+
+/// `[console.oidc]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OidcPolicy {
+    /// The issuer (`https://login.example.com`); its discovery document names the rest.
+    pub issuer: url::Url,
+    /// What the console calls it on the sign-in page ("Example SSO").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// This agent's client at the issuer (a confidential client).
+    pub client_id: String,
+    /// A secret reference (`env:…`, `file:…`, `vault:…`, `k8s:…`), never a value.
+    pub client_secret: String,
+    /// The ID token claim that lists the person's groups.
+    #[serde(default = "default_groups_claim")]
+    pub groups_claim: String,
+    /// Groups per role; a person gets the highest role any of their groups names, and
+    /// nothing at all when none does.
+    #[serde(default)]
+    pub roles: std::collections::BTreeMap<Role, Vec<String>>,
+}
+
+fn default_groups_claim() -> String {
+    "groups".into()
+}
+
+/// `[extensions]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionsPolicy {
+    /// Extension ids this machine allows to run (`inorbit/monitors`); `inorbit/*` allows
+    /// every InOrbit extension.
+    #[serde(default = "inorbit_all")]
+    pub allow: Vec<String>,
+}
+
+fn inorbit_all() -> Vec<String> {
+    vec!["inorbit/*".into()]
+}
+
+impl ExtensionsPolicy {
+    /// Whether `id` is allowed.
+    #[must_use]
+    pub fn allows(&self, id: &str) -> bool {
+        self.allow.iter().any(|a| {
+            a == id
+                || a.strip_suffix("/*")
+                    .is_some_and(|p| id.split_once('/').is_some_and(|(pub_, _)| pub_ == p))
+        })
+    }
 }
 
 /// How much of a declared check's target the platform is told.
@@ -459,6 +573,7 @@ impl Policy {
         toml::to_string_pretty(self).map_err(|e| Error::Policy(e.to_string()))
     }
 
+    #[allow(clippy::too_many_lines)] // one section's rules after another
     fn compile(&mut self) -> std::result::Result<(), String> {
         // Only a whole unknown section is let through, with a warning.
         for (k, v) in std::mem::take(&mut self.unknown) {
@@ -555,6 +670,39 @@ impl Policy {
                 );
             }
         }
+        if let Some(con) = &self.console {
+            if con.users.is_empty() {
+                return Err("console.users must name at least one way in (machine, oidc)".into());
+            }
+            if con.users.contains(&SignInMode::Oidc) {
+                let Some(o) = &con.oidc else {
+                    return Err("console.users names oidc: [console.oidc] is needed".into());
+                };
+                let local = o
+                    .issuer
+                    .host_str()
+                    .is_some_and(|h| h == "127.0.0.1" || h == "localhost" || h == "[::1]");
+                if o.issuer.scheme() != "https" && !local {
+                    return Err("console.oidc.issuer must be https".into());
+                }
+                if !o.client_secret.contains(':') {
+                    return Err(
+                        "console.oidc.client_secret must be a secret reference (env:, file:, vault:, k8s:), never the value"
+                            .into(),
+                    );
+                }
+                if o.roles.values().all(Vec::is_empty) {
+                    return Err(
+                        "console.oidc.roles maps no group to a role: nobody could sign in".into(),
+                    );
+                }
+            }
+        }
+        if let Some(e) = &self.extensions
+            && e.allow.iter().any(|a| !a.contains('/'))
+        {
+            return Err("extensions.allow lists ids as publisher/name (or publisher/*)".into());
+        }
         self.compiled = c;
         Ok(())
     }
@@ -607,6 +755,23 @@ impl Policy {
     #[must_use]
     pub fn share(&self) -> SharePolicy {
         self.share.clone().unwrap_or_default()
+    }
+
+    /// `[console]`, or the machine's token only.
+    #[must_use]
+    pub fn console(&self) -> ConsolePolicy {
+        self.console.clone().unwrap_or(ConsolePolicy {
+            users: machine_only(),
+            oidc: None,
+        })
+    }
+
+    /// `[extensions]`, or InOrbit's built-ins.
+    #[must_use]
+    pub fn extensions(&self) -> ExtensionsPolicy {
+        self.extensions.clone().unwrap_or(ExtensionsPolicy {
+            allow: inorbit_all(),
+        })
     }
 
     /// Whether a surface is accepted. `hwmon` also needs `[work] host`.

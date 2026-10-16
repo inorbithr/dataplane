@@ -96,6 +96,10 @@ pub struct PageArgs {
     /// Open the page in the browser, signed in with this run's token.
     #[arg(long)]
     pub open: bool,
+    /// Open the local console (`/console/`, when `[admin] console_dir` serves one) instead
+    /// of the page.
+    #[arg(long)]
+    pub console: bool,
 }
 
 /// `ledger …`.
@@ -149,7 +153,7 @@ pub enum ConfigCommand {
 pub enum AtlasCommand {
     /// Read a checkout and/or a cluster and write the evidence as JSON lines. Read-only;
     /// the cluster's API server must pass the policy. Nothing is sent anywhere.
-    Observe(AtlasObserveArgs),
+    Observe(Box<AtlasObserveArgs>),
     /// Documentation sources (`[[docs.sources]]` in agent.toml): Notion first.
     #[command(subcommand)]
     Docs(AtlasDocsCommand),
@@ -237,6 +241,15 @@ pub struct AtlasObserveArgs {
     /// The policy that must admit the API server (default: the one agent.toml names).
     #[arg(long)]
     pub policy: Option<PathBuf>,
+    /// A local file of named metric queries against a Prometheus-compatible API, to
+    /// evaluate at each `--at` (aggregates only; see docs/atlas.md, Metrics).
+    #[arg(long)]
+    pub metrics: Option<PathBuf>,
+    /// An instant to evaluate the metric queries at, RFC 3339, or a range
+    /// `START..END[/STEP]` (hourly by default, `15m` or `2h` steps, at most a week of
+    /// hours); repeat for more.
+    #[arg(long = "at")]
+    pub at: Vec<String>,
     /// Where to write the records (default: standard output).
     #[arg(long)]
     pub out: Option<PathBuf>,
@@ -739,8 +752,13 @@ fn page(args: &PageArgs, config_path: &Path) -> Result<ExitCode> {
         addr.to_string()
     };
     let base = format!("{scheme}://{host}/");
+    let landing = if args.console {
+        format!("{base}console/")
+    } else {
+        base.clone()
+    };
     if !args.open {
-        out(&base);
+        out(&landing);
         if cfg.admin.token_required() {
             out(&format!(
                 "It asks for its token: `{} page --open` opens it signed in.",
@@ -756,7 +774,8 @@ fn page(args: &PageArgs, config_path: &Path) -> Result<ExitCode> {
             token_path.display()
         ))
     })?;
-    let url = format!("{base}auth?token={}", token.trim());
+    let next = if args.console { "&next=/console/" } else { "" };
+    let url = format!("{base}auth?token={}{next}", token.trim());
     let opener = if cfg!(target_os = "macos") {
         "open"
     } else {
@@ -769,7 +788,7 @@ fn page(args: &PageArgs, config_path: &Path) -> Result<ExitCode> {
         .status();
     match status {
         Ok(s) if s.success() => {
-            out(&format!("Opened {base} in your browser, signed in."));
+            out(&format!("Opened {landing} in your browser, signed in."));
             Ok(ExitCode::SUCCESS)
         }
         _ => Err(Error::Config(format!(
@@ -787,7 +806,7 @@ async fn atlas_observe(args: &AtlasObserveArgs, config_path: &Path) -> Result<Ex
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".kube/config")))
     });
     let wants_host = args.what.contains(&ObserveWhat::Host);
-    let policy = if kubeconfig.is_some() || wants_host {
+    let policy = if kubeconfig.is_some() || wants_host || args.metrics.is_some() {
         let path = match &args.policy {
             Some(p) => p.clone(),
             None => AgentConfig::load(config_path)?.policy,
@@ -802,6 +821,13 @@ async fn atlas_observe(args: &AtlasObserveArgs, config_path: &Path) -> Result<Ex
         kube_context: args.kube_context.clone(),
         namespaces: args.namespaces.clone(),
         decided: args.decided.clone(),
+        metrics: args
+            .metrics
+            .clone()
+            .map(|file| crate::atlas::MetricsRequest {
+                file,
+                at: args.at.clone(),
+            }),
         host: if wants_host {
             if !(1..=360).contains(&args.samples) || !(1..=300).contains(&args.interval) {
                 return Err(Error::Atlas(

@@ -78,6 +78,43 @@ pub struct AgentConfig {
     /// (`docs/ledger.md`).
     #[serde(default, skip_serializing_if = "LedgerConfig::is_default")]
     pub ledger: LedgerConfig,
+    /// What the agent keeps on this machine for its local console (RFC 0100.1 §5).
+    #[serde(default, skip_serializing_if = "LocalConfig::is_default")]
+    pub local: LocalConfig,
+}
+
+/// `[local]`: the trial store the local console reads. Nothing in it leaves the machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LocalConfig {
+    /// Keep check runs and host readings in `<state_dir>/store/agent.sqlite` ("trial
+    /// storage, not for production"; the customer's own stores come with `[stores]`).
+    #[serde(default = "yes")]
+    pub store: bool,
+    /// Days of runs and readings kept.
+    #[serde(default = "default_retain_days")]
+    pub retain_days: u32,
+}
+
+fn default_retain_days() -> u32 {
+    30
+}
+
+impl Default for LocalConfig {
+    fn default() -> Self {
+        Self {
+            store: true,
+            retain_days: default_retain_days(),
+        }
+    }
+}
+
+impl LocalConfig {
+    /// Whether nothing differs from the defaults.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// The read-only admin page.
@@ -108,6 +145,11 @@ pub struct AdminConfig {
     /// `127.0.0.1`, `localhost` and `[::1]` with its port. Anything else is refused.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hosts: Vec<String>,
+    /// A console bundle (the `agent` build of InOrbit's console, RFC 0100.1 §1) to serve
+    /// under `/console/`. Read from this directory only, which the operator controls; a
+    /// signed, verified bundle replaces this in a later phase (RFC 0100.4, 1.8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console_dir: Option<PathBuf>,
 }
 
 impl Default for AdminConfig {
@@ -120,6 +162,7 @@ impl Default for AdminConfig {
             tls_cert: None,
             tls_key: None,
             hosts: Vec::new(),
+            console_dir: None,
         }
     }
 }
@@ -342,6 +385,7 @@ impl AgentConfig {
             metadata: MetadataConfig::default(),
             docs: DocsConfig::default(),
             ledger: LedgerConfig::default(),
+            local: LocalConfig::default(),
         }
     }
 
@@ -414,6 +458,9 @@ impl AgentConfig {
             fix(p);
         }
         if let Some(p) = &mut self.admin.tls_key {
+            fix(p);
+        }
+        if let Some(p) = &mut self.admin.console_dir {
             fix(p);
         }
     }
