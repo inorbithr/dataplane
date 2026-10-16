@@ -552,6 +552,7 @@ every = "5m"
             targets: TargetShare::Full,
             hostname: true,
             host: false,
+            inventory: None,
         };
         let out = edit_policy_text(POLICY, &want).unwrap();
         assert!(out.starts_with(POLICY), "{out}");
@@ -577,6 +578,7 @@ every = "5m"
             targets: TargetShare::Label,
             hostname: true,
             host: false,
+            inventory: None,
         };
         let out = edit_policy_text(&text, &want).unwrap();
         assert_eq!(
@@ -615,6 +617,7 @@ every = "5m"
             targets: TargetShare::Full,
             hostname: false,
             host: false,
+            inventory: None,
         };
         assert!(write_policy(&path, &want).unwrap());
         assert!(!write_policy(&path, &want).unwrap(), "already so");
@@ -656,6 +659,7 @@ every = "5m"
             targets: TargetShare::Full,
             hostname: true,
             host: false,
+            inventory: None,
         };
         assert!(note_change(d.path(), &b, Some(&l)).unwrap());
         let kinds: Vec<String> = l.recent(10).into_iter().map(|e| e.kind).collect();

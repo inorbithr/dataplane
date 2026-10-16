@@ -34,6 +34,10 @@ pub enum AgentFrame {
         /// (RFC 0100 D11: off by default; the console shows the agent's name).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hostname: Option<String>,
+        /// What this agent's policy admits, its ceilings, observers and the extensions
+        /// installed beside it (RFC 0088.1). Absent with `[share] inventory = false`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inventory: Option<Box<crate::inventory::Inventory>>,
     },
     /// Keep-alive.
     Heartbeat {
@@ -166,6 +170,7 @@ mod tests {
             checks: None,
             metadata: None,
             hostname: None,
+            inventory: None,
         };
         assert_eq!(
             serde_json::to_value(&hello).unwrap(),
@@ -183,6 +188,7 @@ mod tests {
             checks: Some(vec![]),
             metadata: None,
             hostname: None,
+            inventory: None,
         };
         let v = serde_json::to_value(&hello).unwrap();
         assert_eq!(v["checks_hash"], "sha256:11");

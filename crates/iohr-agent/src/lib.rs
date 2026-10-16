@@ -20,6 +20,7 @@ pub mod executor;
 pub mod extensions;
 pub mod extsock;
 pub mod host;
+pub mod inventory;
 pub mod keys;
 pub mod ledger;
 pub mod logbuf;
