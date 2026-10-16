@@ -180,6 +180,15 @@ impl Store {
                sensors INTEGER NOT NULL,
                chipset_millicelsius INTEGER,
                cost_us INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS layouts (
+               page TEXT NOT NULL,
+               who TEXT NOT NULL,
+               widgets TEXT NOT NULL,
+               version INTEGER NOT NULL,
+               updated_at TEXT NOT NULL,
+               updated_by TEXT NOT NULL,
+               PRIMARY KEY (page, who)
              );",
         )
         .map_err(sql)?;
@@ -606,6 +615,103 @@ impl Store {
             .map_err(sql)
     }
 
+    /// A saved dashboard layout (PRD 0024): `who` is the person's subject, or "" for the
+    /// agent's default.
+    ///
+    /// # Errors
+    /// SQLite refused the read.
+    pub fn layout(&self, page: &str, who: &str) -> Result<Option<LayoutRow>> {
+        self.conn()
+            .query_row(
+                "SELECT page, who, widgets, version, updated_at, updated_by
+                 FROM layouts WHERE page = ?1 AND who = ?2",
+                params![page, who],
+                LayoutRow::from_row,
+            )
+            .optional()
+            .map_err(sql)
+    }
+
+    /// Every layout `who` saved, and every default, by page.
+    ///
+    /// # Errors
+    /// SQLite refused the read.
+    pub fn layouts(&self, who: &str) -> Result<Vec<LayoutRow>> {
+        let c = self.conn();
+        let mut stmt = c
+            .prepare(
+                "SELECT page, who, widgets, version, updated_at, updated_by
+                 FROM layouts WHERE who = '' OR who = ?1 ORDER BY page, who",
+            )
+            .map_err(sql)?;
+        let rows = stmt
+            .query_map(params![who], LayoutRow::from_row)
+            .map_err(sql)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(sql)
+    }
+
+    /// Saves a layout made from `base` (0 when there was none). `Ok(Err(current))` when
+    /// someone saved a newer one: nothing is overwritten.
+    ///
+    /// # Errors
+    /// SQLite refused the write.
+    pub fn set_layout(
+        &self,
+        page: &str,
+        who: &str,
+        widgets: &str,
+        base: i64,
+        by: &str,
+    ) -> Result<std::result::Result<LayoutRow, i64>> {
+        let mut c = self.conn();
+        let tx = c.transaction().map_err(sql)?;
+        let current: i64 = tx
+            .query_row(
+                "SELECT version FROM layouts WHERE page = ?1 AND who = ?2",
+                params![page, who],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql)?
+            .unwrap_or(0);
+        if current != base {
+            return Ok(Err(current));
+        }
+        let at = crate::enroll::now_rfc3339();
+        tx.execute(
+            "INSERT INTO layouts (page, who, widgets, version, updated_at, updated_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (page, who) DO UPDATE SET widgets = excluded.widgets,
+               version = excluded.version, updated_at = excluded.updated_at,
+               updated_by = excluded.updated_by",
+            params![page, who, widgets, current + 1, at, by],
+        )
+        .map_err(sql)?;
+        tx.commit().map_err(sql)?;
+        Ok(Ok(LayoutRow {
+            page: page.to_owned(),
+            who: who.to_owned(),
+            widgets: widgets.to_owned(),
+            version: current + 1,
+            updated_at: at,
+            updated_by: by.to_owned(),
+        }))
+    }
+
+    /// Removes a layout; how many rows went (0 or 1).
+    ///
+    /// # Errors
+    /// SQLite refused the write.
+    pub fn reset_layout(&self, page: &str, who: &str) -> Result<usize> {
+        self.conn()
+            .execute(
+                "DELETE FROM layouts WHERE page = ?1 AND who = ?2",
+                params![page, who],
+            )
+            .map_err(sql)
+    }
+
     /// Host readings, newest first.
     ///
     /// # Errors
@@ -751,5 +857,32 @@ mod tests {
             std::env::temp_dir().join(format!("iohr-store-test-{}", uuid::Uuid::now_v7().simple()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+}
+
+/// A saved dashboard layout (PRD 0024): the page's widget ids, widths and whether each is
+/// hidden, as JSON. Never customer data, and never sent anywhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayoutRow {
+    pub page: String,
+    /// The person's subject, or "" for the agent's default.
+    pub who: String,
+    /// `[{"widget": …, "span": 0-12, "hidden": bool}]`.
+    pub widgets: String,
+    pub version: i64,
+    pub updated_at: String,
+    pub updated_by: String,
+}
+
+impl LayoutRow {
+    fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            page: r.get(0)?,
+            who: r.get(1)?,
+            widgets: r.get(2)?,
+            version: r.get(3)?,
+            updated_at: r.get(4)?,
+            updated_by: r.get(5)?,
+        })
     }
 }
