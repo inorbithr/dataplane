@@ -806,3 +806,47 @@ async fn a_share_change_reloads_the_running_agent() {
         .collect();
     assert_eq!(kinds.len(), 2, "the first choice and the change");
 }
+
+/// RFC 0088.1: the hello carries the inventory (what the policy admits, the ceilings and
+/// the extensions `iohr-ext.lock` pins) unless `[share] inventory = false`; never an
+/// address or a host name.
+#[tokio::test]
+async fn the_hello_carries_the_inventory_unless_turned_off() {
+    let digest = format!("sha256:{}", "ab".repeat(32));
+    for (share, sent) in [("", true), ("[share]\ninventory = false\n", false)] {
+        let mut h = harness_with(KeyAlg::Es256, share).await;
+        let lock = h.cfg.policy.parent().unwrap().join("iohr-ext.lock");
+        std::fs::write(
+            &lock,
+            format!(
+                "version = 2\n[[extension]]\nname = \"capture\"\nversion = \"0.1.0-alpha.10\"\ndigest = \"{digest}\"\nsigner = \"https://github.com/inorbithr/dataplane/.github/workflows/release.yml\"\nprivileges = [\"cap_bpf\"]\n"
+            ),
+        )
+        .unwrap();
+        h.cfg.extensions_lock = Some(lock);
+        let (_agent, stop, task) = start(&h).await;
+        let (_, hello) = next(&mut h.frames, "hello").await;
+        if sent {
+            let inv = &hello["inventory"];
+            assert_eq!(inv["format"], 1, "{hello}");
+            assert_eq!(inv["work"]["checks"], true);
+            assert_eq!(inv["work"]["load"], false);
+            assert!(
+                inv["surfaces"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s == "http")
+            );
+            assert!(inv["ceilings"]["max_concurrent_jobs"].as_u64().unwrap() >= 1);
+            assert_eq!(inv["extensions"][0]["name"], "capture");
+            assert_eq!(inv["extensions"][0]["digest"], digest);
+            assert_eq!(inv["extensions"][0]["privileges"][0], "cap_bpf");
+        } else {
+            assert!(hello.get("inventory").is_none(), "{hello}");
+        }
+        assert!(hello.get("hostname").is_none());
+        let _ = stop.send(true);
+        let _ = task.await;
+    }
+}

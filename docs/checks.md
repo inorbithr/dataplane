@@ -281,3 +281,8 @@ numbers, categories and tags do. A transport check's request (method, params, qu
 `auth_scheme` do not. Secret values never
 do; neither do results beyond what any job reports. The platform answers what it accepted
 and why it rejected the rest; the agent's page in the console shows both.
+
+## Running the checks once, from a pipeline
+
+`iohr-agent run --once` runs these entries one time and exits 0, 1 or 2, for a CI step that
+gates a deploy on real checks from inside the network. See [run-once.md](run-once.md).

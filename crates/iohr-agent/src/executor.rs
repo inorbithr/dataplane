@@ -36,6 +36,8 @@ pub struct Executor {
     host_runs: Mutex<std::collections::HashMap<String, u64>>,
     /// `[share] targets`, and the key target hashes are made with.
     share: (crate::policy::TargetShare, Vec<u8>),
+    /// `inorbit/monitors` is not installed: check jobs are refused.
+    monitors_off: bool,
     slots: Arc<Semaphore>,
     window: Mutex<VecDeque<Instant>>,
     jobs: Counter<u64>,
@@ -84,6 +86,7 @@ impl Executor {
             host: None,
             host_runs: Mutex::new(std::collections::HashMap::new()),
             share: (crate::policy::TargetShare::Full, Vec::new()),
+            monitors_off: false,
             slots,
             window: Mutex::new(VecDeque::new()),
             jobs: meter
@@ -173,6 +176,13 @@ impl Executor {
         }
     }
 
+    /// Whether `inorbit/monitors` runs here (RFC 0073.1): without it, check jobs are refused.
+    #[must_use]
+    pub fn with_monitors(mut self, on: bool) -> Self {
+        self.monitors_off = !on;
+        self
+    }
+
     /// The host sampler `hwmon` checks are judged on.
     #[must_use]
     pub fn with_host(mut self, host: Option<crate::host::sampler::Shared>) -> Self {
@@ -254,6 +264,11 @@ impl Executor {
                 ));
             }
             other => return Admission::Refuse(format!("unknown kind of work {other:?}")),
+        }
+        if self.monitors_off {
+            return Admission::Refuse(
+                "the inorbit/monitors extension is not installed on this agent (its Extensions page)".into(),
+            );
         }
         if !self.policy.work.checks {
             return Admission::Refuse(

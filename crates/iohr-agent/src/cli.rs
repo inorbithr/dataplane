@@ -157,6 +157,10 @@ pub struct PageArgs {
     /// Open the page in the browser, signed in with this run's token.
     #[arg(long)]
     pub open: bool,
+    /// Open the local console (`/console/`, when `[admin] console_dir` serves one) instead
+    /// of the page.
+    #[arg(long)]
+    pub console: bool,
 }
 
 /// `ledger …`.
@@ -210,7 +214,7 @@ pub enum ConfigCommand {
 pub enum AtlasCommand {
     /// Read a checkout and/or a cluster and write the evidence as JSON lines. Read-only;
     /// the cluster's API server must pass the policy. Nothing is sent anywhere.
-    Observe(AtlasObserveArgs),
+    Observe(Box<AtlasObserveArgs>),
     /// Documentation sources (`[[docs.sources]]` in agent.toml): Notion first.
     #[command(subcommand)]
     Docs(AtlasDocsCommand),
@@ -298,6 +302,15 @@ pub struct AtlasObserveArgs {
     /// The policy that must admit the API server (default: the one agent.toml names).
     #[arg(long)]
     pub policy: Option<PathBuf>,
+    /// A local file of named metric queries against a Prometheus-compatible API, to
+    /// evaluate at each `--at` (aggregates only; see docs/atlas.md, Metrics).
+    #[arg(long)]
+    pub metrics: Option<PathBuf>,
+    /// An instant to evaluate the metric queries at, RFC 3339, or a range
+    /// `START..END[/STEP]` (hourly by default, `15m` or `2h` steps, at most a week of
+    /// hours); repeat for more.
+    #[arg(long = "at")]
+    pub at: Vec<String>,
     /// Where to write the records (default: standard output).
     #[arg(long)]
     pub out: Option<PathBuf>,
@@ -473,6 +486,40 @@ pub struct RunArgs {
     /// Log as JSON lines.
     #[arg(long)]
     pub json_logs: bool,
+    /// Run the declared checks once and exit: 0 all passed, 1 one failed, 2 something
+    /// could not be judged. No daemon, no session, nothing sent to the platform.
+    #[arg(long)]
+    pub once: bool,
+    /// With --once: only this check (its name in checks.toml); repeat for more.
+    #[arg(long = "check", requires = "once")]
+    pub checks: Vec<String>,
+    /// With --once: only checks carrying this tag, `key=value`; repeat to require more.
+    #[arg(long = "tag", requires = "once", value_parser = crate::run_once::parse_tag)]
+    pub tags: Vec<(String, String)>,
+    /// With --once: every declared check (the default when no --check or --tag is given).
+    #[arg(long, requires = "once")]
+    pub all: bool,
+    /// With --once: the report's format.
+    #[arg(long, value_enum, default_value_t, requires = "once")]
+    pub format: crate::run_once::Format,
+    /// With --once: seconds the whole run may take.
+    #[arg(long, default_value_t = 120, requires = "once")]
+    pub timeout: u64,
+    /// With --once: what fails the run; `degraded` also fails on checks near their `max_ms`.
+    #[arg(long, value_enum, default_value_t, requires = "once")]
+    pub fail_on: crate::run_once::FailOn,
+    /// With --once: write the report to this file too.
+    #[arg(long, requires = "once")]
+    pub out: Option<PathBuf>,
+    /// With --once: write the report signed with this agent's key (a compact JWS) here.
+    #[arg(long, requires = "once")]
+    pub evidence: Option<PathBuf>,
+    /// With --once: the checks file (default: the one agent.toml names).
+    #[arg(long = "checks-file", requires = "once")]
+    pub checks_file: Option<PathBuf>,
+    /// With --once: the policy (default: the one agent.toml names).
+    #[arg(long, requires = "once")]
+    pub policy: Option<PathBuf>,
 }
 
 /// `status`.
@@ -620,16 +667,14 @@ async fn share_cmd(args: &ShareArgs, config_path: &Path) -> Result<ExitCode> {
         out(&format!("Policy: {}", cfg.policy.display()));
         return Ok(ExitCode::SUCCESS);
     };
-    let want = SharePolicy {
-        targets: match t.as_str() {
-            "full" => TargetShare::Full,
-            "label" => TargetShare::Label,
-            _ => TargetShare::Hash,
-        },
-        hostname: args.hostname.as_deref().map_or(now.hostname, |h| h == "on"),
-        // Set in the policy file; `share` keeps it.
-        host: now.host,
+    // The host summary and the inventory are set in the policy file; `share` keeps them.
+    let mut want = now.clone();
+    want.targets = match t.as_str() {
+        "full" => TargetShare::Full,
+        "label" => TargetShare::Label,
+        _ => TargetShare::Hash,
     };
+    want.hostname = args.hostname.as_deref().map_or(now.hostname, |h| h == "on");
     let changed = crate::share::write_policy(&cfg.policy, &want).map_err(|e| match e {
         Error::Io { .. } => Error::Config(format!(
             "{e}; the policy is not writable by this user: run it with sudo, or as the user that owns {}",
@@ -768,8 +813,13 @@ fn page(args: &PageArgs, config_path: &Path) -> Result<ExitCode> {
         addr.to_string()
     };
     let base = format!("{scheme}://{host}/");
+    let landing = if args.console {
+        format!("{base}console/")
+    } else {
+        base.clone()
+    };
     if !args.open {
-        out(&base);
+        out(&landing);
         if cfg.admin.token_required() {
             out(&format!(
                 "It asks for its token: `{} page --open` opens it signed in.",
@@ -785,7 +835,8 @@ fn page(args: &PageArgs, config_path: &Path) -> Result<ExitCode> {
             token_path.display()
         ))
     })?;
-    let url = format!("{base}auth?token={}", token.trim());
+    let next = if args.console { "&next=/console/" } else { "" };
+    let url = format!("{base}auth?token={}{next}", token.trim());
     let opener = if cfg!(target_os = "macos") {
         "open"
     } else {
@@ -798,7 +849,7 @@ fn page(args: &PageArgs, config_path: &Path) -> Result<ExitCode> {
         .status();
     match status {
         Ok(s) if s.success() => {
-            out(&format!("Opened {base} in your browser, signed in."));
+            out(&format!("Opened {landing} in your browser, signed in."));
             Ok(ExitCode::SUCCESS)
         }
         _ => Err(Error::Config(format!(
@@ -816,7 +867,7 @@ async fn atlas_observe(args: &AtlasObserveArgs, config_path: &Path) -> Result<Ex
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".kube/config")))
     });
     let wants_host = args.what.contains(&ObserveWhat::Host);
-    let policy = if kubeconfig.is_some() || wants_host {
+    let policy = if kubeconfig.is_some() || wants_host || args.metrics.is_some() {
         let path = match &args.policy {
             Some(p) => p.clone(),
             None => AgentConfig::load(config_path)?.policy,
@@ -831,6 +882,13 @@ async fn atlas_observe(args: &AtlasObserveArgs, config_path: &Path) -> Result<Ex
         kube_context: args.kube_context.clone(),
         namespaces: args.namespaces.clone(),
         decided: args.decided.clone(),
+        metrics: args
+            .metrics
+            .clone()
+            .map(|file| crate::atlas::MetricsRequest {
+                file,
+                at: args.at.clone(),
+            }),
         host: if wants_host {
             if !(1..=360).contains(&args.samples) || !(1..=300).contains(&args.interval) {
                 return Err(Error::Atlas(
@@ -1196,6 +1254,27 @@ fn http_client(cfg: Option<&AgentConfig>) -> Result<reqwest::Client> {
 }
 
 fn run(config_path: &Path, args: &RunArgs) -> Result<ExitCode> {
+    if args.once {
+        // Any error here is "could not judge": CI reads 2, never 1 (which means a check failed).
+        let result = crate::run_once::run(
+            config_path,
+            &crate::run_once::Options {
+                names: args.checks.clone(),
+                tags: args.tags.clone(),
+                checks: args.checks_file.clone(),
+                policy: args.policy.clone(),
+                timeout: Duration::from_secs(args.timeout.max(1)),
+                format: args.format,
+                fail_on: args.fail_on,
+                out: args.out.clone(),
+                evidence: args.evidence.clone(),
+            },
+        );
+        return Ok(result.unwrap_or_else(|e| {
+            let _ = writeln!(std::io::stderr(), "iohr-agent: {e}");
+            ExitCode::from(2)
+        }));
+    }
     let cfg = AgentConfig::load(config_path)?;
     let telemetry = crate::telemetry::init(&cfg.telemetry, args.json_logs)?;
     let result = runtime()?.block_on(run_async(cfg));
@@ -1855,6 +1934,7 @@ fn ask_share(p: &Prompter, a: &InitArgs) -> Result<crate::policy::SharePolicy> {
         targets,
         hostname,
         host: false,
+        inventory: None,
     })
 }
 

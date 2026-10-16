@@ -180,6 +180,7 @@ starts or reloads.
 |---|---|---|
 | `targets` | `"hash"` | How each declared check's target leaves: `"hash"` sends its label and an HMAC-SHA256 of the target under a key that never leaves the machine (`<state_dir>/share.key`), so the platform can tell when a target changes but not what it is, nor test a guess; `"label"` sends the label only; `"full"` sends the URL, or host and port, as before. |
 | `hostname` | `false` | Send this machine's host name (`hostname` in the hello). Off, the console shows the agent's name. |
+| `inventory` | `true` | Send the agent's inventory in the hello (RFC 0088.1 in inorbithr/core): the surfaces and work kinds this policy admits, its `[ceilings]`, its observers (`host` with `[work] host`), the OS and CPU architecture, and the extensions installed beside it as `iohr-ext.lock` pins them (name, version, digest, signer, privileges). The platform uses it only to send *less*: no work this agent can't run or its policy refuses. No address, host name or location. `false` sends the older capability strings alone. Set it in the file; the page and `iohr agent share` keep it. |
 | `host` | `false` | Send a coarse host summary on the heartbeat (RFC 0102 in inorbithr/core), on the first and every fourth: the 1-minute load, CPUs, memory in use, each filesystem's mount point, use and free space and whether it is read-only (the kernel's `emergency_ro` too), temperatures (`chip/label` and °C, the chipset, CPU and drives first), `md` arrays (name, level, state, members, failed members) and NVMe controllers' kernel states. Needs `[work] host`. No process, user, file, address, model or serial number. Set it in the file; the page and `iohr agent share` keep it as it is. |
 
 Below `"full"`:
@@ -194,3 +195,43 @@ Below `"full"`:
 
 The local page's Policy section shows the levels and, check by check, what the platform
 gets. Whatever the level, every message that leaves is in the [egress ledger](ledger.md).
+
+## `[console]`
+
+Who may sign in to the local console (RFC 0100.2). Left out, only the machine's token works.
+
+```toml
+[console]
+users = ["machine", "oidc"]   # the ways in
+
+[console.oidc]
+issuer = "https://login.example.com"   # https; its discovery document names the rest
+name = "Example SSO"                    # what the sign-in page calls it
+client_id = "iohr-agent-console"        # this agent's (confidential) client at the issuer
+client_secret = "env:IOHR_CONSOLE_OIDC_SECRET"   # a reference, never the value
+groups_claim = "groups"
+roles = { owner = ["sec-admins"], admin = ["sre-leads"], member = ["engineering"], viewer = ["auditors"] }
+```
+
+- `machine`: the token in `<state_dir>/admin.token`. Whoever can read that file is the
+  machine's break-glass **owner**, always recorded as `machine`.
+- `oidc`: the company's identity provider, authorization code with PKCE; the redirect URI is
+  `http(s)://<the console's host>/auth/oidc/callback`. A person gets the highest role any of
+  their groups names, and no session at all when none does. InOrbit is not involved.
+- Roles: `viewer` reads; `member` also changes `checks.toml`; `admin` also changes this policy
+  and the extensions; `owner` is everything. Every change is in the local audit log.
+
+## `[extensions]`
+
+Which extensions this machine allows (RFC 0073.1). Left out: `allow = ["inorbit/*"]`.
+
+```toml
+[extensions]
+allow = ["inorbit/agent-core", "inorbit/console", "inorbit/monitors"]
+```
+
+An extension runs only when the licence entitles it, this list allows it (with the `[work]`
+kinds its manifest needs), and the agent's lock (`<state_dir>/extensions.lock`) has it. The
+local console's Extensions page shows all three for each one. The console cannot add to this
+list: changing the policy is an admin's edit of this file, audited and noted in the egress
+ledger (`policy_set`, hashes only).
