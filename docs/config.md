@@ -38,7 +38,7 @@ or `ed25519`), `extensions_lock` (the `iohr-ext.lock` whose pins the hello's inv
 reports, RFC 0088.1; default `IOHR_DATA_DIR`'s, else iohr's own when the agent runs as an
 iohr extension; a missing file reports no extensions).
 
-`[admin]` the local agent page: loopback only unless `allow_non_loopback`, which then needs `tls_cert` and `tls_key` and always asks for the page's token; `require_token` asks for it on loopback too; `hosts` adds `Host` values it answers to ([security/admin-page.md](security/admin-page.md)); `[ledger]` the egress ledger, on by default, `retain_days` and `max_mb` ([ledger.md](ledger.md)); `[telemetry]` OTLP export, off by default;
+`[admin]` the local agent page: loopback only unless `allow_non_loopback`, which then needs `tls_cert` and `tls_key` and always asks for the page's token; `require_token` asks for it on loopback too; `hosts` adds `Host` values it answers to; `console_dir` serves a console bundle (the `agent` build of InOrbit's console) under `/console/` ([security/admin-page.md](security/admin-page.md)); `[local]` what the agent keeps on this machine for its local console: `store` (on by default) keeps check runs and host readings in `<state_dir>/store/agent.sqlite`, trial storage, not for production, and `retain_days` (30) how long; `[ledger]` the egress ledger, on by default, `retain_days` and `max_mb` ([ledger.md](ledger.md)); `[telemetry]` OTLP export, off by default;
 `[secrets]` the Vault and Kubernetes stores references may resolve from; `[tls]` an extra
 CA bundle; `[session]` reconnect backoff; `[docs]` the documentation sources
 `atlas docs sync` reads, each credential a secret reference ([docs-connectors.md](docs-connectors.md)).

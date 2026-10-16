@@ -1,0 +1,70 @@
+name: no AI attribution
+
+# Commits and pull requests carry only the owner. Fails a PR whose title, description or
+# commits credit an AI agent (a Co-Authored-By trailer or a "Generated with" line), and a
+# push to main that brings such a commit. The same rule as the local git hooks
+# (~/.config/git/no-ai-attribution), here because a PR description has no local hook.
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: no-ai-attribution-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ${{ vars.CI_LIGHT_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            // Text from the PR and commits is data: it is only matched, never run.
+            const ai = 'claude|anthropic|openai|chatgpt|codex|gpt|copilot|gemini|cursor|devin';
+            const patterns = [
+              new RegExp(`^\\s*co-authored-by:.*(${ai}|noreply@anthropic|noreply@openai)`, 'im'),
+              new RegExp(`generated (with|by) \\[?(${ai})`, 'im'),
+              /^\s*🤖/m,
+            ];
+            const hit = (text) => {
+              for (const p of patterns) {
+                const m = (text || '').match(p);
+                if (m) return m[0].trim().slice(0, 120);
+              }
+              return null;
+            };
+            const found = [];
+            const { owner, repo } = context.repo;
+            const pr = context.payload.pull_request;
+            if (pr) {
+              const t = hit(pr.title); if (t) found.push(`PR title: ${t}`);
+              const b = hit(pr.body); if (b) found.push(`PR description: ${b}`);
+              const commits = await github.paginate(github.rest.pulls.listCommits, {
+                owner, repo, pull_number: pr.number, per_page: 100,
+              });
+              for (const c of commits) {
+                const m = hit(c.commit.message);
+                if (m) found.push(`commit ${c.sha.slice(0, 9)}: ${m}`);
+              }
+            } else {
+              for (const c of context.payload.commits || []) {
+                const m = hit(c.message);
+                if (m) found.push(`commit ${c.id.slice(0, 9)}: ${m}`);
+              }
+            }
+            if (found.length) {
+              core.setFailed(
+                'AI attribution found (owner rule: commits and PRs carry only the owner). ' +
+                'Remove these lines:\n' + found.map((f) => `  - ${f}`).join('\n'),
+              );
+            } else {
+              core.info('No AI attribution in this PR or push.');
+            }

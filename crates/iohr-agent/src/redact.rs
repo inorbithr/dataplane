@@ -227,6 +227,11 @@ fn keyed_spans(text: &str, spans: &mut Vec<(usize, usize)>) {
             }
             j += 1;
         }
+        // A quote, or a quote escaped inside a JSON string (`\"`), which must stay whole.
+        let escaped = b.get(j) == Some(&b'\\') && matches!(b.get(j + 1), Some(b'"' | b'\''));
+        if escaped {
+            j += 1;
+        }
         let quoted = matches!(b.get(j), Some(b'"' | b'\''));
         if quoted {
             j += 1;
@@ -238,7 +243,7 @@ fn keyed_spans(text: &str, spans: &mut Vec<(usize, usize)>) {
         }
         let mut ve = vs;
         if quoted {
-            while ve < n && !matches!(b.get(ve), Some(b'"' | b'\'' | b'\n')) {
+            while ve < n && !matches!(b.get(ve), Some(b'"' | b'\'' | b'\n' | b'\\')) {
                 ve += 1;
             }
         } else {
@@ -257,10 +262,58 @@ fn keyed_spans(text: &str, spans: &mut Vec<(usize, usize)>) {
         // `Bearer` followed by an ordinary word ("bearer of", "basic check") is prose.
         let short_prose =
             scheme && (value.len() < 12 || !value.bytes().any(|c| c.is_ascii_digit()));
-        if ve > vs && !short_prose && value != MARK && !is_harmless_value(value) {
+        if ve > vs
+            && !short_prose
+            && value != MARK
+            && !is_harmless_value(value)
+            && !is_reference(value)
+        {
             spans.push((vs, ve));
         }
         i = ve.max(i);
+    }
+}
+
+/// A secret reference (`env:NAME`, `file:/path`, `vault:path`, `k8s:name/key`): where a
+/// secret lives, which the policy asks for in place of the value. Not a secret itself.
+fn is_reference(v: &str) -> bool {
+    ["env:", "file:", "vault:", "k8s:"].iter().any(|p| {
+        v.strip_prefix(p)
+            .is_some_and(|rest| !rest.is_empty() && !rest.bytes().any(|c| c.is_ascii_whitespace()))
+    })
+}
+
+/// A JSON answer with every string value redacted on its own, so the answer stays JSON
+/// (redacting the serialized text could cut through an escaped quote). A value under a
+/// secret-looking key is replaced whole, unless it is a secret reference. Text that is
+/// not JSON is redacted as text.
+#[must_use]
+pub fn redact_json(body: &str) -> String {
+    fn walk(v: &mut serde_json::Value, secret_key: bool) {
+        match v {
+            serde_json::Value::String(s) => {
+                *s = if secret_key && !is_reference(s) && !is_harmless_value(s) && !s.is_empty() {
+                    MARK.to_owned()
+                } else {
+                    redact(s)
+                };
+            }
+            serde_json::Value::Array(a) => a.iter_mut().for_each(|x| walk(x, secret_key)),
+            serde_json::Value::Object(m) => {
+                for (k, x) in m.iter_mut() {
+                    let k = k.to_ascii_lowercase();
+                    walk(x, SECRET_KEYS.iter().any(|s| k.ends_with(s)));
+                }
+            }
+            _ => {}
+        }
+    }
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(mut v) => {
+            walk(&mut v, false);
+            serde_json::to_string(&v).unwrap_or_else(|_| redact(body))
+        }
+        Err(_) => redact(body),
     }
 }
 
@@ -289,6 +342,15 @@ fn word_spans(text: &str, spans: &mut Vec<(usize, usize)>) {
             i += 1;
         }
         let w = text.get(s..i).unwrap_or_default();
+        // The path or name of a secret reference (`file:/…`, `vault:…`) says where a
+        // secret lives, not what it is.
+        let before = text.get(..s).unwrap_or_default();
+        if ["env:", "file:", "vault:", "k8s:"]
+            .iter()
+            .any(|p| before.ends_with(p))
+        {
+            continue;
+        }
         if let Some(off) = secret_in_word(w) {
             spans.push((s + off.0, s + off.1));
         }
@@ -378,6 +440,47 @@ fn high_entropy(w: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_json_answer_stays_json_and_references_stay_readable() {
+        let text = "[console.oidc]\nclient_secret = \"file:/var/run/iohr/oidc-secret\"\nissuer = \"https://login.example.com\"\npassword = \"hunter2hunter2\"\n";
+        let body =
+            serde_json::json!({ "text": text, "access_token": "abc.def.ghi-123456", "n": 3 })
+                .to_string();
+        let out = redact_json(&body);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("still JSON");
+        let t = v["text"].as_str().unwrap_or_default();
+        assert!(
+            t.contains("client_secret = \"file:/var/run/iohr/oidc-secret\""),
+            "{t}"
+        );
+        assert!(!t.contains("hunter2"), "{t}");
+        assert_eq!(v["access_token"], MARK);
+        assert_eq!(v["n"], 3);
+        // Text redaction no longer cuts through an escaped quote either.
+        let r = redact(&body);
+        assert!(serde_json::from_str::<serde_json::Value>(&r).is_ok(), "{r}");
+    }
+
+    #[test]
+    fn a_secret_reference_is_not_a_secret() {
+        assert_eq!(
+            redact("client_secret = \"env:OIDC_SECRET\""),
+            "client_secret = \"env:OIDC_SECRET\""
+        );
+        assert_eq!(
+            redact("token=vault:kv/agent/token"),
+            "token=vault:kv/agent/token"
+        );
+        assert_eq!(redact("token=env: x"), format!("token={MARK} x"));
+        // A path with long mixed parts after `file:` stays; the same word alone does not.
+        let path = "/private/tmp/Session-2eb4edda10df49a08bf1659bdfece5a7XyZ/T/oidc-secret";
+        assert_eq!(
+            redact(&format!("allow = [\"file:{path}\"]")),
+            format!("allow = [\"file:{path}\"]")
+        );
+        assert_ne!(redact(&format!("x {path}")), format!("x {path}"));
+    }
 
     #[test]
     fn redacts_what_it_should() {

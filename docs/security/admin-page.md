@@ -45,7 +45,7 @@ less unless the operator on this machine chooses more; neither reaches anything 
 |---|---|---|
 | Reached from the network | Loopback only by default. Beyond loopback only with `admin.allow_non_loopback = true`, and then the agent refuses to start without `admin.tls_cert` and `admin.tls_key`, always asks for the token (`require_token = false` is refused), and prints a warning at startup | `config::tests::a_non_loopback_page_without_tls_and_token_is_refused_at_startup` |
 | DNS rebinding | The `Host` header must be exactly `127.0.0.1:<port>`, `localhost:<port>`, `[::1]:<port>` (plus `admin.hosts`); anything else gets 421; a missing or repeated `Host`, or an absolute-form target, gets 400 | `host_header_rebinding_attempts_are_refused` |
-| CSRF, cross-site reads | Read-only: GET and HEAD only (405 otherwise), no request bodies (413). An `Origin` that is not this page gets 403. `Sec-Fetch-Site` other than `same-origin`/`none` gets 403, except a top-level navigation to an HTML page (a link followed from another site), which cannot read what it opens. No CORS header is ever sent, so a preflight never succeeds | `a_cross_origin_post_is_refused_and_nothing_writes` |
+| CSRF, cross-site reads | Read-only: GET and HEAD only (405 otherwise), no request bodies (413). An `Origin` that is not this page gets 403. `Sec-Fetch-Site` other than `same-origin`/`none` gets 403, except a top-level `GET` navigation to an HTML page, to the console's pages (code, no data) or to `/auth/oidc/callback` (the company's identity provider sends the browser back cross-site; the `state` is checked there), which cannot read what it opens. No CORS header is ever sent, so a preflight never succeeds | `a_cross_origin_post_is_refused_and_nothing_writes`, `people_sign_in_with_the_company_idp_and_their_role_decides` |
 | Framing, script injection, leaks through referrers or caches | `Content-Security-Policy: default-src 'none'; style-src 'sha256-…'; img-src 'self'; script-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`; the page has no script at all; `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy: same-origin` (nothing to other sites; `no-referrer` would make browsers send `Origin: null` on the page's own form), `Cache-Control: no-store`, COOP and CORP `same-origin`. Every value is HTML-escaped | `every_answer_carries_the_security_headers_and_no_cors` |
 | Another local user | `admin.require_token = true` makes the page ask for its token on loopback too. The token (32 random bytes, new each start) is written to `<state_dir>/admin.token`, mode 0600; `iohr agent page --open` opens the browser with it; the page turns it into a session cookie (`HttpOnly`, `SameSite=Strict`, `Secure` over TLS, 12 h) and redirects so it leaves the address bar. Compared in constant time. `iohr agent status` sends it as a bearer header, which a browser cannot send cross-site without a preflight | `the_token_opens_the_page_once_required`, `constant_time_comparison` |
 | Secrets on the page | Values are redacted when recorded (log lines, errors, job fields) and every response body is redacted again on its way out ([`redact.rs`](../../crates/iohr-agent/src/redact.rs)): PEM private keys, values after secret-looking keys, bearer tokens, JWTs, enrollment tokens, cloud and Git tokens, long high-entropy words, and the page's own token. Check auth is shown as "a header from a secret", never the reference | `no_secret_in_any_page_or_api_answer` (a property test planting secrets in logs, errors, job fields and the ledger), `redact::tests` |
@@ -62,6 +62,44 @@ less unless the operator on this machine chooses more; neither reaches anything 
 | A large or malformed body | 512 bytes at most, form-encoded, only on the two paths; any other body is 413 | same |
 | A broken policy written | The file is edited in place, validated before it is written, written atomically with its permissions; a reload that fails keeps the agent on its previous policy | `share::tests`, `a_share_change_reloads_the_running_agent` |
 | A change nobody can see afterwards | Every change of `[share]` is a `share_set` entry in the ledger when the new policy starts | `a_change_is_noted_once_in_the_ledger` |
+
+### The local API and the console bundle (RFC 0100.4, slice 1)
+
+The same listener also answers the local API (`/v1/...`, the public API's paths and shapes
+for what this agent holds) and serves the console bundle under `/console/` when
+`[admin] console_dir` names one. No new listener.
+
+| Threat | Control | Test |
+|---|---|---|
+| Anyone on the machine reads the agent's data through the API | The API always asks for the page's token, on loopback too (`require_token` or not): the bearer from `<state_dir>/admin.token`, or the session cookie `/auth` gives a browser. 401 otherwise, in the response contract | `the_local_api_always_needs_the_token` |
+| Another site reads the API through the operator's browser | The page's rules apply first: `Origin` must be this page, `Sec-Fetch-Site` other than `same-origin`/`none` is 403, no CORS header | `another_site_cannot_read_the_api` |
+| The API changes something | GET and HEAD only; any other method on `/v1/` is 405 with the contract's body | `the_local_api_is_read_only` |
+| Probing for other accounts or agents | Another account's or agent's id, and any route the agent does not hold, is `not_found`, never a refusal that confirms it exists | `monitors_and_runs_have_the_public_shapes` |
+| Secrets in an answer | Every API answer passes through the same redaction, value by value for JSON so an answer stays JSON; a value under a secret-looking key is replaced whole. A secret reference (`env:`, `file:`, `vault:`, `k8s:`) says where a secret lives and is shown, so a config file round-trips; the policy refuses a literal secret where a reference belongs. A config edit that still holds the redaction mark is refused, so a hidden value is never written back. A check's secret reference is never in a monitor | `no_secret_in_any_page_or_api_answer`, `monitors_and_runs_have_the_public_shapes`, `redact::tests::a_json_answer_stays_json_and_references_stay_readable`, `a_config_change_is_checked_applied_versioned_and_rolled_back` |
+| Script on the console pages | The console is JavaScript, so `/console/` has its own CSP: `script-src 'self'` plus each inline script of the HTML page being served, by SHA-256 computed from the file's bytes; no `'unsafe-inline'` or `'unsafe-eval'` for scripts; `connect-src 'self'`, `frame-ancestors 'none'` | `the_console_bundle_is_served_with_its_own_csp`, `admin::console::tests` |
+| Path traversal through `/console/` | Only files inside `console_dir`: no `..`, no hidden files, no backslash or NUL, the canonical path must stay under the canonical directory (a symlink out is refused), 16 MiB per file | `admin::console::tests::never_leaves_the_directory` |
+| A console page's dozens of files tripping the page's rate limit | Two buckets per client: every connection takes from a loose one (400 burst, 100 per second) before its request is read; every request but the console's files also takes from the page's own (40 burst, 10 per second) | `bounded_requests_and_rate` |
+| `/auth?next=` used as an open redirect | `next` is followed only to a `/console/` path, never to `//` or another site | `the_console_bundle_is_served_with_its_own_csp` |
+| A tampered bundle | Not covered in this slice: the bundle is read from a directory the operator controls. A signed bundle verified before the first file is served is RFC 0100.4 step 1.8 | none yet |
+
+The trial store (`<state_dir>/store/agent.sqlite`, mode 0600 in a 0700 directory) holds
+the same fields the page shows: verdicts, timings, status codes, classes of error and host
+names, never a path, query, body or secret. Nothing in it leaves the machine.
+
+### People, roles and changes (RFC 0100.2, slice 2)
+
+| Threat | Control | Test |
+|---|---|---|
+| Anyone with the URL changes the agent | Every write names a person with a role: the machine's token (owner, `machine`) or a session from the company's identity provider; `viewer` changes nothing, `member` checks, `admin` the policy and extensions | `people_sign_in_with_the_company_idp_and_their_role_decides` |
+| A forged or replayed sign-in | Authorization code with PKCE (S256), a random `state` kept server-side for ten minutes and used once, a `nonce` checked in the ID token; the ID token comes from the token endpoint over TLS (OIDC Core 3.1.3.7), with `iss`, `aud` and `exp` checked; the client secret is a secret reference | `people_sign_in…`, `admin::auth::tests` |
+| Groups misconfigured to give a role | No group named in `[console.oidc] roles` means no session at all; the role is shown on every page and on every audit line | `people_sign_in…` |
+| A web page makes the browser write (CSRF) | A browser's write needs the session's own form token in `X-CSRF-Token` and this page's `Origin`; the CLI's bearer cannot be sent cross-site | `a_browser_write_needs_the_sessions_csrf_token` |
+| A broken file stops the agent | Every file is checked with the agent's own rules before it is written; a file the agent then refuses on reload is put back, and the running agent never left the previous one | `a_config_change_is_checked_applied_versioned_and_rolled_back` |
+| Two people overwrite each other | A change names the version it started from (`base_sha`); a stale one is refused with 409 | same |
+| A change nobody can trace | Every write, sign-in and sign-out is a line in `<state_dir>/audit/audit.jsonl`, hash-chained like the egress ledger, with the reason given; versions keep who, when and why; a policy change is also a `policy_set` ledger entry (hashes only) | `audit::tests`, same |
+| The console widens what the policy forbids | Checks are judged against the policy in force; extensions need the licence and the policy before the lock; only an admin edits the policy itself | `extensions_need_three_yeses_and_an_admin` |
+| A verification's verdict changed afterwards | Its evidence record is computed from the kept runs and frozen once its window has passed; counts and pass rates only, never an estimate; creating one needs the member role and is audited | `a_verification_judges_each_claim_before_and_after` |
+| Sessions that never end | 30 minutes idle, 12 hours at most, ended on sign-out | `a_browser_write_needs…` |
 
 ## Not covered
 
