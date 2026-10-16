@@ -62,6 +62,10 @@ pub struct Policy {
     /// defaults: targets as a keyed hash and a label, no host name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub share: Option<SharePolicy>,
+    /// What the Kubernetes extension may read (`docs/kubernetes.md`). Absent: it reads
+    /// nothing. Left out of the hashed form while absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kubernetes: Option<crate::k8s_ext::KubernetesPolicy>,
     /// Who may sign in to the local console and how (RFC 0100.2). Left out of the hashed
     /// form while absent; absent means the machine's token only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -235,6 +239,12 @@ pub struct SharePolicy {
     /// so a policy that never names it keeps its hash.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub host: bool,
+    /// Send the agent's inventory in the hello (RFC 0088.1): what this policy admits, its
+    /// ceilings, its observers and the extensions installed beside it. On by default (it
+    /// lets the platform send only work this agent can run); `false` sends the older
+    /// capability strings alone. Left out of the hashed form unless set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory: Option<bool>,
 }
 
 /// `[domains]`.
@@ -591,6 +601,9 @@ impl Policy {
             }
         }
         check_environment(&self.environment)?;
+        if let Some(k) = &mut self.kubernetes {
+            k.validate().map_err(|e| format!("kubernetes: {e}"))?;
+        }
         let mut bound = Vec::with_capacity(self.domains.bound.len());
         for d in &self.domains.bound {
             bound.push(normalize_host(d).map_err(|e| format!("domains.bound: {e}"))?);

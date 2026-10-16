@@ -78,6 +78,11 @@ pub struct AgentConfig {
     /// (`docs/ledger.md`).
     #[serde(default, skip_serializing_if = "LedgerConfig::is_default")]
     pub ledger: LedgerConfig,
+    /// The extension lock (`iohr-ext.lock`) whose entries the hello's inventory reports
+    /// (RFC 0088.1). Default: `IOHR_DATA_DIR`, else iohr's data directory when this agent
+    /// runs as an iohr extension; a missing file reports no extensions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions_lock: Option<PathBuf>,
     /// What the agent keeps on this machine for its local console (RFC 0100.1 §5).
     #[serde(default, skip_serializing_if = "LocalConfig::is_default")]
     pub local: LocalConfig,
@@ -385,6 +390,7 @@ impl AgentConfig {
             metadata: MetadataConfig::default(),
             docs: DocsConfig::default(),
             ledger: LedgerConfig::default(),
+            extensions_lock: None,
             local: LocalConfig::default(),
         }
     }
@@ -458,6 +464,9 @@ impl AgentConfig {
             fix(p);
         }
         if let Some(p) = &mut self.admin.tls_key {
+            fix(p);
+        }
+        if let Some(p) = &mut self.extensions_lock {
             fix(p);
         }
         if let Some(p) = &mut self.admin.console_dir {
