@@ -690,7 +690,10 @@ mod tests {
         let b = parse_bounds(real).unwrap();
         assert_eq!(b.first().map(String::as_str), Some("0.5"));
         assert_eq!(b.last().map(String::as_str), Some("+Inf"));
-        let finite: Vec<f64> = b[..b.len() - 1].iter().map(|x| x.parse().unwrap()).collect();
+        let finite: Vec<f64> = b[..b.len() - 1]
+            .iter()
+            .map(|x| x.parse().unwrap())
+            .collect();
         assert!(finite.windows(2).all(|w| w[0] < w[1]), "{b:?}");
     }
 
