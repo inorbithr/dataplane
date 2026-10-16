@@ -12,8 +12,10 @@ pub mod docs;
 pub mod host;
 pub mod k8s;
 pub mod kube;
+pub mod metrics;
 pub mod record;
 pub mod repo;
+pub mod rollouts;
 pub mod snapshot;
 
 use std::collections::BTreeMap;
@@ -42,6 +44,17 @@ pub struct ObserveRequest {
     pub host: Option<HostRequest>,
     /// A directory of decided documents (PRDs, ADRs, RFCs) to read, whatever its layout.
     pub decided: Option<PathBuf>,
+    /// Named metric queries to evaluate at given instants (needs a policy).
+    pub metrics: Option<MetricsRequest>,
+}
+
+/// Which metrics to read, and when.
+#[derive(Debug, Clone)]
+pub struct MetricsRequest {
+    /// The local file of named queries ([`metrics::MetricsFile`]).
+    pub file: PathBuf,
+    /// The instants to evaluate every query at, RFC 3339.
+    pub at: Vec<String>,
 }
 
 /// How to read the host.
@@ -86,10 +99,15 @@ pub struct Summary {
 /// any read or record failure.
 #[allow(clippy::too_many_lines)] // repository, host, cluster, in order
 pub async fn observe(req: &ObserveRequest, policy: Option<&Policy>) -> Result<(Sink, Summary)> {
-    if req.repo.is_none() && req.kubeconfig.is_none() && req.host.is_none() && req.decided.is_none()
+    if req.repo.is_none()
+        && req.kubeconfig.is_none()
+        && req.host.is_none()
+        && req.decided.is_none()
+        && req.metrics.is_none()
     {
         return Err(Error::Atlas(
-            "nothing to observe: pass host, --repo, --decided and/or --kubeconfig".into(),
+            "nothing to observe: pass host, --repo, --decided, --metrics and/or --kubeconfig"
+                .into(),
         ));
     }
     let host_policy = match &req.host {
@@ -172,6 +190,40 @@ pub async fn observe(req: &ObserveRequest, policy: Option<&Policy>) -> Result<(S
         summary.decided = Some(decided::observe_dir(d, &mut sink, &clock)?);
     }
 
+    if let Some(m) = &req.metrics {
+        let policy = policy.ok_or_else(|| {
+            Error::Policy(
+                "reading metrics needs a policy: pass --policy or name one in agent.toml".into(),
+            )
+        })?;
+        if m.at.is_empty() {
+            return Err(Error::Atlas(
+                "--metrics needs at least one --at instant (RFC 3339)".into(),
+            ));
+        }
+        for at in &m.at {
+            chrono::DateTime::parse_from_rfc3339(at)
+                .map_err(|e| Error::Atlas(format!("--at {at}: {e}")))?;
+        }
+        let file = metrics::MetricsFile::load(&m.file)?;
+        let (base, http) = metrics::client(&file, policy).await?;
+        let ctx = Ctx::new(
+            &mut sink,
+            "metrics-reader",
+            ObserverClass::ExternalSystem,
+            method(metrics::METHOD, MethodCategory::Metrics)?,
+            "local",
+            &["query"],
+            &clock,
+        )?;
+        for q in &file.metrics {
+            for at in &m.at {
+                let answer = metrics::fetch(&http, &base, &q.query, at).await?;
+                metrics::observe_answer(&ctx, &mut sink, q, at, &file.endpoint, &answer)?;
+            }
+        }
+    }
+
     if let Some(c) = &context {
         let policy = policy.ok_or_else(|| {
             Error::Policy(
@@ -188,10 +240,21 @@ pub async fn observe(req: &ObserveRequest, policy: Option<&Policy>) -> Result<(S
             &["list"],
             &clock,
         )?;
+        let rollout_ctx = Ctx::new(
+            &mut sink,
+            "rollout-reader",
+            ObserverClass::ExternalSystem,
+            method(rollouts::METHOD, MethodCategory::RuntimeState)?,
+            &c.user,
+            &["list"],
+            &clock,
+        )?;
         let mut facts = BTreeMap::new();
         for ns in &namespaces {
             let state = kube::read_namespace(&client, ns).await?;
             facts.extend(kube::observe(&ctx, &state, &mut sink)?);
+            let rs = rollouts::read(&client, ns).await?;
+            rollouts::observe(&rollout_ctx, ns, &rs, &mut sink)?;
         }
         let manifest = snapshot::build(&facts, ctx.observer.id, chrono::Utc::now())?;
         let known = manifest

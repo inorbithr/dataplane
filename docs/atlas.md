@@ -70,6 +70,42 @@ is read, keeping line numbers; nothing inside one is ever observed. The kind com
 front matter, else the file name (`adr-9001-….md`), else the directory; the number from the
 file name.
 
+## Rollouts and metrics (investigations)
+
+An investigation ("why did latency rise after the last deploy?") needs what changed and
+what was measured as evidence, not as memory.
+
+- **Rollouts** (`rollout-reader`, method `k8s.api.replicasets`): with `--kubeconfig`, every
+  `ReplicaSet` a `Deployment` owns becomes `rollout/<ns>/<deployment>/<replicaset>` with
+  `rolls_out` (the deployment), `rolled_at` (the control plane's creation time), `revision`,
+  `runs_image` and `serving`. Same client, same policy check, `list` only.
+- **Metrics** (`metrics-reader`, method `prometheus.query`): `--metrics <file> --at <RFC 3339>`
+  (repeat `--at`) evaluates the file's named queries against a Prometheus-compatible API
+  (Prometheus, VictoriaMetrics, Thanos, Mimir) at each instant. Per series:
+  `metric/<name>{kept labels}@<instant>` with `measured_ms` (or `measured`), `measured_at`
+  and `query`, all derived from `query/<name>@<instant>`'s `answer_digest`.
+
+```toml
+endpoint = "http://victoria-metrics.observability:8428"
+
+[[metric]]
+name = "envoy.upstream.p95.1h"
+query = "histogram_quantile(0.95, sum by (envoy_cluster_name, le) (rate(envoy_cluster_upstream_rq_time_bucket[1h])))"
+unit = "ms"                       # ms, s (converted to ms) or count
+keep_labels = ["envoy_cluster_name"]
+```
+
+Why this is scoped, since read-only is not automatically safe:
+
+- **Only the file's queries run.** Nothing the platform sends can make the agent run a
+  query of its choosing, so a metrics API cannot be used to enumerate what you measure.
+- **The endpoint passes the policy** like every target (host, port, networks).
+- **Only numbers and the labels you keep are recorded.** Every other label (pods, paths,
+  users, tenants) is dropped before anything is written; the answer is kept by digest.
+- **A query answering more than 64 series is refused, not cut:** a silent cut would bias
+  the evidence.
+- As everywhere in `atlas observe`, the output is a local file; nothing is sent.
+
 ## Output
 
 One JSON object per line, tagged by `record`: `run` (first; agent version, the repository's
