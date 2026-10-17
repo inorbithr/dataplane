@@ -140,7 +140,6 @@ async fn rig() -> Rig {
         issuer: "http://127.0.0.1:9".into(),
         client_id: "test".into(),
         redirect_port: 0,
-        scope: "mcp:read".into(),
         state_dir: dir.path().to_path_buf(),
         notify: None,
         backoff: vec![Duration::from_millis(50), Duration::from_millis(50)],
@@ -344,4 +343,115 @@ async fn a_dns_miss_falls_back_to_the_last_good_address() {
     assert_eq!(got, vec!["127.0.0.1".parse::<std::net::IpAddr>().unwrap()]);
     // A name that was not configured gets the system's answer, failure included.
     assert!(r.lookup("example.test").await.is_err());
+}
+
+/// Serves two metadata documents: the resource's and the sign-in's.
+async fn fake_metadata(
+    resource: &'static [&'static str],
+    auth: &'static [&'static str],
+) -> SocketAddr {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = l.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut buf = [0_u8; 4096];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = head.split(' ').nth(1).unwrap_or("").to_owned();
+                let (code, body) = match path.as_str() {
+                    "/.well-known/oauth-protected-resource/mcp" => {
+                        (200, json!({"scopes_supported": resource}))
+                    }
+                    "/.well-known/oauth-authorization-server" => {
+                        (200, json!({"scopes_supported": auth}))
+                    }
+                    _ => (404, json!({})),
+                };
+                let body = body.to_string();
+                let resp = format!(
+                    "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    addr
+}
+
+async fn login_scope(meta: SocketAddr) -> Vec<String> {
+    crate::tls::install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = Arc::new(DoorConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        upstream: format!("http://{meta}/mcp"),
+        issuer: format!("http://{meta}"),
+        client_id: "test".into(),
+        redirect_port: 0,
+        state_dir: dir.path().to_path_buf(),
+        notify: None,
+        backoff: vec![Duration::from_millis(50)],
+        dns_names: Vec::new(),
+        login_every: Duration::from_secs(600),
+        open_browser: false,
+        token_item: "t".into(),
+        secret_item: "s".into(),
+    });
+    let http = http_client(&cfg).unwrap();
+    let tokens = Arc::new(
+        Tokens::load(
+            cfg,
+            Arc::new(Store::memory()),
+            http,
+            Arc::new(Notifier::new(None)),
+        )
+        .await,
+    );
+    let url = url::Url::parse(&tokens.start_login().await).unwrap();
+    let scope = url
+        .query_pairs()
+        .find(|(k, _)| k == "scope")
+        .map(|(_, v)| v.into_owned())
+        .unwrap();
+    scope.split(' ').map(String::from).collect()
+}
+
+#[tokio::test]
+async fn the_sign_in_asks_for_the_approvals_scopes_the_server_advertises() {
+    let meta = fake_metadata(
+        &[
+            "mcp:read",
+            "approvals:read",
+            "approvals:write",
+            "brand-new:read",
+        ],
+        &[
+            "mcp:read",
+            "approvals:read",
+            "approvals:write",
+            "offline_access",
+        ],
+    )
+    .await;
+    let scope = login_scope(meta).await;
+    assert_eq!(
+        scope,
+        [
+            "mcp:read",
+            "approvals:read",
+            "approvals:write",
+            "offline_access"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_sign_in_falls_back_to_the_pinned_list_with_approvals_when_metadata_is_unreadable() {
+    // Nothing listens on the discard port, so both documents are unreadable.
+    let scope = login_scope("127.0.0.1:9".parse().unwrap()).await;
+    assert!(scope.contains(&"approvals:read".to_owned()));
+    assert!(scope.contains(&"approvals:write".to_owned()));
+    assert_eq!(scope.last().map(String::as_str), Some("offline_access"));
 }

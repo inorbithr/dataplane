@@ -232,7 +232,7 @@ async fn route(req: &Request, door: &Door, hosts: &[String]) -> Reply {
         );
     }
     if path == "/login" {
-        return plain(200, &serde_json::json!({"url": door.bridge.login()}));
+        return plain(200, &serde_json::json!({"url": door.bridge.login().await}));
     }
     door.bridge
         .handle(&req.body, req.header("mcp-protocol-version"))

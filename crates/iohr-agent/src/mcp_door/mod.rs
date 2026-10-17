@@ -18,6 +18,7 @@
 mod bridge;
 mod claude;
 pub mod dns;
+pub mod scopes;
 mod server;
 pub mod store;
 #[cfg(test)]
@@ -49,9 +50,6 @@ pub const DEFAULT_LISTEN: &str = "127.0.0.1:47821";
 /// The names that get a DNS fallback.
 const DNS_NAMES: [&str; 2] = ["api.inorbit.hr", "auth.inorbit.hr"];
 
-/// Scopes the door asks for.
-const SCOPE: &str = "mcp:read mcp:write mcp:generate connections:read decisions:read decisions:write extensions:read trail:read connections:use offline_access";
-
 /// What the door is made of.
 #[derive(Debug, Clone)]
 pub struct DoorConfig {
@@ -65,8 +63,6 @@ pub struct DoorConfig {
     pub client_id: String,
     /// Loopback port the sign-in redirect lands on.
     pub redirect_port: u16,
-    /// Requested scope.
-    pub scope: String,
     /// Where the cache and DNS memory live.
     pub state_dir: PathBuf,
     /// Notifier program (title, body, `--from`), best effort.
@@ -90,6 +86,24 @@ impl DoorConfig {
     #[must_use]
     pub fn token_url(&self) -> String {
         format!("{}/oauth2/token", self.issuer)
+    }
+
+    /// The MCP resource's protected resource metadata (RFC 9728): the upstream's origin,
+    /// the well-known prefix, then the upstream's path.
+    #[must_use]
+    pub fn resource_meta_url(&self) -> Option<String> {
+        let u = url::Url::parse(&self.upstream).ok()?;
+        let origin = u.origin().ascii_serialization();
+        Some(format!(
+            "{origin}/.well-known/oauth-protected-resource{}",
+            u.path().trim_end_matches('/')
+        ))
+    }
+
+    /// The authorization server metadata (RFC 8414).
+    #[must_use]
+    pub fn auth_meta_url(&self) -> String {
+        format!("{}/.well-known/oauth-authorization-server", self.issuer)
     }
 
     /// The sign-in redirect.
@@ -185,7 +199,6 @@ impl DoorArgs {
             issuer: self.issuer.trim_end_matches('/').to_owned(),
             client_id: self.client_id.clone(),
             redirect_port: self.redirect_port,
-            scope: SCOPE.into(),
             state_dir,
             notify,
             backoff: [0.5, 1.0, 2.0, 4.0, 8.0]

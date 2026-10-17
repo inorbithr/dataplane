@@ -342,9 +342,28 @@ impl Tokens {
         }
     }
 
+    /// The scope to ask for, read from the server now (see [`super::scopes`]).
+    async fn scope(&self) -> String {
+        let resource = match self.cfg.resource_meta_url() {
+            Some(u) => super::scopes::scopes_supported(&self.http, &u).await,
+            None => None,
+        };
+        let grantable =
+            super::scopes::scopes_supported(&self.http, &self.cfg.auth_meta_url()).await;
+        let (scope, source) = super::scopes::wanted_scopes(resource, grantable);
+        tracing::info!(source, "login: scope chosen");
+        scope
+    }
+
     /// Starts a PKCE sign-in with the registered loopback redirect and returns its URL;
     /// at most one is pending per `login_every`, and it opens the browser once.
-    pub fn start_login(self: &Arc<Self>) -> String {
+    pub async fn start_login(self: &Arc<Self>) -> String {
+        if let Some(l) = lock(&self.login).as_ref()
+            && l.started.elapsed() < self.cfg.login_every
+        {
+            return l.url.clone();
+        }
+        let scope = self.scope().await;
         let (url, verifier, state) = {
             let mut slot = lock(&self.login);
             if let Some(l) = slot.as_ref()
@@ -363,7 +382,7 @@ impl Tokens {
                 .append_pair("response_type", "code")
                 .append_pair("client_id", &self.cfg.client_id)
                 .append_pair("redirect_uri", &self.cfg.redirect())
-                .append_pair("scope", &self.cfg.scope)
+                .append_pair("scope", &scope)
                 .append_pair("state", &state)
                 .append_pair("code_challenge", &challenge)
                 .append_pair("code_challenge_method", "S256")

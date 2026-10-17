@@ -190,8 +190,8 @@ impl Bridge {
 
     /// Starts a sign-in, returning its address.
     #[must_use]
-    pub fn login(&self) -> String {
-        self.tokens.start_login()
+    pub async fn login(&self) -> String {
+        self.tokens.start_login().await
     }
 
     fn save_cache(&self) {
@@ -379,7 +379,7 @@ impl Bridge {
             Reply::json(200, &Value::Array(errs))
         };
         let Some(tok) = self.tokens.access().await.filter(|_| self.tokens.auth().ok) else {
-            self.tokens.start_login();
+            self.tokens.start_login().await;
             return fail("the InOrbit MCP door is not signed in: iohr-agent mcp login");
         };
         match self
@@ -438,11 +438,11 @@ impl Bridge {
             return replay_discover(&d, &id);
         }
         if !self.tokens.auth().ok {
-            let url = self.tokens.start_login();
+            let url = self.tokens.start_login().await;
             return self.not_signed_in(method, &id, &client_pv, &url);
         }
         let Some(tok) = self.tokens.access().await.filter(|_| self.tokens.auth().ok) else {
-            let url = self.tokens.start_login();
+            let url = self.tokens.start_login().await;
             return self.not_signed_in(method, &id, &client_pv, &url);
         };
         let timeout = match method {
@@ -460,11 +460,11 @@ impl Bridge {
             {
                 result = self.forward(body, &t2, pv, timeout, may_resend).await;
             } else {
-                let url = self.tokens.start_login();
+                let url = self.tokens.start_login().await;
                 return self.not_signed_in(method, &id, &client_pv, &url);
             }
             if result.as_ref().is_ok_and(|r| r.code == 401) {
-                let url = self.tokens.start_login();
+                let url = self.tokens.start_login().await;
                 return self.not_signed_in(method, &id, &client_pv, &url);
             }
         }
