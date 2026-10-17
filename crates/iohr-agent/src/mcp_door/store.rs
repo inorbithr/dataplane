@@ -22,6 +22,7 @@ pub enum Store {
 }
 
 /// The account every item is filed under.
+#[cfg(target_os = "macos")]
 const ACCOUNT: &str = "inorbit";
 
 /// Decodes a stored value: base64, or the raw text when it is not base64.
@@ -77,6 +78,7 @@ impl Store {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn check_item(item: &str) -> Result<()> {
     if item.is_empty() || item.contains(['"', '\n', '\r', '\\']) {
         return Err(Error::Key("keychain item name is not allowed".into()));
@@ -161,12 +163,15 @@ mod keychain {
 mod keychain {
     use super::{Error, Result, Zeroizing};
 
+    // Async to match the macOS implementation the caller awaits.
+    #[allow(clippy::unused_async)]
     pub(super) async fn get(_item: &str) -> Result<Option<Zeroizing<String>>> {
         Err(Error::Key(
             "the MCP door keeps its sign-in in the macOS keychain; this host is not macOS".into(),
         ))
     }
 
+    #[allow(clippy::unused_async)]
     pub(super) async fn set(_item: &str, _value: &str) -> Result<()> {
         Err(Error::Key(
             "the MCP door keeps its sign-in in the macOS keychain; this host is not macOS".into(),
