@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.1.0-alpha.11](https://github.com/inorbithr/dataplane/compare/v0.1.0-alpha.10...v0.1.0-alpha.11) (2026-10-17)
+
+
+### Features
+
+* **agent:** dashboard layouts kept on this machine (PRD 0024) ([#49](https://github.com/inorbithr/dataplane/issues/49)) ([0e3ecbb](https://github.com/inorbithr/dataplane/commit/0e3ecbb6512a7f31e97eb0c4dff661cbf0e5ad75))
+* **agent:** histogram bucket bounds and hourly --at ranges for the metrics reader ([#44](https://github.com/inorbithr/dataplane/issues/44)) ([f22b3b9](https://github.com/inorbithr/dataplane/commit/f22b3b9852c0c647d8ecdab6cc4f7c0f89afc901))
+* **agent:** Kubernetes extension, read-only first slice (RFC 0112) ([#48](https://github.com/inorbithr/dataplane/issues/48)) ([2f4c447](https://github.com/inorbithr/dataplane/commit/2f4c447f6f643671a364d61d770e0202444ddc39))
+* **agent:** rollouts and metrics as Atlas evidence, for investigations ([#43](https://github.com/inorbithr/dataplane/issues/43)) ([74bb26e](https://github.com/inorbithr/dataplane/commit/74bb26eca1dfaf6773cf9224ceb0d686d08f6010))
+* **agent:** run --once, the declared checks one time with exit codes for CI ([#46](https://github.com/inorbithr/dataplane/issues/46)) ([3e16415](https://github.com/inorbithr/dataplane/commit/3e164154b6ee5e74d0b69bb694275b47c1db8485))
+* **agent:** signed http_action jobs for grafana-self-hosted and sensors ([#52](https://github.com/inorbithr/dataplane/issues/52)) ([30a7591](https://github.com/inorbithr/dataplane/commit/30a75919628b177155f871f383845d69660f044c))
+* **agent:** the agent's inventory in the hello (RFC 0088.1) ([#47](https://github.com/inorbithr/dataplane/issues/47)) ([f706327](https://github.com/inorbithr/dataplane/commit/f706327ecaad703254468e8b8feaccabc0c315bf))
+* **agent:** the console in the agent, slice 1: a local API, trial storage and the console bundle (RFC 0100.4) ([#45](https://github.com/inorbithr/dataplane/issues/45)) ([c3b3ebd](https://github.com/inorbithr/dataplane/commit/c3b3ebd7956073db1bac52279aed08d586bb796b))
+* **agent:** the MCP door, one local holder of the platform sign-in ([#54](https://github.com/inorbithr/dataplane/issues/54)) ([92a525c](https://github.com/inorbithr/dataplane/commit/92a525ca6807a31b1822746a843f9a3b3ce8f040))
+
+
+### Bug fixes
+
+* **deps:** rustls 0.23.46 for RUSTSEC-2026-0346 to 0349 ([#56](https://github.com/inorbithr/dataplane/issues/56)) ([9927410](https://github.com/inorbithr/dataplane/commit/99274107435d1a1b3242e6f7d041e9e31aafb2b3))
+
 ## [0.1.0-alpha.10](https://github.com/inorbithr/dataplane/compare/v0.1.0-alpha.9...v0.1.0-alpha.10) (2026-10-09)
 
 
