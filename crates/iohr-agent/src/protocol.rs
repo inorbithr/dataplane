@@ -34,6 +34,10 @@ pub enum AgentFrame {
         /// (RFC 0100 D11: off by default; the console shows the agent's name).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hostname: Option<String>,
+        /// What this agent's policy admits, its ceilings, observers and the extensions
+        /// installed beside it (RFC 0088.1). Absent with `[share] inventory = false`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inventory: Option<Box<crate::inventory::Inventory>>,
     },
     /// Keep-alive.
     Heartbeat {
@@ -46,6 +50,9 @@ pub enum AgentFrame {
     },
     /// The outcome of a job.
     Result(JobResult),
+    /// A sensor's reading (PRD 0117): sent only when the welcome's `accepts` names
+    /// `signal`, and only for sensors the local policy defines (`[[actions.sensors]]`).
+    Signal(crate::actions::Signal),
 }
 
 /// `ok`, `failed` or `refused`.
@@ -95,6 +102,10 @@ pub struct JobResult {
     /// Present when refused.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refusal: Option<Refusal>,
+    /// An `http_action`'s answer, in the fixed shape the agent gives it
+    /// ([`crate::actions::shape`]), at most 256 KiB. Absent for every other kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<serde_json::Value>,
 }
 
 /// Frames the platform sends.
@@ -111,6 +122,10 @@ pub enum ServerFrame {
         /// The platform's clock.
         #[serde(default)]
         server_time: Option<String>,
+        /// The agent frames the platform accepts (`hello`, `heartbeat`, `result`,
+        /// `signal`). An older platform sends none: then only the first three are sent.
+        #[serde(default)]
+        accepts: Vec<String>,
     },
     /// Work.
     Job(Job),
@@ -166,6 +181,7 @@ mod tests {
             checks: None,
             metadata: None,
             hostname: None,
+            inventory: None,
         };
         assert_eq!(
             serde_json::to_value(&hello).unwrap(),
@@ -183,6 +199,7 @@ mod tests {
             checks: Some(vec![]),
             metadata: None,
             hostname: None,
+            inventory: None,
         };
         let v = serde_json::to_value(&hello).unwrap();
         assert_eq!(v["checks_hash"], "sha256:11");
@@ -207,11 +224,26 @@ mod tests {
             refusal: Some(Refusal {
                 reason: "no".into(),
             }),
+            output: None,
         });
         let v = serde_json::to_value(r).unwrap();
         assert_eq!(v["type"], "result");
         assert_eq!(v["status"], "refused");
         assert_eq!(v["refusal"]["reason"], "no");
+        assert!(v.get("output").is_none());
+        let sig = AgentFrame::Signal(crate::actions::Signal {
+            sensor: "api-errors".into(),
+            template: "error-rate".into(),
+            value: Some(7.0),
+            level: crate::actions::Level::Crit,
+            series: 2,
+            at: "t".into(),
+        });
+        assert_eq!(
+            serde_json::to_value(sig).unwrap(),
+            json!({"type": "signal", "sensor": "api-errors", "template": "error-rate",
+                   "value": 7.0, "level": "crit", "series": 2, "at": "t"})
+        );
     }
 
     #[test]
@@ -221,9 +253,17 @@ mod tests {
             f,
             ServerFrame::Welcome {
                 heartbeat_secs: 15,
+                ref accepts,
                 ..
-            }
+            } if accepts.is_empty()
         ));
+        let f: ServerFrame = serde_json::from_value(
+            json!({"type": "welcome", "agent_id": "agt_1", "accepts": ["hello", "signal"]}),
+        )
+        .unwrap();
+        assert!(
+            matches!(f, ServerFrame::Welcome { ref accepts, .. } if accepts.iter().any(|a| a == "signal"))
+        );
         let f: ServerFrame = serde_json::from_value(
             json!({"type": "job", "job_id": "j", "kind": "check", "spec": {}, "deadline_ms": 5000}),
         )

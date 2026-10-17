@@ -38,7 +38,16 @@ fn context_with(
     require_token: bool,
     reload: Option<tokio::sync::mpsc::Sender<crate::agent::Reload>>,
 ) -> Arc<Context> {
-    let policy = Policy::from_toml(POLICY).unwrap();
+    context_policy(dir, require_token, reload, POLICY)
+}
+
+fn context_policy(
+    dir: &Path,
+    require_token: bool,
+    reload: Option<tokio::sync::mpsc::Sender<crate::agent::Reload>>,
+    policy_text: &str,
+) -> Arc<Context> {
+    let policy = Policy::from_toml(policy_text).unwrap();
     let checks = DeclaredChecks::from_toml(CHECKS).unwrap();
     let state = Arc::new(AgentState::new(
         AgentInfo {
@@ -810,6 +819,94 @@ async fn the_ledger_export_is_the_files_and_verifies() {
     crate::ledger::export(l.dir(), &mut exported).unwrap();
     assert_eq!(body.as_bytes(), exported.as_slice());
     assert_eq!(body.lines().count(), 3);
+}
+
+const K8S: &str = "[kubernetes]\nnamespaces = [\"shop\", \"payments\"]\nkinds = [\"deployments\", \"replicasets\", \"pods\", \"events\"]\n";
+
+#[test]
+fn the_kubernetes_page_says_off_without_the_policy_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path(), false);
+    let (_, html) = page::route(&ctx, "/kubernetes", None, &page::View::default()).unwrap();
+    assert!(html.contains("reads nothing") && html.contains("[kubernetes]"));
+    assert!(page::route(&ctx, "/kubernetes/rbac.yaml", None, &page::View::default()).is_none());
+}
+
+#[test]
+fn the_kubernetes_page_shows_the_scope_the_rbac_and_the_queries() {
+    use crate::k8s_ext::audit::{Audit, Line, Outcome};
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context_policy(dir.path(), false, None, &format!("{POLICY}{K8S}"));
+    let a = Audit::open(&crate::k8s_ext::state_dir(dir.path())).unwrap();
+    for (kind, outcome, status) in [
+        ("pods", Outcome::Denied, Some(403)),
+        ("events", Outcome::Read, None),
+    ] {
+        a.append(&Line {
+            at: "2026-10-10T08:00:00Z".into(),
+            kind: kind.into(),
+            namespace: "shop".into(),
+            path: format!("api/v1/namespaces/shop/{kind}?limit=500"),
+            outcome,
+            items: 3,
+            status,
+        })
+        .unwrap();
+    }
+    let (_, html) = page::route(&ctx, "/kubernetes", None, &page::View::default()).unwrap();
+    for want in [
+        "<code>payments</code>",
+        "statefulsets (off)",
+        "denied by RBAC (403)",
+        "kind: RoleBinding",
+        "/kubernetes/rbac.yaml",
+    ] {
+        assert!(html.contains(want), "{want} missing");
+    }
+    let (ctype, yaml) =
+        page::route(&ctx, "/kubernetes/rbac.yaml", None, &page::View::default()).unwrap();
+    assert!(ctype.starts_with("text/plain"));
+    assert!(yaml.contains("namespace: payments") && !yaml.contains("statefulsets"));
+    assert!(!yaml.contains("\"secrets\"") && !yaml.contains("delete"));
+    let (_, json) = page::route(
+        &ctx,
+        "/api/v1/kubernetes.json",
+        None,
+        &page::View::default(),
+    )
+    .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["recent"].as_array().unwrap().len(), 2);
+    assert_eq!(v["policy"]["namespaces"][0], "payments");
+}
+
+/// Writes the Kubernetes page to `$K8S_PAGE_OUT` for screenshots, reading the queries from
+/// `$K8S_STATE` (an agent state directory) when set.
+#[test]
+#[ignore = "writes the page for screenshots"]
+fn kubernetes_page_snapshot() {
+    let out = std::path::PathBuf::from(std::env::var("K8S_PAGE_OUT").unwrap());
+    std::fs::create_dir_all(&out).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let state =
+        std::env::var("K8S_STATE").map_or_else(|_| tmp.path().to_owned(), std::path::PathBuf::from);
+    let ns = std::env::var("K8S_NAMESPACES").unwrap_or_else(|_| "shop".into());
+    let k8s = format!(
+        "[kubernetes]\nnamespaces = [{}]\n",
+        ns.split(',')
+            .map(|n| format!("\"{n}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    for (name, policy) in [("off", POLICY.to_owned()), ("on", format!("{POLICY}{k8s}"))] {
+        let ctx = context_policy(&state, false, None, &policy);
+        let (_, html) = page::route(&ctx, "/kubernetes", None, &page::View::default()).unwrap();
+        std::fs::write(
+            out.join(format!("kubernetes-{name}.html")),
+            crate::redact::redact(&html),
+        )
+        .unwrap();
+    }
 }
 
 // ---- the local API and the console bundle (RFC 0100.4, slice 1) ----------------------
@@ -1771,4 +1868,109 @@ async fn a_verification_judges_each_claim_before_and_after() {
     assert_eq!(r["verification"]["record"]["verdict"], "measuring");
     let list = json_of(&send(addr, &get(base, &host, &auth)).await);
     assert_eq!(list["verifications"].as_array().unwrap().len(), 2);
+}
+
+/// Dashboard layouts (PRD 0024): the console's layouts API answered from the trial store,
+/// saved and read back with the machine's token, audited, and never in the egress ledger.
+#[tokio::test]
+async fn a_layout_is_kept_on_this_machine_through_the_public_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context_with_store(dir.path(), 1);
+    let token = ctx.token.clone().unwrap();
+    let audit = ctx.audit.clone();
+    let (addr, _stop) = start(ctx).await;
+    let host = addr.to_string();
+    let auth = bearer(&token);
+    let path = "/v1/accounts/orgs/acc_TEST/layouts/local.overview";
+    let ledger = |addr: SocketAddr| {
+        let auth = bearer(&token);
+        async move {
+            json_of(
+                &send(
+                    addr,
+                    &get("/v1/agents/agt_01TEST/ledger", &addr.to_string(), &auth),
+                )
+                .await,
+            )
+        }
+    };
+    let before = ledger(addr).await;
+
+    let v = json_of(&send(addr, &get(path, &host, &auth)).await);
+    assert_eq!(v["origin"], "default");
+    assert_eq!(
+        v["can_set_default"], true,
+        "the machine's token is the owner"
+    );
+    let saved = r#"{"scope":"person","widgets":[{"widget":"sent","span":6,"hidden":false}],"base_version":"0"}"#;
+    let r = send(addr, &put_json(path, &host, &auth, saved)).await;
+    assert_eq!(status(&r), 200, "{r}");
+    assert_eq!(json_of(&r)["layout"]["version"], "1");
+    let r = send(addr, &put_json(path, &host, &auth, saved)).await;
+    assert_eq!(status(&r), 409, "a stale save is a conflict: {r}");
+    let v = json_of(&send(addr, &get(path, &host, &auth)).await);
+    assert_eq!(v["origin"], "person");
+    assert_eq!(v["layout"]["widgets"][0]["widget"], "sent");
+    let list = json_of(
+        &send(
+            addr,
+            &get("/v1/accounts/orgs/acc_TEST/layouts", &host, &auth),
+        )
+        .await,
+    );
+    assert_eq!(list["mine"].as_array().map(Vec::len), Some(1));
+    let r = send(
+        addr,
+        &post_json(
+            &format!("{path}/reset"),
+            &host,
+            &auth,
+            r#"{"scope":"person"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(json_of(&r)["now"]["origin"], "default", "{r}");
+
+    // Another account's layouts are not found; nothing reached the ledger.
+    let r = send(
+        addr,
+        &get(
+            "/v1/accounts/orgs/acc_OTHER/layouts/local.overview",
+            &host,
+            &auth,
+        ),
+    )
+    .await;
+    assert_eq!(status(&r), 404);
+    assert_eq!(ledger(addr).await["entries"], before["entries"]);
+    let actions: Vec<String> = audit
+        .unwrap()
+        .recent(20)
+        .into_iter()
+        .map(|e| e.action)
+        .collect();
+    assert!(
+        actions.iter().any(|a| a == "layout.set") && actions.iter().any(|a| a == "layout.reset"),
+        "{actions:?}"
+    );
+}
+
+/// Without the trial store there is nowhere to keep one: 501, and the console hides its editor.
+#[tokio::test]
+async fn without_the_store_layouts_say_so() {
+    let d = tempfile::tempdir().unwrap();
+    let ctx = context(d.path(), false);
+    let token = ctx.token.clone().unwrap();
+    let (addr, _stop) = start(ctx).await;
+    let host = addr.to_string();
+    let r = send(
+        addr,
+        &get(
+            "/v1/accounts/orgs/acc_TEST/layouts/local.overview",
+            &host,
+            &bearer(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status(&r), 501, "{r}");
 }

@@ -23,6 +23,8 @@ use crate::protocol::{AgentFrame, ServerFrame};
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Largest frame accepted from the platform.
 const MAX_FRAME: usize = 256 * 1024;
+/// How often due sensors are looked for.
+const SENSOR_TICK: Duration = Duration::from_secs(15);
 /// A session that lasted this long resets the backoff.
 const STABLE: Duration = Duration::from_secs(60);
 
@@ -236,6 +238,13 @@ async fn once(agent: &Arc<Agent>, shutdown: &mut watch::Receiver<bool>) -> Resul
             .share()
             .hostname
             .then(crate::host::sysfs::host_name),
+        inventory: agent.policy.share().inventory.unwrap_or(true).then(|| {
+            let lock = crate::inventory::lock_path(agent.config.extensions_lock.as_deref());
+            let extensions = lock
+                .as_deref()
+                .map_or((Vec::new(), 0), crate::inventory::read_lock);
+            Box::new(crate::inventory::build(&agent.policy, extensions))
+        }),
     };
     send(agent, &mut sink, &hello, "contract.hello", None).await?;
 
@@ -247,8 +256,9 @@ async fn once(agent: &Arc<Agent>, shutdown: &mut watch::Receiver<bool>) -> Resul
                         Ok(ServerFrame::Welcome {
                             agent_id,
                             heartbeat_secs,
+                            accepts,
                             ..
-                        }) => Ok(Ok((agent_id, heartbeat_secs))),
+                        }) => Ok(Ok((agent_id, heartbeat_secs, accepts))),
                         Ok(ServerFrame::Revoked { reason }) => {
                             Ok(Err(reason.unwrap_or_else(|| "revoked".into())))
                         }
@@ -263,7 +273,7 @@ async fn once(agent: &Arc<Agent>, shutdown: &mut watch::Receiver<bool>) -> Resul
     })
     .await
     .map_err(|_| Error::Session("no welcome in time".into()))??;
-    let (agent_id, heartbeat_secs) = match welcome {
+    let (agent_id, heartbeat_secs, accepts) = match welcome {
         Ok(w) => w,
         Err(reason) => return Ok(SessionEnd::Revoked(reason)),
     };
@@ -281,6 +291,17 @@ async fn once(agent: &Arc<Agent>, shutdown: &mut watch::Receiver<bool>) -> Resul
     let (tx, mut rx) = mpsc::channel::<Finished>(64);
     let mut running: HashMap<String, tokio::task::AbortHandle> = HashMap::new();
     let mut tasks = JoinSet::new();
+    // Sensors (PRD 0117): defined only in the local policy, run here on their interval,
+    // and their readings sent only to a platform that accepts `signal` frames.
+    let sensors_on = accepts.iter().any(|a| a == "signal")
+        && agent
+            .policy
+            .actions
+            .as_ref()
+            .is_some_and(|a| a.enabled && !a.sensors.is_empty());
+    let (sig_tx, mut sig_rx) = mpsc::channel::<crate::actions::Signal>(64);
+    let mut sensor_tick = tokio::time::interval(SENSOR_TICK);
+    sensor_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Dropping `tasks` at any return aborts every running job: no work without a session.
     loop {
@@ -314,6 +335,24 @@ async fn once(agent: &Arc<Agent>, shutdown: &mut watch::Receiver<bool>) -> Resul
                 agent.state.result_sent(done.record, status);
             }
             Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
+            _ = sensor_tick.tick(), if sensors_on => {
+                for s in agent.policy.actions.iter().flat_map(|a| a.sensors.iter()) {
+                    if !agent.executor.sensor_due(&s.name, Duration::from_secs(s.interval_secs)) {
+                        continue;
+                    }
+                    let exec = Arc::clone(&agent.executor);
+                    let tx = sig_tx.clone();
+                    let s = s.clone();
+                    tasks.spawn(async move {
+                        if let Some(sig) = exec.run_sensor(&s).await {
+                            let _ = tx.send(sig).await;
+                        }
+                    });
+                }
+            }
+            Some(sig) = sig_rx.recv() => {
+                send(agent, &mut sink, &AgentFrame::Signal(sig), "actions.sensors", None).await?;
+            }
             () = tokio::time::sleep_until(last_seen + idle_limit) => {
                 return Err(Error::Session(format!("nothing from the platform for {}s", idle_limit.as_secs())));
             }
@@ -332,6 +371,17 @@ async fn once(agent: &Arc<Agent>, shutdown: &mut watch::Receiver<bool>) -> Resul
                                     let id = done.result.job_id.clone();
                                     send(agent, &mut sink, &AgentFrame::Result(done.result), "contract.refusal", Some(&id)).await?;
                                     agent.state.result_sent(done.record, status);
+                                }
+                                Admission::RunAction(admitted) => {
+                                    let exec = Arc::clone(&agent.executor);
+                                    let tx = tx.clone();
+                                    let id = job.job_id.clone();
+                                    let handle = tasks.spawn(async move {
+                                        let done = exec.execute_action(id, *admitted).await;
+                                        let _ = tx.send(done).await;
+                                    });
+                                    running.insert(job.job_id, handle);
+                                    agent.state.job_started();
                                 }
                                 Admission::Run(admitted) => {
                                     let exec = Arc::clone(&agent.executor);
@@ -380,6 +430,11 @@ fn now_utc_seconds() -> String {
 /// The rule that let a result leave: the surface the policy turned on, or the contract's
 /// duty to answer every job (a refusal, or a run the policy then refused).
 fn result_rule(done: &crate::executor::Finished) -> String {
+    if done.record.kind == crate::actions::KIND
+        && done.result.status != crate::protocol::ResultStatus::Refused
+    {
+        return format!("actions.{}", crate::actions::GRAFANA);
+    }
     match (done.result.status, &done.record.surface) {
         (crate::protocol::ResultStatus::Refused, _) | (_, None) => "contract.refusal".into(),
         (_, Some(s)) => format!("work.surfaces.{s}"),
@@ -403,6 +458,7 @@ where
         AgentFrame::Hello { .. } => "hello",
         AgentFrame::Heartbeat { .. } => "heartbeat",
         AgentFrame::Result(_) => "result",
+        AgentFrame::Signal(_) => "signal",
     };
     agent.ledger_record(crate::ledger::Record {
         kind,

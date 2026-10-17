@@ -237,7 +237,9 @@ impl Agent {
                 .with_checks(checks.clone().map(Arc::new))
                 .with_host(host.clone())
                 .with_share(share.targets, share_key.clone())
-                .with_monitors(monitors_on),
+                .with_monitors(monitors_on)
+                .with_agent_id(enrollment.agent_id.clone())
+                .with_account_id(enrollment.account_id.clone()),
         );
         let state = Arc::new(AgentState::new(
             AgentInfo {

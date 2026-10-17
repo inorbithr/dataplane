@@ -5,6 +5,7 @@
 //! The binary is a thin wrapper over [`cli::main`]; the modules are public so the
 //! integration tests can drive an agent against a fake control plane.
 
+pub mod actions;
 pub mod admin;
 pub mod agent;
 pub mod atlas;
@@ -20,6 +21,8 @@ pub mod executor;
 pub mod extensions;
 pub mod extsock;
 pub mod host;
+pub mod inventory;
+pub mod k8s_ext;
 pub mod keys;
 pub mod ledger;
 pub mod logbuf;
@@ -29,6 +32,7 @@ pub mod platform;
 pub mod policy;
 pub mod protocol;
 pub mod redact;
+pub mod run_once;
 pub mod secrets;
 pub mod session;
 pub mod share;
