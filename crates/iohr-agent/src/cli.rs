@@ -75,6 +75,9 @@ pub enum Command {
     /// The egress ledger: what this agent sent to the platform, recorded here first.
     #[command(subcommand)]
     Ledger(LedgerCommand),
+    /// The local MCP door: the one holder of this machine's MCP sign-in (RFC 0129).
+    #[command(subcommand)]
+    Mcp(crate::mcp_door::McpCommand),
     /// The Kubernetes extension: print the read-only RBAC to apply, or read the
     /// namespaces the policy's `[kubernetes]` names. Read-only; nothing is sent anywhere.
     #[command(subcommand)]
@@ -622,6 +625,7 @@ async fn dispatch(cmd: Command, config_path: &Path) -> Result<ExitCode> {
         Command::Share(a) => share_cmd(&a, config_path).await,
         Command::Ledger(LedgerCommand::Verify(a)) => ledger_verify(&a, config_path),
         Command::Ledger(LedgerCommand::Export(a)) => ledger_export(&a, config_path),
+        Command::Mcp(c) => crate::mcp_door::run(c).await,
         Command::K8s(K8sCommand::Rbac(a)) => k8s_rbac(&a, config_path),
         Command::K8s(K8sCommand::Read(a)) => k8s_read(&a, config_path).await,
         Command::Run(_) => Ok(ExitCode::SUCCESS),

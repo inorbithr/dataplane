@@ -26,6 +26,7 @@ pub mod k8s_ext;
 pub mod keys;
 pub mod ledger;
 pub mod logbuf;
+pub mod mcp_door;
 pub mod metadata;
 pub mod platform;
 pub mod policy;
