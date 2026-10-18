@@ -111,6 +111,9 @@ pub fn label(c: &DeclaredCheck) -> &str {
 pub fn level_for(c: &DeclaredCheck, level: TargetShare) -> TargetShare {
     if c.refuse_by == Some(RefuseBy::Platform) {
         TargetShare::Full
+    } else if c.spec.surface == crate::checks::Surface::Examples {
+        // A set key is a label the operator chose; the platform shows it, not a hash.
+        TargetShare::Label
     } else {
         level
     }
@@ -164,6 +167,7 @@ pub fn target_strings(c: &DeclaredCheck) -> Vec<String> {
             out.push(host.clone());
         }
         crate::checks::Target::Sensor { sensor } => out.push(sensor.clone()),
+        crate::checks::Target::Set { set } => out.push(set.clone()),
     }
     out.sort_by_key(|s| std::cmp::Reverse(s.len()));
     out

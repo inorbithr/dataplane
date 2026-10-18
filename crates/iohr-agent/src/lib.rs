@@ -17,6 +17,7 @@ pub mod cli;
 pub mod config;
 pub mod enroll;
 pub mod error;
+pub mod examples;
 pub mod executor;
 pub mod extensions;
 pub mod extsock;

@@ -79,6 +79,10 @@ pub struct Policy {
     /// means no action job is accepted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actions: Option<crate::actions::ActionsPolicy>,
+    /// The SDK example sets this machine runs on a timer (`[examples.<key>]`, RFC 0165);
+    /// `examples` checks read their latest run. Left out of the hashed form while absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub examples: Option<crate::examples::ExamplesPolicy>,
     /// Everything else at the top level, sorted out by [`Policy::from_toml`].
     #[serde(flatten, skip_serializing)]
     unknown: std::collections::BTreeMap<String, toml::Value>,
@@ -601,6 +605,9 @@ impl Policy {
             }
         }
         check_environment(&self.environment)?;
+        if let Some(e) = &self.examples {
+            e.validate()?;
+        }
         if let Some(k) = &mut self.kubernetes {
             k.validate().map_err(|e| format!("kubernetes: {e}"))?;
         }
@@ -795,12 +802,26 @@ impl Policy {
         })
     }
 
-    /// Whether a surface is accepted. `hwmon` also needs `[work] host`.
+    /// Whether a surface is accepted. `hwmon` also needs `[work] host`; `examples` needs
+    /// at least one `[examples.<key>]` set.
     #[must_use]
     pub fn surface_allowed(&self, s: Surface) -> bool {
         self.work.checks
             && self.work.surfaces.contains(&s)
             && (s != Surface::Hwmon || self.work.host)
+            && (s != Surface::Examples || self.examples.as_ref().is_some_and(|e| !e.0.is_empty()))
+    }
+
+    /// The example set `[examples.<key>]`, if the policy has it.
+    #[must_use]
+    pub fn examples_set(&self, key: &str) -> Option<&crate::examples::SetPolicy> {
+        self.examples.as_ref().and_then(|e| e.0.get(key))
+    }
+
+    /// `[examples]`, if any.
+    #[must_use]
+    pub fn examples(&self) -> Option<&crate::examples::ExamplesPolicy> {
+        self.examples.as_ref()
     }
 
     /// Checks an address against `networks`: deny first, then allow.
