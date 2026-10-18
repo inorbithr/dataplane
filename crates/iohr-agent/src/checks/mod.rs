@@ -541,6 +541,7 @@ fn judged(started: Instant, status: Option<u16>, outcome: Result<(), ErrorClass>
         error_class: outcome.err(),
         tls_expires_at: None,
         reading: None,
+        invariants: Vec::new(),
     }
 }
 
