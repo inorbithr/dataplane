@@ -1,0 +1,21 @@
+[package]
+name = "iohr-redact"
+description = "Redaction of secrets in text: keyed values, flag arguments, token shapes, PEM blocks, URL credentials and high-entropy words. Shared by the InOrbit agent and Atlas core; no regular-expression engine, no async, no global state."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[features]
+# `Redactor::redact_json`: redaction over a `serde_json::Value`, by key and by
+# name/value pair.
+json = ["dep:serde_json"]
+
+[dependencies]
+serde_json = { workspace = true, optional = true }
+
+[lints]
+workspace = true

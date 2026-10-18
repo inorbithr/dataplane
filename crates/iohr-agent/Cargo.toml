@@ -25,6 +25,7 @@ getrandom.workspace = true
 h2.workspace = true
 http.workspace = true
 iohr-evidence.workspace = true
+iohr-redact = { workspace = true, features = ["json"] }
 ipnet.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true

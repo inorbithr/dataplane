@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/iohr-agent", "crates/iohr-capture", "crates/iohr-capture-common", "crates/iohr-evidence"]
+members = ["crates/iohr-agent", "crates/iohr-capture", "crates/iohr-capture-common", "crates/iohr-evidence", "crates/iohr-redact"]
 # The eBPF programs build for the BPF target with a pinned nightly, through
 # crates/iohr-capture/build.rs (aya-build); never with the workspace's stable toolchain.
 exclude = ["crates/iohr-capture-ebpf"]
@@ -29,6 +29,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 clap = { version = "4.6", features = ["derive", "env", "wrap_help"] }
 ed25519-dalek = { version = "3", features = ["pkcs8", "pem"] }
 iohr-evidence = { path = "crates/iohr-evidence" }
+# Shared with Atlas core (inorbithr/core), which depends on it by git revision.
+iohr-redact = { path = "crates/iohr-redact" }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 getrandom = "0.4"
 h2 = "0.4"
