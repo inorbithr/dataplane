@@ -976,9 +976,7 @@ fn target(
         }
         FileTarget::Text(s) if surface == Some(Surface::Examples) => {
             if !crate::examples::is_slug(&s) {
-                return Err(
-                    "an examples check names a set: target = { set = \"sdk\" }".into()
-                );
+                return Err("an examples check names a set: target = { set = \"sdk\" }".into());
             }
             Ok((Target::Set { set: s }, Surface::Examples))
         }

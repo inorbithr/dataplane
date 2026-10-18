@@ -149,7 +149,7 @@ timeout_secs = 1800
 | `results` | `examples-results.json` | Relative path under `dir` the command writes (schema 1); no `..`. It must be newer than the run's start. |
 | `every_secs` | `3600` | 60 to 86400. Seconds between runs; a set never overlaps itself. |
 | `timeout_secs` | `1800` | 10 to 7200. The run is killed past this. |
-| `max_age_secs` | `2 x every_secs` | At least `every_secs`. A newest run older than this reads `run/stale`. |
+| `max_age_secs` | `2 x every_secs + timeout_secs` | At least `every_secs`. A newest run older than this reads `run/stale`. |
 
 The set key is a lowercase slug. Nothing from the command's output leaves the machine.
 

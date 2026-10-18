@@ -290,16 +290,15 @@ async fn run_once(set: &SetPolicy) -> Ended {
     let Ok(mut child) = cmd.spawn() else {
         return Ended::Broke("exit");
     };
-    let status = match tokio::time::timeout(Duration::from_secs(set.timeout_secs), child.wait())
-        .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(_)) => return Ended::Broke("exit"),
-        Err(_) => {
-            let _ = child.kill().await;
-            return Ended::Broke("timeout");
-        }
-    };
+    let status =
+        match tokio::time::timeout(Duration::from_secs(set.timeout_secs), child.wait()).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(_)) => return Ended::Broke("exit"),
+            Err(_) => {
+                let _ = child.kill().await;
+                return Ended::Broke("timeout");
+            }
+        };
     // A failing example makes the runner exit non-zero but still write the file: the file
     // decides. Without a fresh file the exit status is the only thing to report.
     let path = set.dir.join(&set.results);
@@ -437,9 +436,10 @@ mod tests {
     #[test]
     fn no_run_yet_is_unknown_not_down() {
         let st = Store::default();
-        assert!(st
-            .judge("sdk", &set(Path::new("/x"), &["true"]), Instant::now())
-            .is_err());
+        assert!(
+            st.judge("sdk", &set(Path::new("/x"), &["true"]), Instant::now())
+                .is_err()
+        );
     }
 
     #[test]
