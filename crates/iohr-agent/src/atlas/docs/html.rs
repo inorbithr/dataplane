@@ -651,6 +651,143 @@ pub fn read(html: &str, page: &Url, root: &Url) -> Page {
     }
 }
 
+/// What a crawler needs from any page: its links, how much text it has, and the API
+/// descriptions it names. Unlike [`read`], navigation, headers and footers count (that is
+/// where a site links its products, apps and code).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Outline {
+    /// `<title>`, whitespace folded.
+    pub title: String,
+    /// `a` and `area` links, absolute (against `<base href>` when there is one), without
+    /// fragments, each with whether it may be followed (`rel="nofollow"` or a robots meta
+    /// `nofollow` says not).
+    pub links: Vec<(Url, bool)>,
+    /// `<link rel="canonical">`.
+    pub canonical: Option<Url>,
+    /// Characters of visible text outside `<head>`, scripts and styles, whitespace left out.
+    pub text_chars: usize,
+    /// `<script>` elements.
+    pub scripts: usize,
+    /// `OpenAPI` or Swagger documents the page names, in a link or a script (a Swagger UI or
+    /// Redoc page names its document as a string in a script).
+    pub specs: Vec<Url>,
+}
+
+/// Whether a path names an API description document by its usual names.
+#[must_use]
+pub fn looks_like_spec(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    let doc = [".yaml", ".yml", ".json"].iter().any(|e| p.ends_with(e));
+    let named = [
+        "openapi", "swagger", "api-docs", "api-spec", "apispec", "asyncapi",
+    ]
+    .iter()
+    .any(|n| p.contains(n));
+    doc && named
+}
+
+/// The outline of `html`, fetched from `page`.
+#[must_use]
+pub fn outline(html: &str, page: &Url) -> Outline {
+    let toks = tokenize(html);
+    let mut base = page.clone();
+    let mut o = Outline::default();
+    let mut in_head = 0usize;
+    let mut in_title = false;
+    let mut nofollow_all = false;
+    let mut hrefs: Vec<(String, bool)> = Vec::new();
+    for t in &toks {
+        match t {
+            Tok::Open {
+                name,
+                attrs,
+                closed,
+            } => match name.as_str() {
+                "head" if !closed => in_head += 1,
+                "title" if !closed && o.title.is_empty() => in_title = true,
+                "script" => o.scripts += 1,
+                "base" => {
+                    if let Some(b) = attr(attrs, "href").and_then(|h| page.join(&decode(h)).ok()) {
+                        base = b;
+                    }
+                }
+                "meta" => {
+                    let robots =
+                        attr(attrs, "name").is_some_and(|n| n.eq_ignore_ascii_case("robots"));
+                    if robots
+                        && attr(attrs, "content")
+                            .is_some_and(|c| c.to_ascii_lowercase().contains("nofollow"))
+                    {
+                        nofollow_all = true;
+                    }
+                }
+                "link" => {
+                    let rel = attr(attrs, "rel").unwrap_or_default().to_ascii_lowercase();
+                    if rel.split_whitespace().any(|r| r == "canonical") {
+                        o.canonical = attr(attrs, "href").and_then(|h| page.join(&decode(h)).ok());
+                    }
+                }
+                "a" | "area" => {
+                    if let Some(h) = attr(attrs, "href") {
+                        let rel = attr(attrs, "rel").unwrap_or_default().to_ascii_lowercase();
+                        let follow = !rel.split_whitespace().any(|r| r == "nofollow");
+                        hrefs.push((decode(h), follow));
+                    }
+                }
+                _ => {}
+            },
+            Tok::Close(name) => match name.as_str() {
+                "head" => in_head = in_head.saturating_sub(1),
+                "title" => in_title = false,
+                _ => {}
+            },
+            Tok::Text(text) => {
+                if in_title {
+                    o.title = decode(text)
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                } else if in_head == 0 {
+                    o.text_chars += decode(text).chars().filter(|c| !c.is_whitespace()).count();
+                }
+            }
+        }
+    }
+    let resolve = |h: &str| -> Option<Url> {
+        let h = h.trim();
+        if h.is_empty() || h.starts_with('#') {
+            return None;
+        }
+        let mut u = base.join(h).ok()?;
+        if !matches!(u.scheme(), "http" | "https") {
+            return None;
+        }
+        u.set_fragment(None);
+        Some(u)
+    };
+    let mut seen = BTreeSet::new();
+    for (h, follow) in hrefs {
+        if let Some(u) = resolve(&h)
+            && seen.insert(u.to_string())
+        {
+            o.links.push((u, follow && !nofollow_all));
+        }
+    }
+    // Strings in scripts and attributes that name an API description.
+    let mut specs = BTreeSet::new();
+    for s in html.split(['"', '\'', '`']) {
+        if s.len() < 300
+            && !s.contains(char::is_whitespace)
+            && looks_like_spec(s)
+            && let Some(u) = resolve(s)
+            && specs.insert(u.to_string())
+        {
+            o.specs.push(u);
+        }
+    }
+    o
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,6 +856,52 @@ See <a href="../operate/rollback#steps">rollback</a>.</p>
             (p.title.as_str(), p.markdown.as_str()),
             ("Ops - Handbook", "Page <b> text\n")
         );
+    }
+
+    #[test]
+    fn an_outline_keeps_navigation_links_and_finds_api_documents() {
+        let html = r##"<html><head><title> Acme  AI </title><base href="https://acme.test/docs/">
+            <link rel="canonical" href="https://acme.test/docs/start"><meta name="x" content="y"></head>
+            <body><nav><a href="/products">Products</a><a href="api#top">API</a></nav>
+            <a rel="nofollow noopener" href="https://play.google.com/store/apps/details?id=com.acme.app">Get it</a>
+            <a href="mailto:hi@acme.test">mail</a><a href="#x">here</a>
+            <script>loadSwaggerUI('/assets/openapi-specs/search.yaml');</script>
+            <footer><a href="https://github.com/acme/">GitHub</a></footer></body></html>"##;
+        let o = outline(html, &u("https://acme.test/docs/start"));
+        assert_eq!(o.title, "Acme AI");
+        assert_eq!(o.canonical, Some(u("https://acme.test/docs/start")));
+        let links: Vec<(String, bool)> = o.links.iter().map(|(l, f)| (l.to_string(), *f)).collect();
+        assert_eq!(
+            links,
+            vec![
+                ("https://acme.test/products".to_owned(), true),
+                ("https://acme.test/docs/api".to_owned(), true),
+                (
+                    "https://play.google.com/store/apps/details?id=com.acme.app".to_owned(),
+                    false
+                ),
+                ("https://github.com/acme/".to_owned(), true),
+            ]
+        );
+        assert_eq!(
+            o.specs,
+            vec![u("https://acme.test/assets/openapi-specs/search.yaml")]
+        );
+        assert_eq!(o.scripts, 1);
+        assert!(o.text_chars > 10, "{}", o.text_chars);
+        let shell = outline(
+            r#"<html><head><title>App</title></head><body><div id="root"></div><script src="/app.js"></script></body></html>"#,
+            &u("https://acme.test/"),
+        );
+        assert_eq!(
+            (shell.text_chars, shell.links.len(), shell.scripts),
+            (0, 0, 1)
+        );
+        let nofollow = outline(
+            r#"<meta name="robots" content="noindex, nofollow"><a href="/x">x</a>"#,
+            &u("https://acme.test/"),
+        );
+        assert_eq!(nofollow.links, vec![(u("https://acme.test/x"), false)]);
     }
 
     #[test]

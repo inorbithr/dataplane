@@ -2,10 +2,12 @@
 //! the local policy and is pinned to the address the policy admitted (no second lookup),
 //! requests are spaced to the provider's rate limit, "too many requests" and server errors
 //! are retried with capped, jittered exponential backoff (a `Retry-After` is honoured),
-//! answers are capped in size, redirects are not followed, and no request leaves the base
+//! answers are capped in size, redirects are not followed (a crawler's [`ApiClient::get_page`]
+//! gets the redirect's target back to decide on itself), and no request leaves the base
 //! URL's origin. Errors name the method, the path and the status, never a header, a query
 //! or a body.
 
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -79,6 +81,55 @@ impl Stats {
     }
 }
 
+/// What [`ApiClient::get_page`] got.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fetched {
+    /// A body of a wanted type.
+    Page {
+        /// The body, at most the client's `max_body`.
+        body: Vec<u8>,
+        /// The `Content-Type`, lower case, without parameters (empty when absent).
+        content_type: String,
+    },
+    /// A 3xx; the caller decides whether to follow it.
+    Redirect {
+        /// The status code.
+        status: u16,
+        /// The `Location` header, as sent.
+        location: Option<String>,
+    },
+    /// A type not wanted (an image, a PDF): the body was not read.
+    Skipped {
+        /// The `Content-Type`, lower case, without parameters.
+        content_type: String,
+        /// `Content-Length`, when sent.
+        size: Option<u64>,
+    },
+}
+
+/// The address the policy admits for `host:port`. A `localhost` name (RFC 6761 section
+/// 6.3: `localhost` and every name under it) is the loopback address, which the policy
+/// must still allow.
+///
+/// # Errors
+/// The policy refuses the host ([`DocsError::Refused`]) or its name does not resolve
+/// ([`DocsError::Unavailable`]).
+pub async fn resolve(policy: &Policy, host: &str, port: u16) -> Result<SocketAddr, DocsError> {
+    let lower = host.trim_end_matches('.').to_ascii_lowercase();
+    let name = if lower == "localhost" || lower.ends_with(".localhost") {
+        "127.0.0.1"
+    } else {
+        host
+    };
+    policy
+        .resolve_target(name, port, Duration::from_secs(5))
+        .await
+        .map_err(|e| match e {
+            TargetError::Refused(r) => DocsError::Refused(format!("{host}:{port}: {r}")),
+            TargetError::Dns(r) => DocsError::Unavailable(format!("{host}:{port}: {r}")),
+        })
+}
+
 /// A read-only JSON client for one provider origin.
 #[derive(Debug)]
 pub struct ApiClient {
@@ -126,13 +177,7 @@ impl ApiClient {
             .ok_or_else(|| DocsError::Refused("the base URL has no host".into()))?
             .to_owned();
         let port = base.port_or_known_default().unwrap_or(443);
-        let addr = policy
-            .resolve_target(&host, port, Duration::from_secs(5))
-            .await
-            .map_err(|e| match e {
-                TargetError::Refused(r) => DocsError::Refused(format!("{host}:{port}: {r}")),
-                TargetError::Dns(r) => DocsError::Unavailable(format!("{host}:{port}: {r}")),
-            })?;
+        let addr = resolve(policy, &host, port).await?;
         crate::tls::install_crypto_provider();
         let mut builder = tls
             .reqwest_builder()
@@ -214,6 +259,22 @@ impl ApiClient {
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
+    /// `GET path` for a crawler: a redirect comes back as [`Fetched::Redirect`] instead of
+    /// an error, and a body whose type `wanted` refuses is not read.
+    ///
+    /// # Errors
+    /// See [`DocsError`]; never [`DocsError::Redirected`].
+    pub async fn get_page(
+        &self,
+        path: &str,
+        accept: &'static str,
+        wanted: fn(&str) -> bool,
+    ) -> Result<Fetched, DocsError> {
+        self.exchange(Method::GET, path, None, accept, Some(wanted))
+            .await
+            .map(|(f, _)| f)
+    }
+
     /// `POST path` with a JSON body, for providers that read with POST (Notion's search
     /// and queries). Never used to change anything.
     ///
@@ -260,6 +321,27 @@ impl ApiClient {
         body: Option<&Value>,
         accept: &'static str,
     ) -> Result<(Vec<u8>, String), DocsError> {
+        match self.exchange(method, path, body, accept, None).await? {
+            (Fetched::Page { body, .. }, what) => Ok((body, what)),
+            (Fetched::Redirect { status, .. }, what) => {
+                let status = StatusCode::from_u16(status)
+                    .map_or_else(|_| status.to_string(), |s| s.to_string());
+                Err(DocsError::Redirected(format!("{what}: {status}")))
+            }
+            (Fetched::Skipped { .. }, what) => Err(DocsError::Malformed(what)),
+        }
+    }
+
+    /// One request with pacing and retries. With `page`, a 3xx is an answer and a body of
+    /// a type `page` refuses is left unread.
+    async fn exchange(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+        accept: &'static str,
+        page: Option<fn(&str) -> bool>,
+    ) -> Result<(Fetched, String), DocsError> {
         let url = self.url(path)?;
         let what = format!("{method} {}", url.path());
         let mut attempt = 0u32;
@@ -278,8 +360,25 @@ impl ApiClient {
                 Ok(resp) => {
                     let status = resp.status();
                     if status.is_success() {
-                        let bytes = self.read_body(resp, &what).await?;
-                        return Ok((bytes, what));
+                        let content_type = content_type(resp.headers());
+                        if page.is_some_and(|wanted| !wanted(&content_type)) {
+                            let size = resp.content_length();
+                            return Ok((Fetched::Skipped { content_type, size }, what));
+                        }
+                        let body = self.read_body(resp, &what).await?;
+                        return Ok((Fetched::Page { body, content_type }, what));
+                    }
+                    if status.is_redirection() {
+                        let location = resp
+                            .headers()
+                            .get(reqwest::header::LOCATION)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_owned);
+                        let r = Fetched::Redirect {
+                            status: status.as_u16(),
+                            location,
+                        };
+                        return Ok((r, what));
                     }
                     match status {
                         StatusCode::TOO_MANY_REQUESTS => {
@@ -314,9 +413,6 @@ impl ApiClient {
                         }
                         StatusCode::NOT_FOUND | StatusCode::GONE => {
                             return Err(DocsError::NotFound(format!("{what}: {status}")));
-                        }
-                        s if s.is_redirection() => {
-                            return Err(DocsError::Redirected(format!("{what}: {status}")));
                         }
                         _ => return Err(DocsError::Malformed(format!("{what}: {status}"))),
                     }
@@ -369,10 +465,20 @@ impl ApiClient {
 }
 
 const JSON: &str = "application/json";
-const TEXT: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8";
+/// What a page, a sitemap or robots.txt is asked for with.
+pub const TEXT: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8";
 
 fn json_of(bytes: &[u8], what: &str) -> Result<Value, DocsError> {
     serde_json::from_slice(bytes).map_err(|_| DocsError::Malformed(format!("{what}: not JSON")))
+}
+
+/// `Content-Type` without parameters, lower case; empty when absent.
+fn content_type(h: &HeaderMap) -> String {
+    h.get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .map(|v| v.trim().to_ascii_lowercase())
+        .unwrap_or_default()
 }
 
 /// `Retry-After` in seconds. An HTTP date is not honoured (the backoff applies).
@@ -535,6 +641,49 @@ mod tests {
             c.get("/r").await.unwrap_err(),
             DocsError::Redirected(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_page_fetch_returns_redirects_and_skips_unwanted_types() {
+        let s = MockServer::start().await;
+        Mock::given(path("/r"))
+            .respond_with(ResponseTemplate::new(301).insert_header("location", "/to"))
+            .mount(&s)
+            .await;
+        Mock::given(path("/img"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("x".repeat(4096), "image/png"))
+            .mount(&s)
+            .await;
+        Mock::given(path("/p"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw("<p>hi</p>", "text/html; charset=utf-8"),
+            )
+            .mount(&s)
+            .await;
+        let c = client(&s, fast()).await;
+        let html = |t: &str| t == "text/html";
+        assert_eq!(
+            c.get_page("/r", TEXT, html).await.unwrap(),
+            Fetched::Redirect {
+                status: 301,
+                location: Some("/to".into())
+            }
+        );
+        assert_eq!(
+            c.get_page("/img", TEXT, html).await.unwrap(),
+            Fetched::Skipped {
+                content_type: "image/png".into(),
+                size: Some(4096)
+            },
+            "an unwanted body is not read, so the size cap does not apply"
+        );
+        assert_eq!(
+            c.get_page("/p", TEXT, html).await.unwrap(),
+            Fetched::Page {
+                body: b"<p>hi</p>".to_vec(),
+                content_type: "text/html".into()
+            }
+        );
     }
 
     #[tokio::test]

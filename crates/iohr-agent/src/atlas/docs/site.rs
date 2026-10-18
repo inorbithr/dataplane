@@ -8,6 +8,10 @@
 //! A page's change time is the sitemap's `<lastmod>`. A page without one is read on every
 //! run (its digest says whether it changed). Redirects are not followed: a sitemap entry
 //! that redirects is skipped as gone, since the page it points to is listed on its own.
+//!
+//! Following every link across a whole registrable domain is the crawler's job
+//! ([`super::crawl`], `iohr-agent atlas crawl`), which reuses these robots.txt and sitemap
+//! readers.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -48,6 +52,24 @@ pub struct Robots {
 }
 
 impl Robots {
+    /// Rules that allow nothing: robots.txt itself is forbidden (401, 403) or unreachable
+    /// (RFC 9309 section 2.3.1.4).
+    #[must_use]
+    pub fn deny_all() -> Self {
+        Self {
+            rules: vec![(false, "/".into())],
+            ..Self::default()
+        }
+    }
+
+    /// The pace `Crawl-delay` asks for, in requests per minute (at least 1), if it asks.
+    #[must_use]
+    pub fn per_minute(&self) -> Option<u32> {
+        self.crawl_delay
+            .filter(|d| *d > 0)
+            .map(|d| u32::try_from(60 / d.min(60)).unwrap_or(1).max(1))
+    }
+
     /// Parses robots.txt: the group naming `iohr-agent` if there is one, else `*`.
     #[must_use]
     pub fn parse(text: &str) -> Self {
@@ -151,7 +173,7 @@ fn robots_match(pattern: &str, path: &str) -> bool {
 }
 
 /// `(loc, lastmod)` pairs of a urlset, or the locs of a sitemap index.
-fn sitemap_entries(xml: &str) -> (bool, Vec<(String, Option<Timestamp>)>) {
+pub(crate) fn sitemap_entries(xml: &str) -> (bool, Vec<(String, Option<Timestamp>)>) {
     let index = xml.contains("<sitemapindex");
     let tag = if index { "sitemap" } else { "url" };
     let mut out = Vec::new();
@@ -244,8 +266,7 @@ impl Site {
         let site = Self::new(api, root);
         // Honour Crawl-delay from the start: read robots.txt before any page.
         let robots = site.robots().await?;
-        if let Some(d) = robots.crawl_delay.filter(|d| *d > 0) {
-            let per_minute = u32::try_from(60 / d.min(60)).unwrap_or(1).max(1);
+        if let Some(per_minute) = robots.per_minute() {
             site.api.slow_to(per_minute);
         }
         Ok(site)
@@ -270,10 +291,7 @@ impl Site {
             Ok(text) => Robots::parse(&text),
             Err(DocsError::NotFound(_) | DocsError::Redirected(_)) => Robots::default(),
             // A site that forbids robots.txt itself is read as forbidding everything.
-            Err(DocsError::Forbidden(_) | DocsError::Unauthorized(_)) => Robots {
-                rules: vec![(false, "/".into())],
-                ..Robots::default()
-            },
+            Err(DocsError::Forbidden(_) | DocsError::Unauthorized(_)) => Robots::deny_all(),
             Err(e) => return Err(e),
         };
         *self
