@@ -31,7 +31,54 @@ struct Env {
     fed: Arc<FedApprovals>,
 }
 
+fn mode(p: &Path, m: u32) {
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+}
+
+impl Env {
+    /// Writes a file into the working directory, which the agent may not write to.
+    fn write(&self, name: &str, body: &str) {
+        mode(&self.work, 0o755);
+        std::fs::write(self.work.join(name), body).unwrap();
+        mode(&self.work, 0o555);
+    }
+
+    fn conn(&self, kind: Kind) -> Conn {
+        let mut c = Conn::new(
+            "c1",
+            kind,
+            self.tmp.path().join("bin/tool"),
+            self.work.clone(),
+        );
+        c.env = BTreeMap::from([
+            ("MARKS".into(), self.marks.to_string_lossy().into_owned()),
+            ("PATH".into(), "/usr/bin:/bin".into()),
+        ]);
+        c.timeout_secs = 10;
+        c.max_output = 4096;
+        c
+    }
+
+    /// Rebuilds the runner around `conn`, keeping the plans and the audit log.
+    fn rebuild(&mut self, conn: Conn) {
+        let audit = Arc::new(Audit::open(&self.tmp.path().join("audit")).unwrap());
+        self.runner = Runner::new(conn, &self.tmp.path().join("plans"), audit)
+            .unwrap()
+            .with_approvals(self.fed.clone());
+    }
+}
+
+impl Drop for Env {
+    fn drop(&mut self) {
+        mode(&self.work, 0o755);
+    }
+}
+
 fn env(kind: Kind, body: &str) -> Env {
+    env_with(kind, body, |_| {})
+}
+
+fn env_with(kind: Kind, body: &str, f: impl FnOnce(&mut Conn)) -> Env {
     let t = tempfile::tempdir().unwrap();
     let bins = t.path().join("bin");
     let work = t.path().join("work");
@@ -40,21 +87,27 @@ fn env(kind: Kind, body: &str) -> Env {
     let marks = t.path().join("marks");
     std::fs::create_dir_all(&marks).unwrap();
     let bin = script(&bins, "tool", body);
-    let conn = Conn {
-        name: "c1".into(),
-        kind,
-        bin,
-        aux_bin: None,
-        workdir: work.clone(),
-        prefix: vec![],
-        env: BTreeMap::from([("MARKS".into(), marks.to_string_lossy().into_owned()), ("PATH".into(), "/usr/bin:/bin".into())]),
-        timeout_secs: 10,
-        max_output: 4096,
-    };
+    mode(&work, 0o555);
+    let mut conn = Conn::new("c1", kind, bin, work.clone());
+    conn.env = BTreeMap::from([
+        ("MARKS".into(), marks.to_string_lossy().into_owned()),
+        ("PATH".into(), "/usr/bin:/bin".into()),
+    ]);
+    conn.timeout_secs = 10;
+    conn.max_output = 4096;
+    f(&mut conn);
     let audit = Arc::new(Audit::open(&t.path().join("audit")).unwrap());
     let fed = Arc::new(FedApprovals::new());
-    let runner = Runner::new(conn, &t.path().join("plans"), audit).unwrap().with_approvals(fed.clone());
-    Env { tmp: t, work, marks, runner, fed }
+    let runner = Runner::new(conn, &t.path().join("plans"), audit)
+        .unwrap()
+        .with_approvals(fed.clone());
+    Env {
+        tmp: t,
+        work,
+        marks,
+        runner,
+        fed,
+    }
 }
 
 const KUBECTL: &str = r#"
@@ -69,59 +122,139 @@ esac
 #[tokio::test]
 async fn kubectl_plan_then_apply_with_matching_hash() {
     let e = env(Kind::Kubectl, KUBECTL);
-    std::fs::write(e.work.join("m.yaml"), "kind: Deployment\nreplicas: 3\n").unwrap();
-    let plan = e.runner.run("alice", &s("diff -f m.yaml -n shop"), None).await.unwrap();
+    e.write("m.yaml", "kind: Deployment\nreplicas: 3\n");
+    let plan = e
+        .runner
+        .run("alice", &s("diff -f m.yaml -n shop"), None)
+        .await
+        .unwrap();
     let hash = plan.plan_hash.clone().unwrap();
     assert!(hash.starts_with("sha256:") && hash.len() == 71);
-    assert!(!plan.stdout.contains("hunter2hunter2"), "plan output is redacted: {}", plan.stdout);
+    assert!(
+        !plan.stdout.contains("hunter2hunter2"),
+        "plan output is redacted: {}",
+        plan.stdout
+    );
     // The file is edited after the plan: the apply still runs the snapshot.
-    std::fs::write(e.work.join("m.yaml"), "kind: Deployment\nreplicas: 99\n").unwrap();
+    e.write("m.yaml", "kind: Deployment\nreplicas: 99\n");
     e.fed.feed("ap1", &hash);
-    let ap = Approval { id: "ap1".into(), plan_hash: hash.clone() };
-    let r = e.runner.run("alice", &s("apply --server-side -f m.yaml -n shop"), Some(&ap)).await.unwrap();
+    let ap = Approval {
+        id: "ap1".into(),
+        plan_hash: hash.clone(),
+    };
+    let r = e
+        .runner
+        .run(
+            "alice",
+            &s("apply --server-side -f m.yaml -n shop"),
+            Some(&ap),
+        )
+        .await
+        .unwrap();
     assert_eq!(r.code, 0);
     let applied = std::fs::read_to_string(e.marks.join("applied")).unwrap();
-    assert!(applied.contains("replicas: 3"), "applied the snapshot, got {applied:?}");
+    assert!(
+        applied.contains("replicas: 3"),
+        "applied the snapshot, got {applied:?}"
+    );
     // Single use.
-    let again = e.runner.run("alice", &s("apply --server-side -f m.yaml -n shop"), Some(&ap)).await;
+    let again = e
+        .runner
+        .run(
+            "alice",
+            &s("apply --server-side -f m.yaml -n shop"),
+            Some(&ap),
+        )
+        .await;
     assert!(matches!(again, Err(InfraError::Denied(_))), "{again:?}");
 }
 
 #[tokio::test]
 async fn apply_is_refused_without_or_with_the_wrong_hash() {
     let e = env(Kind::Kubectl, KUBECTL);
-    std::fs::write(e.work.join("m.yaml"), "kind: Deployment\n").unwrap();
-    let plan = e.runner.run("alice", &s("diff -f m.yaml"), None).await.unwrap();
+    e.write("m.yaml", "kind: Deployment\n");
+    let plan = e
+        .runner
+        .run("alice", &s("diff -f m.yaml"), None)
+        .await
+        .unwrap();
     let hash = plan.plan_hash.unwrap();
     let apply = s("apply --server-side -f m.yaml");
     // No approval at all.
-    assert!(matches!(e.runner.run("a", &apply, None).await, Err(InfraError::Denied(_))));
+    assert!(matches!(
+        e.runner.run("a", &apply, None).await,
+        Err(InfraError::Denied(_))
+    ));
     // An approval for another hash.
     let other = sha256_of(b"another plan");
     e.fed.feed("ap2", &other);
-    let bad = Approval { id: "ap2".into(), plan_hash: other };
-    assert!(matches!(e.runner.run("a", &apply, Some(&bad)).await, Err(InfraError::Denied(_))));
+    let bad = Approval {
+        id: "ap2".into(),
+        plan_hash: other,
+    };
+    assert!(matches!(
+        e.runner.run("a", &apply, Some(&bad)).await,
+        Err(InfraError::Denied(_))
+    ));
     // A right hash that the checker never issued.
-    let unissued = Approval { id: "nope".into(), plan_hash: hash.clone() };
-    assert!(matches!(e.runner.run("a", &apply, Some(&unissued)).await, Err(InfraError::Denied(_))));
+    let unissued = Approval {
+        id: "nope".into(),
+        plan_hash: hash.clone(),
+    };
+    assert!(matches!(
+        e.runner.run("a", &apply, Some(&unissued)).await,
+        Err(InfraError::Denied(_))
+    ));
     // A good approval used for a different apply (other namespace) is refused and not spent.
     e.fed.feed("ap3", &hash);
-    let good = Approval { id: "ap3".into(), plan_hash: hash };
-    let other_ns = e.runner.run("a", &s("apply --server-side -f m.yaml -n prod"), Some(&good)).await;
-    assert!(matches!(other_ns, Err(InfraError::Denied(_))), "{other_ns:?}");
-    assert!(e.runner.run("a", &apply, Some(&good)).await.is_ok(), "the approval was not burned by the refusal");
+    let good = Approval {
+        id: "ap3".into(),
+        plan_hash: hash,
+    };
+    let other_ns = e
+        .runner
+        .run(
+            "a",
+            &s("apply --server-side -f m.yaml -n prod"),
+            Some(&good),
+        )
+        .await;
+    assert!(
+        matches!(other_ns, Err(InfraError::Denied(_))),
+        "{other_ns:?}"
+    );
+    assert!(
+        e.runner.run("a", &apply, Some(&good)).await.is_ok(),
+        "the approval was not burned by the refusal"
+    );
 }
 
 #[tokio::test]
 async fn a_tampered_snapshot_blocks_the_apply() {
     let e = env(Kind::Kubectl, KUBECTL);
-    std::fs::write(e.work.join("m.yaml"), "kind: Deployment\n").unwrap();
-    let hash = e.runner.run("a", &s("diff -f m.yaml"), None).await.unwrap().plan_hash.unwrap();
-    let dir = e.tmp.path().join("plans").join(hash.strip_prefix("sha256:").unwrap());
+    e.write("m.yaml", "kind: Deployment\n");
+    let hash = e
+        .runner
+        .run("a", &s("diff -f m.yaml"), None)
+        .await
+        .unwrap()
+        .plan_hash
+        .unwrap();
+    let dir = e
+        .tmp
+        .path()
+        .join("plans")
+        .join(hash.strip_prefix("sha256:").unwrap());
     std::fs::write(dir.join("files/m.yaml"), "kind: Deployment\nevil: true\n").unwrap();
     e.fed.feed("ap", &hash);
-    let ap = Approval { id: "ap".into(), plan_hash: hash };
-    let r = e.runner.run("a", &s("apply --server-side -f m.yaml"), Some(&ap)).await;
+    let ap = Approval {
+        id: "ap".into(),
+        plan_hash: hash,
+    };
+    let r = e
+        .runner
+        .run("a", &s("apply --server-side -f m.yaml"), Some(&ap))
+        .await;
     assert!(matches!(r, Err(InfraError::Denied(_))), "{r:?}");
     assert!(!e.marks.join("applied").exists());
 }
@@ -143,17 +276,32 @@ async fn tofu_hash_is_the_plan_files_sha256() {
     let hash = plan.plan_hash.unwrap();
     assert_eq!(hash, sha256_of(b"plan-bytes-v1\n"));
     e.fed.feed("t1", &hash);
-    let ap = Approval { id: "t1".into(), plan_hash: hash };
+    let ap = Approval {
+        id: "t1".into(),
+        plan_hash: hash,
+    };
     e.runner.run("a", &s("apply"), Some(&ap)).await.unwrap();
-    assert_eq!(std::fs::read_to_string(e.marks.join("tofu-applied")).unwrap(), "plan-bytes-v1\n");
+    assert_eq!(
+        std::fs::read_to_string(e.marks.join("tofu-applied")).unwrap(),
+        "plan-bytes-v1\n"
+    );
 }
 
 #[tokio::test]
 async fn reads_run_freely_and_are_redacted_and_refusals_never_start_a_process() {
     let e = env(Kind::Kubectl, KUBECTL);
-    let r = e.runner.run("a", &s("get pods -n shop"), None).await.unwrap();
+    let r = e
+        .runner
+        .run("a", &s("get pods -n shop"), None)
+        .await
+        .unwrap();
     assert_eq!(r.stdout.trim(), "pod/web");
-    for bad in ["get secrets", "exec web -- sh", "delete pod web", "get pods; touch x"] {
+    for bad in [
+        "get secrets",
+        "exec web -- sh",
+        "delete pod web",
+        "get pods; touch x",
+    ] {
         let r = e.runner.run("a", &s(bad), None).await;
         assert!(matches!(r, Err(InfraError::Refused(_))), "{bad}: {r:?}");
     }
@@ -163,7 +311,7 @@ async fn reads_run_freely_and_are_redacted_and_refusals_never_start_a_process() 
 #[tokio::test]
 async fn a_secret_manifest_is_never_planned() {
     let e = env(Kind::Kubectl, KUBECTL);
-    std::fs::write(e.work.join("s.yaml"), "apiVersion: v1\nkind: Secret\ndata:\n  a: Yg==\n").unwrap();
+    e.write("s.yaml", "apiVersion: v1\nkind: Secret\ndata:\n  a: Yg==\n");
     let r = e.runner.run("a", &s("diff -f s.yaml"), None).await;
     assert!(matches!(r, Err(InfraError::Refused(_))), "{r:?}");
 }
@@ -171,30 +319,276 @@ async fn a_secret_manifest_is_never_planned() {
 #[tokio::test]
 async fn path_escapes_are_refused() {
     let e = env(Kind::Kubectl, KUBECTL);
+    mode(&e.work, 0o755);
     std::os::unix::fs::symlink("/etc/hosts", e.work.join("link.yaml")).unwrap();
+    mode(&e.work, 0o555);
     let r = e.runner.run("a", &s("diff -f link.yaml"), None).await;
     assert!(matches!(r, Err(InfraError::Refused(_))), "{r:?}");
 }
 
 #[tokio::test]
-async fn output_is_capped_and_the_deadline_kills() {
+async fn output_is_capped_and_the_deadline_kills_the_whole_group() {
     let e = env(Kind::Ssh, "yes x | head -c 100000; echo");
     let r = e.runner.run("a", &s("uptime"), None).await.unwrap();
     assert!(r.truncated && r.stdout.len() <= 4096);
-    let mut slow = env(Kind::Ssh, "sleep 30");
-    // Rebuild the runner with a one second deadline.
-    let conn = Conn { name: "c".into(), kind: Kind::Ssh, bin: slow.work.parent().unwrap().join("bin/tool"), aux_bin: None, workdir: slow.work.clone(), prefix: vec![], env: BTreeMap::new(), timeout_secs: 1, max_output: 4096 };
-    let audit = Arc::new(Audit::open(&slow.work.parent().unwrap().join("audit2")).unwrap());
-    slow.runner = Runner::new(conn, &slow.work.parent().unwrap().join("plans2"), audit).unwrap();
+    // The tool starts a grandchild and waits; at the deadline both are stopped.
+    let slow = env_with(
+        Kind::Ssh,
+        r#"sleep 30 & echo $! > "$MARKS/gc"; wait"#,
+        |c| c.timeout_secs = 1,
+    );
     let r = slow.runner.run("a", &s("uptime"), None).await;
     assert!(matches!(r, Err(InfraError::Failed(_))), "{r:?}");
+    let gc = std::fs::read_to_string(slow.marks.join("gc")).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let alive = std::process::Command::new("kill")
+        .args(["-0", gc.trim()])
+        .status()
+        .unwrap()
+        .success();
+    assert!(!alive, "the grandchild {} outlived the deadline", gc.trim());
 }
 
 #[tokio::test]
-async fn the_ssh_remote_command_is_one_word_from_the_table() {
-    let e = env(Kind::Ssh, r#"printf '%s\n' "$#" "$1""#);
-    let r = e.runner.run("a", &s("journalctl -u nginx -n 5"), None).await.unwrap();
-    assert_eq!(r.stdout, "1\njournalctl --no-pager -u nginx -n 5\n");
+async fn the_ssh_remote_command_is_one_word_from_the_table_after_the_forced_options() {
+    let e = env_with(Kind::Ssh, r#"printf '%s\n' "$@""#, |c| {
+        c.prefix = s("-p 2222 ops@db1");
+    });
+    let r = e
+        .runner
+        .run("a", &s("journalctl -u nginx -n 5"), None)
+        .await
+        .unwrap();
+    let args: Vec<&str> = r.stdout.lines().collect();
+    assert_eq!(
+        args,
+        [
+            "-F",
+            "/dev/null",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            "ControlPath=none",
+            "-p",
+            "2222",
+            "ops@db1",
+            "journalctl --no-pager -u nginx -n 5"
+        ]
+    );
+    // A prefix naming its own config file is refused at load.
+    let mut c = e.conn(Kind::Ssh);
+    c.prefix = s("-F /tmp/evil ops@db1");
+    let audit = Arc::new(Audit::open(&e.tmp.path().join("audit3")).unwrap());
+    assert!(Runner::new(c, &e.tmp.path().join("plans3"), audit).is_err());
+}
+
+#[tokio::test]
+async fn ssh_units_outside_the_allow_list_are_refused() {
+    let e = env_with(Kind::Ssh, "echo ok", |c| {
+        c.units = Some(vec!["nginx.service".into()]);
+    });
+    assert!(
+        e.runner
+            .run("a", &s("journalctl -u nginx -n 5"), None)
+            .await
+            .is_ok()
+    );
+    let r = e.runner.run("a", &s("journalctl -u sshd -n 5"), None).await;
+    assert!(matches!(r, Err(InfraError::Refused(_))), "{r:?}");
+}
+
+#[tokio::test]
+async fn key_file_contents_never_reach_the_output() {
+    let t = tempfile::tempdir().unwrap();
+    let key = t.path().join("id_ed25519");
+    let body = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ\n-----END OPENSSH PRIVATE KEY-----\n";
+    std::fs::write(&key, body).unwrap();
+    let k = key.to_string_lossy().into_owned();
+    let e = env_with(Kind::Ssh, &format!("cat '{k}'"), |c| {
+        c.prefix = vec!["-i".into(), k.clone(), "ops@db1".into()];
+    });
+    let r = e.runner.run("a", &s("uptime"), None).await.unwrap();
+    assert!(
+        !r.stdout
+            .contains("b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ"),
+        "{}",
+        r.stdout
+    );
+}
+
+#[tokio::test]
+async fn a_tree_the_agent_can_write_is_never_planned_or_read() {
+    let e = env(Kind::Kubectl, KUBECTL);
+    e.write("m.yaml", "kind: Deployment\n");
+    mode(&e.work, 0o755);
+    for argv in ["get pods", "diff -f m.yaml"] {
+        let r = e.runner.run("a", &s(argv), None).await;
+        assert!(matches!(r, Err(InfraError::Refused(_))), "{argv}: {r:?}");
+    }
+    mode(&e.work, 0o575);
+    let r = e.runner.run("a", &s("get pods"), None).await;
+    assert!(
+        matches!(r, Err(InfraError::Refused(_))),
+        "group-writable: {r:?}"
+    );
+}
+
+#[tokio::test]
+async fn ansible_runs_with_the_tree_plugins_and_config_switched_off() {
+    let body = r#"env | grep ^ANSIBLE_ | grep -v ^ANSIBLE_CONFIG= | sort; [ -f "$ANSIBLE_CONFIG" ] && [ ! -s "$ANSIBLE_CONFIG" ] && echo empty-config"#;
+    let e = env(Kind::Ansible, body);
+    e.write("site.yml", "- hosts: all\n");
+    let r = e
+        .runner
+        .run("a", &s("--list-hosts site.yml"), None)
+        .await
+        .unwrap();
+    assert!(r.plan_hash.is_none(), "a listing saves no plan");
+    assert_eq!(
+        r.stdout,
+        "ANSIBLE_INVENTORY_ENABLED=yaml,ini\nANSIBLE_VARS_ENABLED=host_group_vars\nempty-config\n"
+    );
+}
+
+const SLOW_APPLY: &str = r#"
+case "$1" in
+  diff) echo "+ replicas: 3"; exit 1 ;;
+  apply) sleep 2; echo applied ;;
+  *) exit 9 ;;
+esac
+"#;
+
+#[tokio::test]
+async fn one_apply_per_connection_at_a_time() {
+    let e = env(Kind::Kubectl, SLOW_APPLY);
+    e.write("m.yaml", "kind: Deployment\n");
+    let hash = e
+        .runner
+        .run("a", &s("diff -f m.yaml"), None)
+        .await
+        .unwrap()
+        .plan_hash
+        .unwrap();
+    e.fed.feed("l1", &hash);
+    e.fed.feed("l2", &hash);
+    let (a1, a2) = (
+        Approval {
+            id: "l1".into(),
+            plan_hash: hash.clone(),
+        },
+        Approval {
+            id: "l2".into(),
+            plan_hash: hash,
+        },
+    );
+    let apply = s("apply --server-side -f m.yaml");
+    let second = async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        e.runner.run("a", &apply, Some(&a2)).await
+    };
+    let (r1, r2) = tokio::join!(e.runner.run("a", &apply, Some(&a1)), second);
+    assert!(r1.is_ok(), "{r1:?}");
+    assert!(
+        matches!(r2, Err(InfraError::Denied(ref m)) if m.contains("another apply")),
+        "{r2:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_plan_is_bound_to_its_connection_and_expires() {
+    let mut e = env_with(Kind::Kubectl, KUBECTL, |c| c.plan_ttl_secs = 1);
+    e.write("m.yaml", "kind: Deployment\n");
+    let hash = e
+        .runner
+        .run("a", &s("diff -f m.yaml"), None)
+        .await
+        .unwrap()
+        .plan_hash
+        .unwrap();
+    e.fed.feed("x", &hash);
+    let ap = Approval {
+        id: "x".into(),
+        plan_hash: hash.clone(),
+    };
+    let apply = s("apply --server-side -f m.yaml");
+    // Another connection sharing the plans directory cannot apply it.
+    let mut other = e.conn(Kind::Kubectl);
+    other.name = "c2".into();
+    e.rebuild(other);
+    let r = e.runner.run("a", &apply, Some(&ap)).await;
+    assert!(
+        matches!(r, Err(InfraError::Denied(ref m)) if m.contains("another connection")),
+        "{r:?}"
+    );
+    // Past the TTL the plan is refused on its own connection too.
+    let mut same = e.conn(Kind::Kubectl);
+    same.plan_ttl_secs = 1;
+    e.rebuild(same);
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    let r = e.runner.run("a", &apply, Some(&ap)).await;
+    assert!(
+        matches!(r, Err(InfraError::Denied(ref m)) if m.contains("TTL")),
+        "{r:?}"
+    );
+}
+
+#[tokio::test]
+async fn kubectl_resource_types_follow_the_allow_list() {
+    let e = env_with(Kind::Kubectl, KUBECTL, |c| {
+        c.resources = Some(vec!["deployments".into(), "pods".into()]);
+    });
+    assert!(
+        e.runner
+            .run("a", &s("get pods -n shop"), None)
+            .await
+            .is_ok()
+    );
+    let r = e.runner.run("a", &s("get configmaps -n shop"), None).await;
+    assert!(matches!(r, Err(InfraError::Refused(_))), "{r:?}");
+    e.write("c.yaml", "kind: ConfigMap\n");
+    let r = e.runner.run("a", &s("diff -f c.yaml"), None).await;
+    assert!(matches!(r, Err(InfraError::Refused(_))), "{r:?}");
+}
+
+#[tokio::test]
+async fn helm_oci_charts_come_only_from_listed_registries() {
+    let digest = "a".repeat(64);
+    let e = env_with(Kind::Helm, "echo diff; exit 0", |c| {
+        c.oci_registries = vec!["ghcr.io".into()];
+    });
+    let bad = format!("diff upgrade web oci://evil.example/charts/web@sha256:{digest}");
+    let r = e.runner.run("a", &s(&bad), None).await;
+    assert!(matches!(r, Err(InfraError::Refused(_))), "{r:?}");
+    let good = format!("diff upgrade web oci://ghcr.io/acme/web@sha256:{digest}");
+    let r = e.runner.run("a", &s(&good), None).await;
+    assert!(!matches!(r, Err(InfraError::Refused(_))), "{r:?}");
+}
+
+#[tokio::test]
+async fn a_secret_manifest_is_never_planned_in_any_spelling_and_the_audit_names_it() {
+    let e = env(Kind::Kubectl, KUBECTL);
+    let list = r#"{"apiVersion":"v1","kind":"List","items":[{"kind":"Secret","metadata":{"namespace":"shop"},"data":{"a":"Yg=="}}]}"#;
+    e.write("l.json", list);
+    e.write("c.yaml", "apiVersion: v1\nkind: Secret # the db password\nmetadata:\n  namespace: shop\ndata:\n  a: Yg==\n");
+    e.write("q.yaml", "apiVersion: v1\n\"kind\": 'Secret'\n");
+    for f in ["l.json", "c.yaml", "q.yaml"] {
+        let r = e.runner.run("a", &s(&format!("diff -f {f}")), None).await;
+        assert!(matches!(r, Err(InfraError::Refused(_))), "{f}: {r:?}");
+    }
+    let audit = Audit::open(&e.tmp.path().join("audit")).unwrap();
+    let recent = audit.recent(10);
+    let hit = recent
+        .iter()
+        .find(|x| x.action == "infra.kubectl.refused" && x.reason.contains("l.json"))
+        .unwrap();
+    assert!(
+        hit.reason.contains("kind Secret, namespace shop"),
+        "{}",
+        hit.reason
+    );
+    assert!(recent.iter().all(|x| !x.reason.contains("Yg==")));
 }
 
 #[tokio::test]
@@ -204,7 +598,11 @@ async fn every_run_is_audited_and_the_chain_verifies() {
     let _ = e.runner.run("a", &s("delete pod x"), None).await;
     let audit = Audit::open(&e.tmp.path().join("audit")).unwrap();
     let recent = audit.recent(10);
-    assert!(recent.iter().any(|x| x.action == "infra.kubectl.read" && x.outcome == "ok"));
+    assert!(
+        recent
+            .iter()
+            .any(|x| x.action == "infra.kubectl.read" && x.outcome == "ok")
+    );
     assert!(recent.iter().any(|x| x.action == "infra.kubectl.refused"));
     assert!(audit.verify().is_ok());
 }

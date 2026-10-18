@@ -38,10 +38,29 @@ pub struct Plan {
     pub output_sha256: String,
     /// The plan hash; empty while it is being computed.
     pub hash: String,
+    /// The connection the plan was made on; an apply on another is denied.
+    #[serde(default)]
+    pub conn: String,
+    /// sha256 of what the plan ran against (prefix, kube context, kubeconfig).
+    #[serde(default)]
+    pub context_sha256: String,
+    /// helm: the chart reference the plan used.
+    #[serde(default)]
+    pub chart: Option<String>,
+    /// helm: the exact chart version the plan used.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// When the plan was made, Unix seconds; the plan TTL counts from here.
+    #[serde(default)]
+    pub created_at: u64,
+    /// tofu: the record's own hash (the plan hash is the plan file's), so the record's
+    /// connection, context and time cannot be changed on their own.
+    #[serde(default)]
+    pub record_sha256: String,
 }
 
 impl Plan {
-    /// The hash of a record: its canonical JSON with the hash field empty.
+    /// The hash of a record: its canonical JSON with the hash fields empty.
     ///
     /// # Panics
     /// Never: the record is plain data.
@@ -49,6 +68,7 @@ impl Plan {
     pub fn compute_hash(&self) -> String {
         let mut c = self.clone();
         c.hash = String::new();
+        c.record_sha256 = String::new();
         sha256_of(&serde_json::to_vec(&c).unwrap_or_default())
     }
 }
@@ -131,6 +151,9 @@ impl Store {
                 .map_err(|_| "the plan file is missing".to_owned())?;
             if sha256_of(&got) != hash {
                 return Err("the plan file changed since the plan".into());
+            }
+            if plan.compute_hash() != plan.record_sha256 {
+                return Err("the saved plan record changed since the plan".into());
             }
         } else if plan.compute_hash() != hash {
             return Err("the saved plan record changed since the plan".into());

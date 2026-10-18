@@ -67,32 +67,76 @@ pub async fn run(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // Its own process group, so a deadline stops everything it started, not only it.
+    #[cfg(unix)]
+    cmd.process_group(0);
     let mut child = cmd.spawn()?;
     let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) else {
         return Err(std::io::Error::other("no pipes"));
     };
-    let work = async {
+    let pid = child.id();
+    let readers = tokio::spawn(async move {
         let ((o, oc), (e, ec)) = tokio::join!(read_capped(out, cap), read_capped(err, cap));
-        let status = child.wait().await?;
-        Ok::<_, std::io::Error>((o, e, oc || ec, status.code()))
+        (o, e, oc || ec)
+    });
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    let status = tokio::select! {
+        s = child.wait() => Some(s?),
+        () = &mut deadline => None,
     };
-    match tokio::time::timeout(timeout, work).await {
-        Ok(r) => {
-            let (stdout, stderr, truncated, code) = r?;
-            Ok(Output {
-                code,
-                stdout,
-                stderr,
-                truncated,
-                timed_out: false,
-            })
-        }
-        Err(_) => Ok(Output {
+    let Some(status) = status else {
+        stop(&mut child, pid).await;
+        readers.abort();
+        return Ok(Output {
             code: None,
             stdout: Vec::new(),
             stderr: Vec::new(),
             truncated: false,
             timed_out: true,
+        });
+    };
+    // The child is gone; a grandchild still holding a pipe gets what is left of the deadline.
+    match tokio::time::timeout_at(deadline.deadline(), readers).await {
+        Ok(Ok((stdout, stderr, truncated))) => Ok(Output {
+            code: status.code(),
+            stdout,
+            stderr,
+            truncated,
+            timed_out: false,
         }),
+        Ok(Err(e)) => Err(std::io::Error::other(e)),
+        Err(_) => {
+            stop(&mut child, pid).await;
+            Ok(Output {
+                code: None,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                truncated: false,
+                timed_out: true,
+            })
+        }
     }
+}
+
+/// Stops the process group: TERM, two seconds to exit, then KILL.
+#[cfg(unix)]
+async fn stop(child: &mut tokio::process::Child, pid: Option<u32>) {
+    use rustix::process::{Pid, Signal, kill_process_group};
+    let group = pid
+        .and_then(|p| i32::try_from(p).ok())
+        .and_then(Pid::from_raw);
+    if let Some(g) = group {
+        let _ = kill_process_group(g, Signal::TERM);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let _ = kill_process_group(g, Signal::KILL);
+    } else {
+        let _ = child.start_kill();
+    }
+    let _ = child.wait().await;
+}
+
+#[cfg(not(unix))]
+async fn stop(child: &mut tokio::process::Child, _pid: Option<u32>) {
+    let _ = child.kill().await;
 }

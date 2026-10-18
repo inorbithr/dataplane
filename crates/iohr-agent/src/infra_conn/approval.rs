@@ -3,9 +3,6 @@
 //! This slice has the interface and a test double fed from the infra run. The real check
 //! (a `ClaimRun` against the platform) is slice C4; nothing here calls a server.
 
-use std::collections::BTreeSet;
-use std::sync::Mutex;
-
 /// What the caller presents with an apply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Approval {
@@ -36,17 +33,22 @@ pub struct DenyAll;
 
 impl ApprovalCheck for DenyAll {
     fn spend(&self, _: &Approval, _: &str) -> Result<(), Denied> {
-        Err(Denied("no approval source is configured; applies are refused".into()))
+        Err(Denied(
+            "no approval source is configured; applies are refused".into(),
+        ))
     }
 }
 
 /// A test double: approvals are fed in, as the infra run will feed them, and each is
-/// spent once.
+/// spent once. Built only for tests (the `test-approvals` feature), so a release agent
+/// cannot be wired to an approval source that anyone in the process can feed.
+#[cfg(any(test, feature = "test-approvals"))]
 #[derive(Debug, Default)]
 pub struct FedApprovals {
-    live: Mutex<BTreeSet<(String, String)>>,
+    live: std::sync::Mutex<std::collections::BTreeSet<(String, String)>>,
 }
 
+#[cfg(any(test, feature = "test-approvals"))]
 impl FedApprovals {
     /// An empty set.
     #[must_use]
@@ -64,6 +66,7 @@ impl FedApprovals {
     }
 }
 
+#[cfg(any(test, feature = "test-approvals"))]
 impl ApprovalCheck for FedApprovals {
     fn spend(&self, approval: &Approval, plan_hash: &str) -> Result<(), Denied> {
         if approval.plan_hash != plan_hash {

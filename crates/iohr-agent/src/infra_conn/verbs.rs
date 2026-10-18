@@ -83,6 +83,59 @@ pub struct Command {
     pub ok_codes: &'static [i32],
     /// For a plan: the apply it makes possible.
     pub apply: Option<Vec<Arg>>,
+    /// The values a connection's allow-lists are checked against.
+    pub values: Values,
+}
+
+/// What a request names, for the per-connection allow-lists.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Values {
+    /// Kubernetes resource types, as written (`deploy`, `pods`, `deployments.apps`).
+    pub resources: Vec<String>,
+    /// The helm chart reference.
+    pub chart: Option<String>,
+    /// The helm chart version.
+    pub version: Option<String>,
+    /// systemd units.
+    pub units: Vec<String>,
+}
+
+/// The resource types a resource word names: `pods,deploy/web` names `pods` and `deploy`.
+fn resource_types(word: &str) -> impl Iterator<Item = String> + '_ {
+    word.split(',')
+        .filter_map(|p| p.split('/').next())
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned)
+}
+
+fn values(v: &Verb, p: &Parsed) -> Values {
+    let mut out = Values::default();
+    for (check, x) in v.pos.iter().zip(&p.pos) {
+        match check {
+            V::Res | V::One(_) => out.resources.extend(resource_types(x)),
+            V::Chart => out.chart = Some(x.clone()),
+            V::Unit => out.units.push(x.clone()),
+            _ => {}
+        }
+    }
+    // `kubectl logs web-1` reads a pod; `logs deploy/web` names its type.
+    if v.kind == Kind::Kubectl && v.id == "logs" {
+        out.resources = match p.pos.first().and_then(|x| x.split_once('/')) {
+            Some((t, _)) => vec![t.to_owned()],
+            None => vec!["pods".to_owned()],
+        };
+    }
+    for f in v.flags {
+        let Some(x) = p.vals.get(f.canon) else {
+            continue;
+        };
+        match f.v {
+            V::Ver => out.version = Some(x.clone()),
+            V::Unit => out.units.push(x.clone()),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// How a value is checked.
@@ -123,17 +176,83 @@ fn name_chars(s: &str, extra: &[u8], max: usize) -> bool {
         })
 }
 
+/// Whether one resource word names secrets in any spelling kubectl accepts: `Secret`,
+/// `secrets`, `secrets.v1`, `secret.v1.`, `SECRETS.v1.core`. The word is lowercased,
+/// cut at its first `.` (the group and version), and a plural `s` is dropped. RBAC that
+/// denies secrets to the agent's identity is the real control; this is the second one.
+fn names_secrets(word: &str) -> bool {
+    normal_type(word) == "secret"
+}
+
+/// A resource type in one spelling, for comparing: lowercase, without its API group and
+/// without a plural `s` (`Secrets.v1.` and `secret` are both `secret`; `deploy`,
+/// `deployment` and `deployments.apps` become `deploy` and `deployment`). Short names
+/// (`deploy`, `po`) stay as they are, so an allow-list names each spelling it accepts.
+#[must_use]
+pub fn normal_type(word: &str) -> String {
+    let w = word.to_ascii_lowercase();
+    let head = w.split('.').next().unwrap_or_default();
+    head.strip_suffix('s').unwrap_or(head).to_owned()
+}
+
+/// A helm chart reference the tables allow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChartRef {
+    /// `repo/name` from a configured repository; the version comes from `--version`.
+    Repo,
+    /// `oci://<registry>/<path>@sha256:<64 hex>`, pinned by its digest.
+    Oci {
+        /// The registry host (and port), checked against the connection's allow-list.
+        registry: String,
+    },
+}
+
+/// Parses a chart reference: `repo/name`, or an OCI reference pinned by digest. Local
+/// paths, `https://` archives and unpinned OCI references are refused, since helm would
+/// load whatever is there at plan and again at apply.
+#[must_use]
+pub fn chart_ref(s: &str) -> Option<ChartRef> {
+    if let Some(rest) = s.strip_prefix("oci://") {
+        let (path, digest) = rest.split_once("@sha256:")?;
+        let (registry, repo) = path.split_once('/')?;
+        let ok = digest.len() == 64
+            && digest
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            && name_chars(registry, b":", 253)
+            && registry.contains('.')
+            && !repo
+                .split('/')
+                .any(|p| p.is_empty() || p == "." || p == "..")
+            && name_chars(repo, b"/", 253);
+        return ok.then(|| ChartRef::Oci {
+            registry: registry.to_owned(),
+        });
+    }
+    let (repo, name) = s.split_once('/')?;
+    (name_chars(repo, b"", 63)
+        && name_chars(name, b"", 253)
+        && !matches!(repo, "." | "..")
+        && !matches!(name, "." | ".."))
+    .then_some(ChartRef::Repo)
+}
+
+/// An exact chart version: `1.2.3`, `v1.2.3`, `1.2.3-rc.1+build`; never a range.
+fn exact_version(s: &str) -> bool {
+    let body = s.strip_prefix('v').unwrap_or(s);
+    let core = body.split(['-', '+']).next().unwrap_or_default();
+    name_chars(s, b"+", 64)
+        && !core.is_empty()
+        && core
+            .split('.')
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
 impl V {
     fn check(self, s: &str) -> Result<(), Refused> {
         let ok = match self {
             Self::Name => name_chars(s, b":/=", 253),
-            Self::Res => {
-                name_chars(s, b",/:", 253)
-                    && !s.split([',', '/']).any(|p| {
-                        let p = p.to_ascii_lowercase();
-                        p == "secret" || p == "secrets" || p.starts_with("secret.")
-                    })
-            }
+            Self::Res => name_chars(s, b",/:", 253) && !s.split([',', '/']).any(names_secrets),
             Self::Sel => name_chars(s, b",=!()/: ", 253) && !s.starts_with(' '),
             Self::Int(max) => s.parse::<u32>().is_ok_and(|n| n >= 1 && n <= max),
             Self::Out => matches!(s, "json" | "yaml" | "name" | "wide" | "table"),
@@ -144,8 +263,8 @@ impl V {
                     && s.len() > 1
             }
             Self::File => rel_path(s),
-            Self::Chart => name_chars(s, b"/:", 253) && !s.contains(".."),
-            Self::Ver => name_chars(s, b"+", 64),
+            Self::Chart => chart_ref(s).is_some(),
+            Self::Ver => exact_version(s),
             Self::Unit => name_chars(s, b"@:", 128),
             Self::One(set) => set.contains(&s),
             Self::Pat => name_chars(s, b",:!&[]*", 253),
@@ -563,7 +682,7 @@ const VERBS: &[Verb] = &[
         class: Class::Plan,
         words: &["diff", "upgrade"],
         aux: false,
-        fixed: &[Fx::L("--detailed-exitcode")],
+        fixed: &[Fx::L("--detailed-exitcode"), Fx::L("--suppress-secrets")],
         pos: &[V::Name, V::Chart],
         min_pos: 2,
         flags: &[VALUES, VERSION, NS],
@@ -612,7 +731,7 @@ const VERBS: &[Verb] = &[
     Verb {
         kind: Kind::Ansible,
         id: "list-hosts",
-        class: Class::Read,
+        class: Class::Plan,
         words: &[],
         aux: false,
         fixed: &[],
@@ -632,7 +751,7 @@ const VERBS: &[Verb] = &[
     Verb {
         kind: Kind::Ansible,
         id: "list-tasks",
-        class: Class::Read,
+        class: Class::Plan,
         words: &[],
         aux: false,
         fixed: &[],
@@ -703,10 +822,7 @@ const VERBS: &[Verb] = &[
         pos: &[],
         min_pos: 0,
         flags: NONE_F,
-        bools: &[B {
-            names: &["-json"],
-            canon: "-json",
-        }],
+        bools: NONE_B,
         need: &[],
         swallow: NONE_S,
         default: NONE_D,
@@ -721,23 +837,6 @@ const VERBS: &[Verb] = &[
         aux: false,
         fixed: &[],
         pos: &[],
-        min_pos: 0,
-        flags: NONE_F,
-        bools: NONE_B,
-        need: &[],
-        swallow: NONE_S,
-        default: NONE_D,
-        ok: &[0],
-        apply_id: None,
-    },
-    Verb {
-        kind: Kind::Tofu,
-        id: "output",
-        class: Class::Read,
-        words: &["output"],
-        aux: false,
-        fixed: &[Fx::L("-no-color")],
-        pos: &[V::Name],
         min_pos: 0,
         flags: NONE_F,
         bools: NONE_B,
@@ -1022,12 +1121,33 @@ fn parse(v: &Verb, argv: &[String]) -> Result<Parsed, Refused> {
     if p.pos.len() < v.min_pos {
         return no(format!("{:?} needs at least {} arguments", v.id, v.min_pos));
     }
+    // A chart pinned by digest needs no version, and must not carry a second pin.
+    let digest =
+        v.pos.iter().zip(&p.pos).any(|(c, x)| {
+            matches!(c, V::Chart) && matches!(chart_ref(x), Some(ChartRef::Oci { .. }))
+        });
+    if digest && p.vals.contains_key("--version") {
+        return no("an OCI chart pinned by digest takes no --version");
+    }
     for n in v.need {
+        if digest && *n == "--version" {
+            continue;
+        }
         if !p.vals.contains_key(n) && !p.bools.contains(n) {
             return no(format!("{:?} needs {n}", v.id));
         }
     }
     Ok(p)
+}
+
+/// A flag's given value, else the table's default for it.
+fn flag_value(v: &Verb, p: &Parsed, canon: &str) -> Option<String> {
+    p.vals.get(canon).cloned().or_else(|| {
+        v.default
+            .iter()
+            .find(|(k, _)| *k == canon)
+            .map(|(_, d)| (*d).to_owned())
+    })
 }
 
 /// The argv a parse builds for `v`, in the table's order.
@@ -1044,13 +1164,7 @@ fn emit(v: &Verb, p: &Parsed) -> Vec<Arg> {
             }
         }
         for f in v.flags {
-            let val = p.vals.get(f.canon).cloned().or_else(|| {
-                v.default
-                    .iter()
-                    .find(|(k, _)| *k == f.canon)
-                    .map(|(_, d)| (*d).to_owned())
-            });
-            if let Some(val) = val {
+            if let Some(val) = flag_value(v, p, f.canon) {
                 cmd.push(f.canon.to_owned());
                 cmd.push(val);
             }
@@ -1058,12 +1172,7 @@ fn emit(v: &Verb, p: &Parsed) -> Vec<Arg> {
         cmd.extend(p.pos.iter().cloned());
         return vec![Arg::Lit(cmd.join(" "))];
     }
-    let mut words: Vec<&str> = v.words.to_vec();
-    if v.id == "apply" || v.id == "diff" || v.id == "upgrade" {
-        // `diff`/`apply` are the one word; `diff upgrade` keeps both.
-        words.truncate(words.len());
-    }
-    out.extend(words.iter().map(|w| Arg::lit(w)));
+    out.extend(v.words.iter().map(|w| Arg::lit(w)));
     for f in v.fixed {
         out.push(match f {
             Fx::L(s) => Arg::lit(s),
@@ -1078,13 +1187,7 @@ fn emit(v: &Verb, p: &Parsed) -> Vec<Arg> {
         });
     }
     for f in v.flags {
-        let val = p.vals.get(f.canon).cloned().or_else(|| {
-            v.default
-                .iter()
-                .find(|(k, _)| *k == f.canon)
-                .map(|(_, d)| (*d).to_owned())
-        });
-        if let Some(val) = val {
+        if let Some(val) = flag_value(v, p, f.canon) {
             out.push(Arg::lit(f.canon));
             out.push(if matches!(f.v, V::File) {
                 Arg::File(val)
@@ -1112,7 +1215,10 @@ pub fn classify(kind: Kind, argv: &[String]) -> Result<Command, Refused> {
     let v = select(kind, argv)?;
     let p = parse(v, argv)?;
     let built = emit(v, &p);
-    let apply = v.apply_id.and_then(|id| find(kind, id)).map(|av| emit(av, &p));
+    let apply = v
+        .apply_id
+        .and_then(|id| find(kind, id))
+        .map(|av| emit(av, &p));
     Ok(Command {
         kind,
         class: v.class,
@@ -1121,6 +1227,7 @@ pub fn classify(kind: Kind, argv: &[String]) -> Result<Command, Refused> {
         args: built,
         ok_codes: v.ok,
         apply,
+        values: values(v, &p),
     })
 }
 
@@ -1161,6 +1268,28 @@ mod tests {
             class(Kind::Kubectl, "apply --server-side -f m.yaml").unwrap(),
             Class::Apply
         );
+    }
+
+    #[test]
+    fn the_values_name_resource_types_charts_and_units() {
+        let r = |k, s| classify(k, &a(s)).unwrap().values;
+        assert_eq!(
+            r(Kind::Kubectl, "get pods,deploy/web -n x").resources,
+            ["pods", "deploy"]
+        );
+        assert_eq!(r(Kind::Kubectl, "logs web-1").resources, ["pods"]);
+        assert_eq!(r(Kind::Kubectl, "logs deploy/web").resources, ["deploy"]);
+        assert_eq!(
+            r(Kind::Kubectl, "auth can-i get configmaps").resources,
+            ["configmaps"]
+        );
+        let h = r(Kind::Helm, "upgrade web bitnami/nginx --version 1.2.3");
+        assert_eq!(
+            (h.chart.as_deref(), h.version.as_deref()),
+            (Some("bitnami/nginx"), Some("1.2.3"))
+        );
+        assert_eq!(r(Kind::Ssh, "journalctl -u nginx").units, ["nginx"]);
+        assert_eq!(r(Kind::Ssh, "systemctl status nginx").units, ["nginx"]);
     }
 
     #[test]
@@ -1222,7 +1351,7 @@ mod tests {
         assert!(class(Kind::Helm, "install web repo/web --set a=b").is_err());
         assert_eq!(
             class(Kind::Ansible, "--list-hosts site.yml").unwrap(),
-            Class::Read
+            Class::Plan
         );
         assert_eq!(
             class(Kind::Ansible, "--check --diff site.yml").unwrap(),
@@ -1243,7 +1372,7 @@ mod tests {
             Class::Read
         );
         assert_eq!(class(Kind::Tofu, "state list").unwrap(), Class::Read);
-        assert_eq!(class(Kind::Tofu, "show -json").unwrap(), Class::Read);
+        assert!(class(Kind::Tofu, "show -json").is_err());
         assert_eq!(
             class(Kind::Tofu, "plan -target module.net").unwrap(),
             Class::Plan
@@ -1254,7 +1383,7 @@ mod tests {
         assert!(class(Kind::Tofu, "destroy").is_err());
         assert!(
             class(Kind::Tofu, "output -json").is_err(),
-            "names only: no -json values"
+            "no output verb: it prints values"
         );
         assert_eq!(class(Kind::Ssh, "uptime").unwrap(), Class::Read);
         assert_eq!(
@@ -1329,7 +1458,7 @@ mod tests {
             (Kind::Kubectl, "logs web -c app --since 5m"),
             (
                 Kind::Helm,
-                "template web oci://r.example/web --version 1.2.3+b -f values/prod.yaml",
+                "template web repo/web --version 1.2.3+b -f values/prod.yaml",
             ),
             (Kind::Ssh, "journalctl -u nginx@1.service -n 20"),
         ];
@@ -1347,6 +1476,93 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn no_spelling_of_secrets_is_a_resource() {
+        // Group-qualified, trailing-dot, capitalised and named forms all reach secrets.
+        for bad in [
+            "get secrets.v1",
+            "get secrets.",
+            "get Secret",
+            "get secret.v1.",
+            "get secrets/name",
+            "get SECRETS.v1.core",
+            "describe pods,Secrets.v1 -n shop",
+        ] {
+            assert!(
+                classify(Kind::Kubectl, &a(bad)).is_err(),
+                "{bad} must be refused"
+            );
+        }
+        for good in [
+            "get deployments.apps",
+            "get pods",
+            "get secretstores.external-secrets.io",
+        ] {
+            assert!(classify(Kind::Kubectl, &a(good)).is_ok(), "{good}");
+        }
+    }
+
+    #[test]
+    fn tofu_never_prints_output_values() {
+        assert!(
+            class(Kind::Tofu, "show -json").is_err(),
+            "show -json prints sensitive values"
+        );
+        assert!(class(Kind::Tofu, "output").is_err(), "output prints values");
+        assert!(class(Kind::Tofu, "output db_password").is_err());
+        assert_eq!(class(Kind::Tofu, "show").unwrap(), Class::Read);
+    }
+
+    #[test]
+    fn ansible_listings_load_the_playbook_so_they_are_plans() {
+        assert_eq!(
+            class(Kind::Ansible, "--list-hosts site.yml").unwrap(),
+            Class::Plan
+        );
+        assert_eq!(
+            class(Kind::Ansible, "--list-tasks site.yml").unwrap(),
+            Class::Plan
+        );
+        let c = classify(Kind::Ansible, &a("--list-tasks site.yml")).unwrap();
+        assert!(c.apply.is_none(), "a listing leads to no apply");
+    }
+
+    #[test]
+    fn helm_charts_are_pinned_repo_charts_or_oci_digests() {
+        let digest = format!("oci://r.example/charts/web@sha256:{}", "a".repeat(64));
+        for good in [
+            "template web repo/web --version 1.2.3".to_owned(),
+            format!("template web {digest}"),
+            format!("diff upgrade web {digest} -n shop"),
+            "upgrade --install web repo/web --version 1.2.3".to_owned(),
+        ] {
+            assert!(classify(Kind::Helm, &a(&good)).is_ok(), "{good}");
+        }
+        for bad in [
+            "template web /srv/charts/web --version 1.0.0",
+            "template web ./web --version 1.0.0",
+            "template web web --version 1.0.0",
+            "template web charts/web/sub --version 1.0.0",
+            "template web https://evil.example/web-1.0.0.tgz --version 1.0.0",
+            "template web oci://r.example/web --version 1.0.0",
+            "template web oci://r.example/web:1.0.0 --version 1.0.0",
+            "template web oci://r.example/web@sha256:abc --version 1.0.0",
+            "template web repo/web",
+            "template web repo/web:1.0 --version 1.0.0",
+        ] {
+            assert!(
+                classify(Kind::Helm, &a(bad)).is_err(),
+                "{bad} must be refused"
+            );
+        }
+        let d = classify(Kind::Helm, &a("diff upgrade web repo/web --version 1.2.3")).unwrap();
+        assert!(
+            d.args.contains(&Arg::lit("--suppress-secrets")),
+            "{:?}",
+            d.args
+        );
     }
 
     #[test]
