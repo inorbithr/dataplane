@@ -53,11 +53,15 @@ pub enum Surface {
     /// A hardware sensor on this host against thresholds in `checks.toml` (needs
     /// `[work] host`); reports the reading and a level, nothing else.
     Hwmon,
+    /// A named set of the SDK's examples this machine runs on a timer from its own
+    /// checkout (`[examples.<key>]` in the policy); the check reads the latest finished
+    /// run. RFC 0165.
+    Examples,
 }
 
 impl Surface {
     /// Every surface this version can check.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Http,
         Self::Tcp,
         Self::Tls,
@@ -69,6 +73,7 @@ impl Surface {
         Self::Mcp,
         Self::Graphql,
         Self::Hwmon,
+        Self::Examples,
     ];
 
     /// The surfaces on when the policy names none. The transport surfaces read an answer
@@ -90,6 +95,7 @@ impl Surface {
             Self::Mcp => "mcp",
             Self::Graphql => "graphql",
             Self::Hwmon => "hwmon",
+            Self::Examples => "examples",
         }
     }
 
@@ -106,19 +112,22 @@ impl Surface {
     /// `checks.toml`, never in a job.
     #[must_use]
     pub fn needs_declared(self) -> bool {
-        matches!(self, Self::Grpc | Self::Ws | Self::Mqtt | Self::Hwmon)
+        matches!(
+            self,
+            Self::Grpc | Self::Ws | Self::Mqtt | Self::Hwmon | Self::Examples
+        )
     }
 
-    /// Reads this host, never the network.
+    /// Reads this host, never the network: a sensor, or the latest run of an example set.
     #[must_use]
     pub fn is_host(self) -> bool {
-        matches!(self, Self::Hwmon)
+        matches!(self, Self::Hwmon | Self::Examples)
     }
 
     /// Sends a credential when the check names one (everything but `tcp` and `tls`).
     #[must_use]
     pub fn takes_auth(self) -> bool {
-        !matches!(self, Self::Tcp | Self::Tls | Self::Hwmon)
+        !matches!(self, Self::Tcp | Self::Tls | Self::Hwmon | Self::Examples)
     }
 
     /// Has an HTTP status to expect.
@@ -203,6 +212,11 @@ pub struct Params {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum Target {
+    /// `{"set": "sdk"}`: an example set named in the policy (`examples` checks).
+    Set {
+        /// The `[examples.<key>]` key.
+        set: String,
+    },
     /// `{"sensor": "asusec/Chipset"}`.
     Sensor {
         /// `chip/label` or `chip/kind/label`.
@@ -306,6 +320,45 @@ pub enum ErrorClass {
     /// A transport answered, but not in the shape the check expects: a GraphQL `errors`,
     /// an `error` frame, too few events or tools, an answer past its size bound.
     Answer,
+    /// One or more examples of the set failed, or its run did not finish (the invariants
+    /// say which).
+    Examples,
+}
+
+/// One named thing a check judged: an example (`language/example`) or a run-level
+/// condition (`run/stale`, `run/timeout`, ...). Never a body, a path or a message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Invariant {
+    /// The slug.
+    pub name: String,
+    /// How it came out.
+    pub status: InvariantStatus,
+}
+
+/// An [`Invariant`]'s outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvariantStatus {
+    /// Held.
+    Ok,
+    /// Broke.
+    Failed,
+    /// Did not run.
+    Skipped,
+}
+
+impl Invariant {
+    /// An invariant with `status`.
+    #[must_use]
+    pub fn new(name: String, status: InvariantStatus) -> Self {
+        Self { name, status }
+    }
+
+    /// A broken invariant.
+    #[must_use]
+    pub fn failed(name: String) -> Self {
+        Self::new(name, InvariantStatus::Failed)
+    }
 }
 
 /// A check's result `detail`: timings, a status code, a class of error. Never a body.
@@ -327,6 +380,9 @@ pub struct CheckDetail {
     /// `hwmon`: the reading, its peak since the previous run, its rate and its level.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reading: Option<crate::host::check::Reading>,
+    /// `examples`: the examples of the set, failures first, then run-level conditions.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub invariants: Vec<Invariant>,
 }
 
 impl CheckDetail {
@@ -373,6 +429,17 @@ impl CheckSpec {
     /// A description of what is missing or wrong.
     pub fn endpoint(&self) -> Result<Endpoint, String> {
         match (&self.target, self.surface) {
+            (Target::Set { set }, Surface::Examples) => Ok(Endpoint {
+                host: format!("examples:{set}"),
+                port: 0,
+                tls: false,
+                url: None,
+            }),
+            (Target::Set { .. }, s) => Err(format!(
+                "a set target is for examples checks, not {}",
+                s.as_str()
+            )),
+            (_, Surface::Examples) => Err("an examples check names a set target".into()),
             (Target::Sensor { sensor }, Surface::Hwmon) => Ok(Endpoint {
                 host: format!("sensor:{sensor}"),
                 port: 0,
@@ -451,8 +518,8 @@ pub async fn run(tls: &TlsContext, p: Prepared<'_>) -> Result<CheckDetail, Strin
         Surface::Mqtt => mqtt::check(tls, &p).await,
         Surface::Mcp => mcp::check(tls, &p).await?,
         Surface::Graphql => graphql::check(tls, &p).await,
-        Surface::Hwmon => {
-            return Err("an hwmon check reads the host sampler, not the network".into());
+        Surface::Hwmon | Surface::Examples => {
+            return Err("a host check reads this machine, not the network".into());
         }
     };
     Ok(detail.apply_max_ms(&p.spec.expect))
@@ -542,6 +609,7 @@ mod tests {
                         | Surface::Mcp
                         | Surface::Graphql
                         | Surface::Hwmon
+                        | Surface::Examples
                 )
             );
         }

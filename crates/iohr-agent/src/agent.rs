@@ -398,6 +398,13 @@ impl Agent {
                 shutdown.clone(),
             ));
         }
+        if self.policy.examples().is_some() {
+            tokio::spawn(crate::examples::run_loop(
+                Arc::clone(&self.policy),
+                self.executor.examples_store(),
+                shutdown.clone(),
+            ));
+        }
         crate::session::run(self, shutdown).await
     }
 }
