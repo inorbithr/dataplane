@@ -21,6 +21,7 @@ pub mod executor;
 pub mod extensions;
 pub mod extsock;
 pub mod host;
+pub mod infra_conn;
 pub mod inventory;
 pub mod k8s_ext;
 pub mod keys;
