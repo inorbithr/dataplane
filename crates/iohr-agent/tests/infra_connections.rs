@@ -87,6 +87,15 @@ fn env_with(kind: Kind, body: &str, f: impl FnOnce(&mut Conn)) -> Env {
     let marks = t.path().join("marks");
     std::fs::create_dir_all(&marks).unwrap();
     let bin = script(&bins, "tool", body);
+    if kind == Kind::Tofu {
+        // An initialised working directory with a remote backend, as a plan needs.
+        std::fs::create_dir_all(work.join(".terraform")).unwrap();
+        std::fs::write(
+            work.join(".terraform/terraform.tfstate"),
+            r#"{"version":3,"backend":{"type":"s3","config":{}}}"#,
+        )
+        .unwrap();
+    }
     mode(&work, 0o555);
     let mut conn = Conn::new("c1", kind, bin, work.clone());
     conn.env = BTreeMap::from([
@@ -780,4 +789,104 @@ async fn a_tofu_plan_on_the_local_backend_is_refused() {
     mode(&e.work, 0o555);
     let r = e.runner.run("a", &s("plan"), None).await;
     assert!(r.is_ok(), "{r:?}");
+}
+
+#[tokio::test]
+async fn a_tofu_plan_without_an_initialised_backend_is_refused() {
+    let e = env(Kind::Tofu, TOFU);
+    // An implicit local backend leaves no file at all; an unreadable one is no better.
+    mode(&e.work, 0o755);
+    std::fs::remove_file(e.work.join(".terraform/terraform.tfstate")).unwrap();
+    mode(&e.work, 0o555);
+    let r = e.runner.run("a", &s("plan"), None).await;
+    assert!(
+        matches!(r, Err(InfraError::Refused(ref m)) if m.contains("run tofu init with a remote backend")),
+        "{r:?}"
+    );
+    mode(&e.work, 0o755);
+    std::fs::write(e.work.join(".terraform/terraform.tfstate"), "not json").unwrap();
+    mode(&e.work, 0o555);
+    let r = e.runner.run("a", &s("plan"), None).await;
+    assert!(matches!(r, Err(InfraError::Refused(_))), "{r:?}");
+}
+
+#[tokio::test]
+async fn a_kind_that_cannot_be_read_as_a_plain_name_refuses_the_manifest() {
+    let e = env(Kind::Kubectl, KUBECTL);
+    for (i, bad) in [
+        "kind:\n  Secret\n",
+        "kind: !!str Secret\n",
+        "kind: |\n  Secret\n",
+        "kind: \"\"\n",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let name = format!("m{i}.yaml");
+        e.write(&name, bad);
+        let r = e
+            .runner
+            .run("a", &s(&format!("diff -f {name}")), None)
+            .await;
+        assert!(matches!(r, Err(InfraError::Refused(_))), "{bad:?}: {r:?}");
+    }
+    e.write("ok.yaml", "kind: Deployment\n");
+    let r = e.runner.run("a", &s("diff -f ok.yaml"), None).await;
+    assert!(r.is_ok(), "{r:?}");
+}
+
+#[tokio::test]
+async fn every_file_of_a_kubeconfig_list_is_learned() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+    std::fs::write(&a, "token: first-file-token-0123456789").unwrap();
+    std::fs::write(&b, "token: second-file-token-9876543210").unwrap();
+    let list = format!("{}:{}", a.display(), b.display());
+    let e = env_with(
+        Kind::Kubectl,
+        &format!("cat '{}' '{}'", a.display(), b.display()),
+        |c| {
+            c.env.insert("KUBECONFIG".into(), list);
+        },
+    );
+    let r = e.runner.run("a", &s("get pods"), None).await.unwrap();
+    assert!(!r.stdout.contains("second-file-token"), "{}", r.stdout);
+    assert!(!r.stdout.contains("first-file-token"), "{}", r.stdout);
+}
+
+#[tokio::test]
+async fn swapping_a_file_named_by_an_env_path_between_plan_and_apply_is_denied() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("cfg");
+    std::fs::write(&cfg, "one").unwrap();
+    let path = cfg.to_string_lossy().into_owned();
+    let e = env_with(
+        Kind::Kubectl,
+        "case \"$1\" in diff) echo d; exit 1 ;; *) echo applied ;; esac",
+        |c| {
+            c.env.insert("KUBE_CONFIG_PATH".into(), path);
+        },
+    );
+    e.write("m.yaml", "kind: Deployment\n");
+    let hash = e
+        .runner
+        .run("a", &s("diff -f m.yaml"), None)
+        .await
+        .unwrap()
+        .plan_hash
+        .unwrap();
+    std::fs::write(&cfg, "two").unwrap();
+    e.fed.feed("kp", &hash);
+    let ap = Approval {
+        id: "kp".into(),
+        plan_hash: hash,
+    };
+    let res = e
+        .runner
+        .run("a", &s("apply --server-side -f m.yaml"), Some(&ap))
+        .await;
+    assert!(
+        matches!(res, Err(InfraError::Denied(ref m)) if m.contains("context")),
+        "{res:?}"
+    );
 }

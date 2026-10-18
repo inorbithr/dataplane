@@ -63,7 +63,8 @@ the connection name, a context hash, the helm chart and version, and `created_at
 seconds). The context hash is the sha256 of the prefix, `KUBECONFIG`, `KUBECONTEXT`,
 `HELM_KUBECONTEXT` and the contents of each kubeconfig file, plus the contents of every
 file the prefix names with `--kubeconfig`, `-i`, `--private-key`, `--key-file` or
-`--client-key`. An apply against another cluster or identity, or after one of those files was
+`--client-key`, an ssh `-o IdentityFile=<file>` or attached `-i<file>`, and every absolute-path
+environment value (`KUBE_CONFIG_PATH`, a `/a:/b` list). An apply against another cluster or identity, or after one of those files was
 swapped, is denied.
 
 For `tofu` the plan hash is the plan file's sha256, and the record carries its own hash
@@ -121,9 +122,12 @@ trusted-tree check, but save nothing and lead to no apply.
 ### tofu
 
 `show` runs without `-json`, and there is no `output` verb: both would print sensitive
-values. A local backend is refused: when `.terraform/terraform.tfstate` (written by
-`tofu init`) names backend type `local`, a plan is refused with a clear error, since the plan
-runs on a snapshot and local state would be lost or edited. Use a remote backend.
+values. A plan needs a remote backend: `.terraform/terraform.tfstate` (written by `tofu init`)
+must exist and name a known remote backend type (`s3`, `gcs`, `azurerm`, `http`, `pg`,
+`consul`, `kubernetes`, `remote`, `cloud`, `oss`, `cos`, `etcdv3`, `swift`). A missing,
+unreadable or `local` backend (an implicit local backend leaves no file) is refused with
+"run tofu init with a remote backend", since the plan runs on a snapshot and local state
+would be lost or edited.
 
 ### ssh
 
@@ -162,7 +166,13 @@ process-wide values. When the runner is built it registers:
 
 Every redaction also hides the userinfo of a URL that carries a password:
 `postgres://admin:pw@db/x` becomes `postgres://[redacted]@db/x`. A bare user
-(`ssh://git@host`) stays.
+(`ssh://git@host`) stays. A password with a raw `/`, `?` or `#` is covered: when the text
+before it reads `user:word` (not a port), the userinfo runs to the last `@` of the token. A
+password of digits only that holds a `/` is the one shape not caught.
+
+A manifest whose `kind` is empty or not a plain name (`kind:` then a new line, `!!str`, `|`)
+is refused as one that cannot be read. A path list in an environment value (`KUBECONFIG=/a:/b`)
+has each file learned for redaction.
 
 ## Verbs
 

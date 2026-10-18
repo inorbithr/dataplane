@@ -112,6 +112,23 @@ const CONTEXT_FILE_FLAGS: &[&str] = &[
     "--client-key",
 ];
 
+/// The tofu backends that keep state off this host.
+const REMOTE_BACKENDS: &[&str] = &[
+    "s3",
+    "gcs",
+    "azurerm",
+    "http",
+    "pg",
+    "consul",
+    "kubernetes",
+    "remote",
+    "cloud",
+    "oss",
+    "cos",
+    "etcdv3",
+    "swift",
+];
+
 /// The largest key file read to learn its contents for redaction.
 const KEY_FILE_MAX: u64 = 64 << 10;
 
@@ -340,18 +357,20 @@ impl Runner {
             }
             parts.push(format!("{k}={v}"));
         }
-        // The key and kubeconfig files the prefix names: swapping one between plan and apply
-        // changes what the apply runs as.
-        let mut words = self.conn.prefix.iter();
-        while let Some(w) = words.next() {
-            let file = match w.split_once('=') {
-                Some((f, v)) if CONTEXT_FILE_FLAGS.contains(&f) => Some(v),
-                _ if CONTEXT_FILE_FLAGS.contains(&w.as_str()) => words.next().map(String::as_str),
-                _ => None,
-            };
-            if let Some(f) = file {
-                parts.push(std::fs::read(f).map_or_else(|_| "-".into(), |b| sha256_of(&b)));
+        // The key and kubeconfig files the prefix names, and every absolute path in the
+        // environment (`KUBE_CONFIG_PATH`, a list `/a:/b`): swapping one between plan and
+        // apply changes what the apply runs as.
+        let mut files = prefix_key_files(&self.conn);
+        let mut envs: Vec<(&String, &String)> = self.conn.env.iter().collect();
+        envs.sort();
+        for (k, v) in envs {
+            if Path::new(v).is_absolute() && k != "KUBECONFIG" {
+                parts.push(format!("{k}={v}"));
+                files.extend(v.split(':').filter(|f| !f.is_empty()).map(str::to_owned));
             }
+        }
+        for f in files {
+            parts.push(std::fs::read(&f).map_or_else(|_| "-".into(), |b| sha256_of(&b)));
         }
         sha256_of(&serde_json::to_vec(&parts).unwrap_or_default())
     }
@@ -736,22 +755,23 @@ impl Runner {
     /// would write it into the working directory, which the apply then trusts. Refused
     /// when `.terraform/terraform.tfstate` (written by `tofu init`) says `local`.
     fn check_tofu_backend(&self, who: &str, target: &str) -> Result<(), InfraError> {
-        let Ok(text) =
-            std::fs::read_to_string(self.conn.workdir.join(".terraform/terraform.tfstate"))
-        else {
-            return Ok(());
-        };
-        let kind = serde_json::from_str::<serde_json::Value>(&text)
+        // No file is an implicit local backend (nothing was initialised with a remote one),
+        // so a missing or unreadable file fails closed too.
+        let kind = std::fs::read_to_string(self.conn.workdir.join(".terraform/terraform.tfstate"))
             .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
             .and_then(|v| v["backend"]["type"].as_str().map(str::to_owned));
-        if kind.as_deref() == Some("local") {
-            return Err(self.refuse(
-                who,
-                target,
-                "this tofu working directory uses the local backend; use a remote backend, because the plan runs on a snapshot and local state would be lost or edited".into(),
-            ));
+        if kind
+            .as_deref()
+            .is_some_and(|k| REMOTE_BACKENDS.contains(&k))
+        {
+            return Ok(());
         }
-        Ok(())
+        Err(self.refuse(
+            who,
+            target,
+            "run tofu init with a remote backend: this working directory has none (a missing, unreadable or local backend), and the plan runs on a snapshot, so local state would be lost or edited".into(),
+        ))
     }
 
     async fn apply(
@@ -849,8 +869,16 @@ impl Runner {
     ) -> Result<(), InfraError> {
         let text = String::from_utf8_lossy(bytes);
         let kinds = key_values(&text, "kind");
+        if kinds.iter().any(String::is_empty) {
+            return Err(self.refuse(
+                who,
+                target,
+                format!("{rel} has a kind this connection cannot read (empty, tagged or block); write it as a plain name"),
+            ));
+        }
         if kinds.iter().any(|k| verbs::normal_type(k) == "secret") {
-            let ns = key_values(&text, "namespace");
+            let mut ns = key_values(&text, "namespace");
+            ns.retain(|n| !n.is_empty());
             let ns = if ns.is_empty() {
                 "-".to_owned()
             } else {
@@ -915,11 +943,36 @@ fn key_values(text: &str, key: &str) -> Vec<String> {
         while b.get(j).copied().is_some_and(word) {
             j += 1;
         }
-        if let Some(v) = text.get(v0..j).filter(|v| !v.is_empty())
-            && !out.iter().any(|o| o == v)
-        {
+        // An empty or unreadable value (`kind:` then a new line, `!!str`, `|`) is kept as
+        // "" so a caller can refuse what it cannot read.
+        let v = text.get(v0..j).unwrap_or_default();
+        if !out.iter().any(|o| o == v) {
             out.push(v.to_owned());
         }
+    }
+    out
+}
+
+/// The files the prefix names as keys or kubeconfigs: `--kubeconfig f`, `--key-file=f`,
+/// `-i f`, an attached `-if` (ssh) and `-o IdentityFile=f`.
+fn prefix_key_files(conn: &Conn) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut words = conn.prefix.iter();
+    while let Some(w) = words.next() {
+        let ident = |s: &str| {
+            s.split_once(['=', ' '])
+                .filter(|(k, _)| k.eq_ignore_ascii_case("IdentityFile"))
+                .map(|(_, v)| v.to_owned())
+        };
+        let file = match w.split_once('=') {
+            Some((f, v)) if CONTEXT_FILE_FLAGS.contains(&f) => Some(v.to_owned()),
+            _ if CONTEXT_FILE_FLAGS.contains(&w.as_str()) => words.next().cloned(),
+            _ if conn.kind == Kind::Ssh && w == "-o" => words.next().and_then(|s| ident(s)),
+            _ if conn.kind == Kind::Ssh && w.starts_with("-o") => ident(&w[2..]),
+            _ if conn.kind == Kind::Ssh && w.starts_with("-i") => Some(w[2..].to_owned()),
+            _ => None,
+        };
+        out.extend(file);
     }
     out
 }
@@ -933,7 +986,10 @@ fn learn_secrets(conn: &Conn, r: &redact::Redactor) {
         // ignores the short ones (it keeps `1` and `true` from garbling output), and a
         // path is a place, learned as a file below, not a value to hide.
         if Path::new(v).is_absolute() {
-            learn_file(Path::new(v), r);
+            // A path list (`KUBECONFIG=/a:/b`) names several files.
+            for f in v.split(':').filter(|f| !f.is_empty()) {
+                learn_file(Path::new(f), r);
+            }
         } else {
             r.register(v);
         }
@@ -997,4 +1053,30 @@ fn now_secs() -> u64 {
 
 fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or("").chars().take(200).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ssh(prefix: &[&str]) -> Conn {
+        let mut c = Conn::new("c", Kind::Ssh, "/bin/ssh".into(), "/w".into());
+        c.prefix = prefix.iter().map(|s| (*s).to_owned()).collect();
+        c
+    }
+
+    #[test]
+    fn every_spelling_of_an_ssh_key_file_is_found() {
+        for prefix in [
+            vec!["-i", "/k"],
+            vec!["-i/k"],
+            vec!["-o", "IdentityFile=/k"],
+            vec!["-oIdentityFile=/k"],
+            vec!["-o", "identityfile=/k"],
+        ] {
+            assert_eq!(prefix_key_files(&ssh(&prefix)), vec!["/k"], "{prefix:?}");
+        }
+        let none = prefix_key_files(&ssh(&["-o", "BatchMode=yes", "ops@h"]));
+        assert_eq!(none.len(), 0, "{none:?}");
+    }
 }

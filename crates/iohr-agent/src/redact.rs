@@ -450,14 +450,26 @@ fn userinfo_spans(text: &str, spans: &mut Vec<(usize, usize)>) {
         let start = from + i + 3;
         from = start;
         let rest = text.get(start..).unwrap_or_default();
-        let end = rest
-            .find(|c: char| {
-                c.is_whitespace() || matches!(c, '/' | '?' | '#' | '"' | '\'' | '`' | '<' | '>')
-            })
+        let line = rest
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '<' | '>'))
             .unwrap_or(rest.len());
-        let authority = rest.get(..end).unwrap_or_default();
-        if let Some(at) = authority.rfind('@') {
-            let info = authority.get(..at).unwrap_or_default();
+        let line = rest.get(..line).unwrap_or_default();
+        let end = line.find(['/', '?', '#']).unwrap_or(line.len());
+        let authority = line.get(..end).unwrap_or_default();
+        // A password may hold a raw `/`, `?` or `#`, which would end the authority early:
+        // when what precedes it reads `name:word` (a colon, and not a port), the userinfo
+        // runs to the last `@` of the token.
+        let wide = match authority.split_once(':') {
+            Some((_, after)) => {
+                !authority.contains('@')
+                    && !after.is_empty()
+                    && !after.bytes().all(|c| c.is_ascii_digit())
+            }
+            None => false,
+        };
+        let scope = if wide { line } else { authority };
+        if let Some(at) = scope.rfind('@') {
+            let info = scope.get(..at).unwrap_or_default();
             if info.contains(':') {
                 spans.push((start, start + at));
             }
@@ -591,6 +603,10 @@ mod tests {
             "https://[redacted]@host/path and https://[redacted]@other"
         );
         // No password, no secret: a bare user and a plain URL stay readable.
+        assert_eq!(
+            redact("db://admin:pa/ss?w#rd@host:5432/app next"),
+            "db://[redacted]@host:5432/app next"
+        );
         assert_eq!(redact("ssh://git@host/x"), "ssh://git@host/x");
         assert_eq!(redact("https://host:8443/a@b"), "https://host:8443/a@b");
     }
