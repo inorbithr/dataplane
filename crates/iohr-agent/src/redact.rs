@@ -17,7 +17,7 @@ pub use iohr_redact::MARK;
 /// The process-wide values.
 fn process() -> &'static iohr_redact::Redactor {
     static R: OnceLock<iohr_redact::Redactor> = OnceLock::new();
-    R.get_or_init(iohr_redact::Redactor::new)
+    R.get_or_init(|| iohr_redact::Redactor::new().with_references())
 }
 
 /// Remembers an exact secret value (8 characters or more) for the whole process.
@@ -52,9 +52,17 @@ pub fn redact_json(body: &str) -> String {
 
 /// Exact secret values one owner knows, redacted wherever they appear, on top of the
 /// shape and key rules and the process-wide values. Every value given is kept.
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct Redactor {
     own: iohr_redact::Redactor,
+}
+
+impl Default for Redactor {
+    fn default() -> Self {
+        Self {
+            own: iohr_redact::Redactor::new().with_references(),
+        }
+    }
 }
 
 impl Redactor {
@@ -72,13 +80,13 @@ impl Redactor {
     /// `text` redacted by the rules, this owner's values and the process-wide ones.
     #[must_use]
     pub fn redact(&self, text: &str) -> String {
-        process().redact(&self.own.redact(text))
+        self.own.redact_also(text, &[process()])
     }
 
     /// [`redact_json`] with this owner's values too.
     #[must_use]
     pub fn redact_json(&self, body: &str) -> String {
-        process().redact_json_str(&self.own.redact_json_str(body))
+        self.own.redact_json_str_also(body, &[process()])
     }
 }
 
@@ -103,7 +111,10 @@ mod tests {
         assert!(redact("a zzq-owner-only-value-7").contains("zzq-owner-only"));
         let cut = r#"{"a":[{"client_secret":"correcthorse","n":"zzq-owner-only-value-7","m":"#;
         let j = r.redact_json(cut);
-        assert!(!j.contains("correcthorse") && !j.contains("zzq-owner"), "{j}");
+        assert!(
+            !j.contains("correcthorse") && !j.contains("zzq-owner"),
+            "{j}"
+        );
     }
 
     #[test]
@@ -112,5 +123,20 @@ mod tests {
         let out = redact_json(r#"{"access_token":"abc.def.ghi-123456","n":3}"#);
         assert!(out.contains(MARK) && out.contains("\"n\":3"), "{out}");
         assert!(has_secret("password=hunter2hunter2"));
+    }
+
+    #[test]
+    fn a_process_value_is_not_cut_by_the_rules_of_the_owner_pass() {
+        register("my long process secret");
+        let r = Redactor::new();
+        assert_eq!(
+            r.redact("auth: my long process secret"),
+            format!("auth: {MARK}")
+        );
+        let j = r.redact_json(r#"{"note":"auth: my long process secret"}"#);
+        assert!(!j.contains("process secret") && !j.contains("long"), "{j}");
+        // The agent leaves references readable, but not a look-alike.
+        assert_eq!(redact("password=env:DB_PASS"), "password=env:DB_PASS");
+        assert!(redact("keyfile:AKIAIOSFODNN7EXAMPLE").contains(MARK));
     }
 }

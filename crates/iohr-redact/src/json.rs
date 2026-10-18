@@ -6,12 +6,21 @@ use crate::{MARK, Redactor, is_harmless_value, is_reference};
 
 impl Redactor {
     /// Redacts `value` in place. A string under a secret-looking key is replaced whole,
-    /// unless it is a secret reference or harmless (`true`, `none`); so is a number under
-    /// one, and the `value` of an object whose `name` (or `key`) is a secret name. Every
-    /// other string goes through [`Redactor::redact`]. A secret key over an object or an
-    /// array is not itself a secret, so its contents are walked. Keys are never changed.
+    /// unless it is a secret reference (when [`Redactor::with_references`] is on) or
+    /// harmless (`true`, `none`); so is a number under one, and the `value` of an object
+    /// whose `name` (or `key`) is a secret name. Every other string goes through
+    /// [`Redactor::redact`]. A secret key over an object or an array is not itself a secret,
+    /// so its contents are walked. Keys are never changed.
     pub fn redact_json(&self, value: &mut Value) {
-        self.walk(value, false);
+        self.redact_json_also(value, &[]);
+    }
+
+    /// [`Redactor::redact_json`] with the rules and values of `others` too, in one pass
+    /// (see [`Redactor::redact_also`]).
+    pub fn redact_json_also(&self, value: &mut Value, others: &[&Self]) {
+        let mut set = vec![self];
+        set.extend_from_slice(others);
+        walk(&set, value, false);
     }
 
     /// A JSON body with every string value redacted on its own, so the answer stays JSON
@@ -19,39 +28,54 @@ impl Redactor {
     /// not JSON (a cut stream) is redacted as text, by key and by value.
     #[must_use]
     pub fn redact_json_str(&self, body: &str) -> String {
-        match serde_json::from_str::<Value>(body) {
-            Ok(mut v) => {
-                self.walk(&mut v, false);
-                serde_json::to_string(&v).unwrap_or_else(|_| self.redact(body))
-            }
-            Err(_) => self.redact(body),
-        }
+        self.redact_json_str_also(body, &[])
     }
 
-    fn walk(&self, v: &mut Value, secret_key: bool) {
-        match v {
-            Value::String(s) => {
-                *s = if secret_key && !is_reference(s) && !is_harmless_value(s) && !s.is_empty() {
-                    MARK.to_owned()
-                } else {
-                    self.redact(s)
-                };
+    /// [`Redactor::redact_json_str`] with the rules and values of `others` too, in one pass.
+    #[must_use]
+    pub fn redact_json_str_also(&self, body: &str, others: &[&Self]) -> String {
+        match serde_json::from_str::<Value>(body) {
+            Ok(mut v) => {
+                self.redact_json_also(&mut v, others);
+                serde_json::to_string(&v).unwrap_or_else(|_| self.redact_also(body, others))
             }
-            Value::Number(_) if secret_key => *v = Value::String(MARK.to_owned()),
-            Value::Array(a) => a.iter_mut().for_each(|x| self.walk(x, secret_key)),
-            Value::Object(m) => {
-                let named = ["name", "key", "Name", "Key"].iter().any(|k| {
-                    m.get(*k)
-                        .and_then(Value::as_str)
-                        .is_some_and(|s| self.is_secret_key(s))
-                });
-                for (k, x) in m.iter_mut() {
-                    let paired = named && k.eq_ignore_ascii_case("value");
-                    self.walk(x, paired || self.is_secret_key(k));
-                }
-            }
-            _ => {}
+            Err(_) => self.redact_also(body, others),
         }
+    }
+}
+
+fn redact_set(set: &[&Redactor], text: &str) -> String {
+    match set.split_first() {
+        Some((first, rest)) => first.redact_also(text, rest),
+        None => text.to_owned(),
+    }
+}
+
+fn walk(set: &[&Redactor], v: &mut Value, secret_key: bool) {
+    // A reference stays readable only when every redactor in the set allows it.
+    let left_alone = |s: &str| set.iter().all(|r| r.references) && is_reference(s);
+    match v {
+        Value::String(s) => {
+            *s = if secret_key && !left_alone(s) && !is_harmless_value(s) && !s.is_empty() {
+                MARK.to_owned()
+            } else {
+                redact_set(set, s)
+            };
+        }
+        Value::Number(_) if secret_key => *v = Value::String(MARK.to_owned()),
+        Value::Array(a) => a.iter_mut().for_each(|x| walk(set, x, secret_key)),
+        Value::Object(m) => {
+            let named = ["name", "key", "Name", "Key"].iter().any(|k| {
+                m.get(*k)
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| set.iter().any(|r| r.is_secret_key(s)))
+            });
+            for (k, x) in m.iter_mut() {
+                let paired = named && k.eq_ignore_ascii_case("value");
+                walk(set, x, paired || set.iter().any(|r| r.is_secret_key(k)));
+            }
+        }
+        _ => {}
     }
 }
 
@@ -62,7 +86,7 @@ mod tests {
     use super::*;
 
     fn redact_json(body: &str) -> String {
-        Redactor::new().redact_json_str(body)
+        Redactor::new().with_references().redact_json_str(body)
     }
 
     #[test]
@@ -81,7 +105,7 @@ mod tests {
         assert_eq!(v["access_token"], MARK);
         assert_eq!(v["n"], 3);
         // Text redaction does not cut through an escaped quote either.
-        let r = Redactor::new().redact(&body);
+        let r = Redactor::new().with_references().redact(&body);
         assert!(serde_json::from_str::<Value>(&r).is_ok(), "{r}");
     }
 

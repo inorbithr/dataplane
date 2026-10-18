@@ -128,6 +128,9 @@ pub struct Redactor {
     extra_keys: Vec<String>,
     extra_prefixes: Vec<(String, usize)>,
     registered: Mutex<Vec<String>>,
+    /// Whether a secret reference (`env:NAME`, `file:/path`) after a secret key is left
+    /// readable. Off by default: only a policy that names references asks for it.
+    references: bool,
 }
 
 impl std::fmt::Debug for Redactor {
@@ -137,6 +140,7 @@ impl std::fmt::Debug for Redactor {
             .field("extra_keys", &self.extra_keys.len())
             .field("extra_prefixes", &self.extra_prefixes.len())
             .field("registered", &self.lock().len())
+            .field("references", &self.references)
             .finish()
     }
 }
@@ -183,6 +187,17 @@ impl Redactor {
         self
     }
 
+    /// Leaves a secret reference (`env:NAME`, `file:/path`, `vault:path`, `k8s:name/key`)
+    /// readable, as it says where a secret lives and is not one. Off by default, so a value
+    /// like `password=env:hunter2` is redacted. A reference whose tail has a known token
+    /// shape (a prefix such as `ghp_`, or a JWT) is redacted even with this on, and a
+    /// scheme must start a word (`dotenv:` and `keyfile:` are not schemes).
+    #[must_use]
+    pub const fn with_references(mut self) -> Self {
+        self.references = true;
+        self
+    }
+
     /// Also redacts this exact value wherever it appears (8 characters or more).
     #[must_use]
     pub fn with_exact(self, value: &str) -> Self {
@@ -221,11 +236,28 @@ impl Redactor {
     /// `text` with every secret-looking span replaced by [`MARK`].
     #[must_use]
     pub fn redact(&self, text: &str) -> String {
+        self.redact_also(text, &[])
+    }
+
+    /// [`Redactor::redact`] with the rules and registered values of `others` too, all found
+    /// in ONE pass over the original text and merged. Two passes in a row would let the
+    /// first one cut into a value the second one knows whole.
+    #[must_use]
+    pub fn redact_also(&self, text: &str, others: &[&Self]) -> String {
         let mut spans = Vec::new();
-        pem_spans(text, &mut spans);
-        self.keyed_spans(text, &mut spans);
-        self.word_spans(text, &mut spans);
-        userinfo_spans(text, &mut spans);
+        self.collect(text, &mut spans);
+        for o in others {
+            o.collect(text, &mut spans);
+        }
+        render(text, spans)
+    }
+
+    /// Every span of `text` this redactor replaces.
+    fn collect(&self, text: &str, spans: &mut Vec<(usize, usize)>) {
+        pem_spans(text, spans);
+        self.keyed_spans(text, spans);
+        self.word_spans(text, spans);
+        userinfo_spans(text, spans);
         for v in self.lock().iter() {
             let mut from = 0;
             while let Some(i) = text.get(from..).and_then(|t| t.find(v.as_str())) {
@@ -233,23 +265,15 @@ impl Redactor {
                 from += i + v.len();
             }
         }
-        if spans.is_empty() {
-            return text.to_owned();
-        }
-        spans.sort_unstable();
-        let mut out = String::with_capacity(text.len());
-        let mut at = 0;
-        for (s, e) in spans {
-            if e <= at {
-                continue;
-            }
-            let s = s.max(at);
-            out.push_str(text.get(at..s).unwrap_or_default());
-            out.push_str(MARK);
-            at = e;
-        }
-        out.push_str(text.get(at..).unwrap_or_default());
-        out
+    }
+
+    /// Whether `value` is a secret reference this instance leaves readable.
+    fn referenced(&self, value: &str) -> bool {
+        self.references
+            && is_reference(value)
+            && !value
+                .split(|c: char| !c.is_ascii() || !is_word(c as u8))
+                .any(|w| self.shape_in_word(w).is_some())
     }
 
     /// Whether `text` holds anything [`Redactor::redact`] would replace.
@@ -294,7 +318,7 @@ impl Redactor {
             let paired = key == "value" && paired_until.is_some_and(|end| ks < end);
             let secret_key = paired || self.is_secret_key(&key);
             let long_flag = secret_key && ks >= 2 && b.get(ks - 2..ks) == Some(b"--");
-            let short_flag = is_short_flag(b, ks, &key);
+            let short_flag = is_short_flag(b, ks, text.get(ks..i).unwrap_or_default(), text);
             if !scheme && !secret_key && !short_flag {
                 continue;
             }
@@ -311,7 +335,7 @@ impl Redactor {
                 while matches!(b.get(j), Some(b' ' | b'\t')) {
                     j += 1;
                 }
-                if j > i && !matches!(b.get(j), None | Some(b'-')) {
+                if j > i && b.get(j).is_some() && !is_flag_like(b, j) {
                     found = value_at(b, j);
                 }
             }
@@ -339,7 +363,7 @@ impl Redactor {
                 && !not_a_password
                 && value != MARK
                 && !is_harmless_value(value)
-                && !is_reference(value)
+                && !self.referenced(value)
             {
                 spans.push((vs, ve));
             }
@@ -365,8 +389,13 @@ impl Redactor {
             let w = text.get(s..i).unwrap_or_default();
             // The path or name of a secret reference (`file:/…`, `vault:…`) says where a
             // secret lives, not what it is.
+            // Only when this instance leaves references readable, and only a real scheme
+            // (`dotenv:` and `keyfile:` are not); a known token shape is redacted anyway.
             let before = text.get(..s).unwrap_or_default();
-            if REFERENCE_SCHEMES.iter().any(|p| before.ends_with(p)) {
+            if self.references && after_scheme(before) {
+                if let Some(off) = self.shape_in_word(w) {
+                    spans.push((s + off.0, s + off.1));
+                }
                 continue;
             }
             if let Some(off) = self.secret_in_word(w) {
@@ -377,6 +406,12 @@ impl Redactor {
 
     /// The span of a secret inside one word, if there is one.
     fn secret_in_word(&self, w: &str) -> Option<(usize, usize)> {
+        self.shape_in_word(w)
+            .or_else(|| high_entropy(w).then_some((0, w.len())))
+    }
+
+    /// The span of a token with a known shape (a prefix, or a JWT) inside one word.
+    fn shape_in_word(&self, w: &str) -> Option<(usize, usize)> {
         let extra = self.extra_prefixes.iter().map(|(p, m)| (p.as_str(), *m));
         for (p, min) in PREFIXES.iter().copied().chain(extra) {
             let mut from = 0;
@@ -412,19 +447,70 @@ impl Redactor {
                 return Some((i, w.len()));
             }
         }
-        high_entropy(w).then_some((0, w.len()))
+        None
     }
 }
 
 /// Schemes of a secret reference.
 const REFERENCE_SCHEMES: [&str; 4] = ["env:", "file:", "vault:", "k8s:"];
 
-/// A lone `-p` flag: standalone, after a space or at the start.
-fn is_short_flag(b: &[u8], ks: usize, key: &str) -> bool {
-    key.eq_ignore_ascii_case("p")
-        && ks >= 1
-        && b.get(ks - 1) == Some(&b'-')
-        && (ks == 1 || b.get(ks - 2).is_some_and(u8::is_ascii_whitespace))
+/// Tools whose `-p VALUE` is a password. Other tools use `-p` for a path, a patch or a port
+/// (`git log -p`, `mkdir -p`, `docker run -p`).
+const PASSWORD_TOOLS: &[&str] = &[
+    "mysql",
+    "mysqldump",
+    "mysqladmin",
+    "mysqlpump",
+    "mariadb",
+    "mariadb-dump",
+    "sshpass",
+    "login",
+    "htpasswd",
+];
+
+/// A lone `-p` flag: standalone, after a space or at the start, in a command of a tool
+/// that takes its password that way. Lower case only: `-P` is a port.
+fn is_short_flag(b: &[u8], ks: usize, key: &str, text: &str) -> bool {
+    if key != "p"
+        || ks < 1
+        || b.get(ks - 1) != Some(&b'-')
+        || !(ks == 1 || b.get(ks - 2).is_some_and(u8::is_ascii_whitespace))
+    {
+        return false;
+    }
+    // The command so far: from the last newline or command separator.
+    let head = text.get(..ks - 1).unwrap_or_default();
+    let cmd = head
+        .rfind(['\n', ';', '|', '&'])
+        .map_or(head, |i| head.get(i + 1..).unwrap_or_default());
+    cmd.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_')))
+        .any(|w| PASSWORD_TOOLS.contains(&w.to_ascii_lowercase().as_str()))
+}
+
+/// Whether the argument at `j` is another flag (`--user`, `-v`) rather than a value.
+fn is_flag_like(b: &[u8], j: usize) -> bool {
+    if b.get(j) != Some(&b'-') {
+        return false;
+    }
+    if b.get(j + 1) == Some(&b'-') {
+        return true;
+    }
+    // `-v`, `-x ` : one letter. `-s3cr3t` is longer and is a value.
+    b.get(j + 1).is_none_or(u8::is_ascii_whitespace)
+        || (b.get(j + 1).is_some_and(u8::is_ascii_alphanumeric)
+            && b.get(j + 2).is_none_or(u8::is_ascii_whitespace))
+}
+
+/// Whether `before` ends in a secret-reference scheme that starts a word.
+fn after_scheme(before: &str) -> bool {
+    REFERENCE_SCHEMES.iter().any(|p| {
+        before.strip_suffix(p).is_some_and(|rest| {
+            !rest
+                .bytes()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
+        })
+    })
 }
 
 /// A port or an address piece: digits, `:` and `.`.
@@ -437,6 +523,30 @@ fn is_port(v: &str) -> bool {
 /// Starts like a path.
 fn is_path(v: &str) -> bool {
     v.starts_with(['/', '~']) || v.starts_with("./") || v.starts_with("../")
+}
+
+/// `text` with the (possibly overlapping) `spans` replaced by one [`MARK`] each.
+fn render(text: &str, mut spans: Vec<(usize, usize)>) -> String {
+    if spans.is_empty() {
+        return text.to_owned();
+    }
+    spans.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+    for (s, e) in spans {
+        match merged.last_mut() {
+            Some(last) if s < last.1 => last.1 = last.1.max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (s, e) in merged {
+        out.push_str(text.get(at..s).unwrap_or_default());
+        out.push_str(MARK);
+        at = e;
+    }
+    out.push_str(text.get(at..).unwrap_or_default());
+    out
 }
 
 fn pem_spans(text: &str, spans: &mut Vec<(usize, usize)>) {
@@ -617,10 +727,10 @@ fn high_entropy(w: &str) -> bool {
 mod tests {
     use super::*;
     fn redact(t: &str) -> String {
-        Redactor::new().redact(t)
+        Redactor::new().with_references().redact(t)
     }
     fn has_secret(t: &str) -> bool {
-        Redactor::new().has_secret(t)
+        Redactor::new().with_references().has_secret(t)
     }
 
     #[test]
@@ -820,5 +930,87 @@ mod tests {
                 "{v} was evicted"
             );
         }
+    }
+
+    fn strict(t: &str) -> String {
+        Redactor::new().redact(t)
+    }
+
+    #[test]
+    fn a_strict_redactor_redacts_references_and_the_look_alikes_always() {
+        for c in [
+            "password=env:hunter2",
+            "token=vault:hvs.X",
+            "secret=k8s:abc",
+            "client_secret=file:/x/y",
+        ] {
+            assert!(strict(c).contains(MARK), "strict: {c}");
+        }
+        for c in [
+            "load dotenv:ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789",
+            "keyfile:AKIAIOSFODNN7EXAMPLE",
+            "load env:ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789",
+        ] {
+            assert!(strict(c).contains(MARK), "strict: {c}");
+            let lenient = redact(c);
+            assert!(
+                lenient.contains(MARK)
+                    && !lenient.contains("AKIAIOSFODNN7")
+                    && !lenient.contains("ghp_aBc"),
+                "references on: {c} -> {lenient}"
+            );
+        }
+        // With references on, a plain reference stays readable.
+        assert_eq!(redact("password=env:DB_PASS"), "password=env:DB_PASS");
+        assert_eq!(redact("client_secret=file:/x/y"), "client_secret=file:/x/y");
+        // A reference with a token shape in its tail is not a reference.
+        let t = "password=vault:hvs.AAAAAAAAAAAAAAAAAAAAAAAA";
+        assert!(redact(t).contains(MARK), "{}", redact(t));
+    }
+
+    #[test]
+    fn registered_values_and_the_rules_merge_in_one_pass() {
+        let process = Redactor::new().with_references();
+        process.register("my long process secret");
+        let own = Redactor::new().with_references();
+        for (text, want) in [
+            ("auth: my long process secret", format!("auth: {MARK}")),
+            (
+                "x my long process secret and password=hunter2hunter2",
+                format!("x {MARK} and password={MARK}"),
+            ),
+        ] {
+            assert_eq!(own.redact_also(text, &[&process]), want, "{text}");
+        }
+        // The old order leaked the tail.
+        let two_pass = process.redact(&own.redact("auth: my long process secret"));
+        assert!(two_pass.contains("process secret"), "{two_pass}");
+    }
+
+    #[test]
+    fn short_password_flags_need_a_tool_that_takes_one() {
+        assert_eq!(redact("git log -p HEAD~3"), "git log -p HEAD~3");
+        assert_eq!(redact("mysql -P 3306 -u root"), "mysql -P 3306 -u root");
+        assert_eq!(redact("mkdir -p build"), "mkdir -p build");
+        assert!(redact("sshpass -p hunter2x ssh h").contains(MARK));
+        assert!(redact("docker login -u me -p hunter2x").contains(MARK));
+        assert!(redact("mysql -u root -p hunter2x").contains(MARK));
+    }
+
+    #[test]
+    fn a_flag_value_that_starts_with_a_dash_is_still_a_value() {
+        assert_eq!(
+            redact("run --password -s3cr3t now"),
+            "run --password [redacted] now"
+        );
+        assert_eq!(redact("run --password --user x"), "run --password --user x");
+        assert_eq!(redact("run --password -v"), "run --password -v");
+    }
+
+    #[test]
+    fn short_exact_keys_redact_prose_too() {
+        // Known and accepted: a value under `auth`, `otp`, `pin` or `jwt` is hidden whatever
+        // it looks like, because a secret can look like a word.
+        assert_eq!(redact("auth: failed"), "auth: [redacted]");
     }
 }
