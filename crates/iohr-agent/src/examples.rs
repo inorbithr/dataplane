@@ -317,8 +317,7 @@ async fn read_fresh(path: &Path, since: std::time::SystemTime) -> Option<Vec<u8>
     // A little slack: file times are coarse on some file systems.
     let fresh = meta
         .modified()
-        .ok()
-        .is_some_and(|m| m + Duration::from_secs(2) >= since);
+        .is_ok_and(|m| m + Duration::from_secs(2) >= since);
     if !fresh {
         return None;
     }
@@ -454,7 +453,9 @@ mod tests {
         {
             let mut g = st.runs.lock().unwrap();
             let o = g.get_mut("sdk").unwrap();
-            o.at = Instant::now() - Duration::from_secs(120);
+            o.at = Instant::now()
+                .checked_sub(Duration::from_secs(120))
+                .unwrap();
         }
         let d = judged(&st, &s);
         assert!(!d.ok);

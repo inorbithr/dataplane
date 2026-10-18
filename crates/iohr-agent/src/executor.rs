@@ -250,8 +250,8 @@ impl Executor {
             .ok_or_else(|| format!("no declared check named {key:?} in checks.toml"))?;
         let same_target = match (&entry.spec.target, &spec.target) {
             (Target::Url { url: a }, Target::Url { url: b }) => a == b,
-            (Target::Sensor { sensor: a }, Target::Sensor { sensor: b }) => a == b,
-            (Target::Set { set: a }, Target::Set { set: b }) => a == b,
+            (Target::Sensor { sensor: a }, Target::Sensor { sensor: b })
+            | (Target::Set { set: a }, Target::Set { set: b }) => a == b,
             (
                 Target::HostPort {
                     host: a, port: p, ..
