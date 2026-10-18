@@ -12,7 +12,7 @@ use iohr_agent::checks_file::DeclaredChecks;
 use iohr_agent::config::SecretsConfig;
 use iohr_agent::executor::{Admission, Executor};
 use iohr_agent::policy::{Policy, TargetShare};
-use iohr_agent::protocol::{Job, ResultStatus};
+use iohr_agent::protocol::Job;
 use iohr_agent::secrets::SecretResolver;
 use iohr_agent::tls::TlsContext;
 
