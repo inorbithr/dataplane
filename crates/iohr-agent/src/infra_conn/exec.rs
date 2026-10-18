@@ -96,7 +96,10 @@ pub async fn run(
             timed_out: true,
         });
     };
-    // The child is gone; a grandchild still holding a pipe gets what is left of the deadline.
+    // The child is gone, and so is anything it left running in its group: a background
+    // process must not outlive the command (or keep a pipe open to the end of the deadline).
+    kill_group(pid);
+    // A grandchild that somehow still holds a pipe gets what is left of the deadline.
     match tokio::time::timeout_at(deadline.deadline(), readers).await {
         Ok(Ok((stdout, stderr, truncated))) => Ok(Output {
             code: status.code(),
@@ -118,6 +121,22 @@ pub async fn run(
         }
     }
 }
+
+/// Kills what is left of the child's process group at once. The child has exited, so
+/// the group holds only what it started; an empty group makes this a no-op.
+#[cfg(unix)]
+fn kill_group(pid: Option<u32>) {
+    use rustix::process::{Pid, Signal, kill_process_group};
+    if let Some(g) = pid
+        .and_then(|p| i32::try_from(p).ok())
+        .and_then(Pid::from_raw)
+    {
+        let _ = kill_process_group(g, Signal::KILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_group(_pid: Option<u32>) {}
 
 /// Stops the process group: TERM, two seconds to exit, then KILL.
 #[cfg(unix)]

@@ -29,8 +29,9 @@ is defence in depth on top of that, not a replacement for it.
    with that argv, an empty environment plus the connection's `env`, no stdin, a deadline
    (`timeout_secs`, 1 to 900) and a cap per stream (`max_output`, 1 KiB to 8 MiB).
 4. The process runs in its own process group. At the deadline the whole group gets TERM,
-   then KILL 2 seconds later, so a child the tool started is stopped too. If the tool exits
-   but a child still holds its output pipe, the child gets what is left of the deadline.
+   then KILL 2 seconds later, so a child the tool started is stopped too. When the tool
+   exits on its own, whatever is left in its group is killed at once, so nothing it started
+   in the background outlives the command.
 5. Output goes through the connection's own `redact::Redactor` before it is returned (JSON
    output through `redact_json`, which falls back to text for a cut stream).
 6. Every request writes to the hash-chained audit log: who, `infra.<kind>.<class>` (or
@@ -60,25 +61,29 @@ is defence in depth on top of that, not a replacement for it.
 The record holds the apply form, the snapshot file hashes, the hash of the redacted output,
 the connection name, a context hash, the helm chart and version, and `created_at` (Unix
 seconds). The context hash is the sha256 of the prefix, `KUBECONFIG`, `KUBECONTEXT`,
-`HELM_KUBECONTEXT` and the contents of each kubeconfig file, so an apply against a cluster
-other than the planned one is denied.
+`HELM_KUBECONTEXT` and the contents of each kubeconfig file, plus the contents of every
+file the prefix names with `--kubeconfig`, `-i`, `--private-key`, `--key-file` or
+`--client-key`. An apply against another cluster or identity, or after one of those files was
+swapped, is denied.
 
 For `tofu` the plan hash is the plan file's sha256, and the record carries its own hash
 (`record_sha256`) as well, so its connection, context and time cannot be edited on their own.
 For the other kinds the plan hash is the record's hash.
 
 One apply runs per connection at a time. A plan that would produce the hash of the apply
-running now is refused until that apply ends.
+running now is refused until that apply ends; the check and the saving of a plan happen under
+the same lock the apply takes before it loads the plan, so neither can replace the other's
+directory.
 
 ## The trusted tree
 
 Plans and reads run tools that load content from the working directory: playbooks, roles,
 plugins, kustomizations, providers. That tree must be content the agent cannot change.
-Before a read or a plan, every directory from the working directory up to the connection's
+Before a read, a plan or a `tofu` apply, every directory from the working directory up to the connection's
 `root` (default: the working directory itself) is checked. The request is refused when any of
 them is writable by the agent's user or by group or others. Every request is refused when the
-agent runs as uid 0, since root can change any tree. Applies are not checked, because they run
-from the snapshot.
+agent runs as uid 0, since root can change any tree. Other applies are not checked, because they run
+from the snapshot; a `tofu` apply runs in the working directory itself, so it is.
 
 On a host that is not unix, reads and plans are refused.
 
@@ -89,7 +94,9 @@ On a host that is not unix, reads and plans are refused.
 A manifest given to a plan is refused if it holds `kind: Secret` in any spelling (YAML, JSON,
 inside a `List`, `Secrets.v1` and so on). The refusal is audited with the file, the kind and
 the namespace, never the values. `get secrets` is refused in every spelling kubectl accepts
-(`Secret`, `secrets.v1`, `SECRETS.v1.core`, inside a comma list or `secrets/name`).
+(`Secret`, `secrets.v1`, `SECRETS.v1.core`, inside a comma list or `secrets/name`), and the
+same check and the resource allow-list run on every positional of `get` and `describe`, so
+`get pod/a secret/db` is refused too.
 
 ### helm
 
@@ -99,6 +106,9 @@ A chart is `repo/name` from a configured repository with an exact `--version` (`
 connection lists in `oci_registries`. Local paths, `https://` archives and OCI tags are
 refused, since helm would load whatever is there at plan time and again at apply time.
 `diff upgrade` always runs with `--suppress-secrets`.
+`template` output is checked like a manifest: a plan is refused, and nothing saved, when the
+rendered chart holds `kind: Secret`, a type the connection does not allow, or is cut by the
+output cap (a Secret could sit past the cap).
 
 ### ansible
 
@@ -111,14 +121,16 @@ trusted-tree check, but save nothing and lead to no apply.
 ### tofu
 
 `show` runs without `-json`, and there is no `output` verb: both would print sensitive
-values. A local backend is not supported: the plan runs on a snapshot, so use a remote
-backend.
+values. A local backend is refused: when `.terraform/terraform.tfstate` (written by
+`tofu init`) names backend type `local`, a plan is refused with a clear error, since the plan
+runs on a snapshot and local state would be lost or edited. Use a remote backend.
 
 ### ssh
 
 Every ssh run starts with options the connection cannot override (ssh keeps the first value
 it is given): `-F /dev/null`, `-o BatchMode=yes`, `-o StrictHostKeyChecking=yes`,
-`-o ControlPath=none`. A prefix that names a config file (`-F`) is refused when the connection
+`-o ControlPath=none`, `-o IdentitiesOnly=yes` (only the identity the prefix names, never the
+agent's keys), `-o ForwardAgent=no` and `-o ClearAllForwardings=yes`. A prefix that names a config file (`-F`) is refused when the connection
 is checked. The remote command is a single word assembled from the table and validated
 values.
 
@@ -140,12 +152,17 @@ Each connection can narrow what its verbs may name:
 Each connection has its own `Redactor` on top of the shape and key rules and the
 process-wide values. When the runner is built it registers:
 
-- `env` values under names holding `TOKEN`, `SECRET`, `KEY`, `PASS` or `CREDENTIAL`;
+- every `env` value that is not an absolute path, whatever its name (the redactor ignores
+  values under 8 characters, so `1` or `true` never garble output);
 - values of `--token` and `--password` in the prefix;
 - the contents of key files: the files named by `--private-key`, `--key-file`,
   `--client-key` (and `-i` for ssh) in the prefix, and `env` values that are absolute paths
   to files up to 64 KiB. The whole file, each line of 16 characters or more, and each such
   value after a `key:` or `key=` (a kubeconfig's token) are registered.
+
+Every redaction also hides the userinfo of a URL that carries a password:
+`postgres://admin:pw@db/x` becomes `postgres://[redacted]@db/x`. A bare user
+(`ssh://git@host`) stays.
 
 ## Verbs
 

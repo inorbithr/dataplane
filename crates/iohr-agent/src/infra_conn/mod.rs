@@ -84,7 +84,8 @@ const fn default_ttl() -> u64 {
 
 /// Options every ssh connection runs with, ahead of its own prefix (ssh keeps the first
 /// value it is given for an option): no config file, no prompts, a known host key only,
-/// no shared master connection.
+/// no shared master connection, only the identity the prefix names (no agent keys), no
+/// agent forwarding and no port forwarding of any kind.
 const SSH_FORCED: &[&str] = &[
     "-F",
     "/dev/null",
@@ -94,6 +95,21 @@ const SSH_FORCED: &[&str] = &[
     "StrictHostKeyChecking=yes",
     "-o",
     "ControlPath=none",
+    "-o",
+    "IdentitiesOnly=yes",
+    "-o",
+    "ForwardAgent=no",
+    "-o",
+    "ClearAllForwardings=yes",
+];
+
+/// Prefix flags whose value is a file that decides who the command runs as.
+const CONTEXT_FILE_FLAGS: &[&str] = &[
+    "--kubeconfig",
+    "-i",
+    "--private-key",
+    "--key-file",
+    "--client-key",
 ];
 
 /// The largest key file read to learn its contents for redaction.
@@ -324,6 +340,19 @@ impl Runner {
             }
             parts.push(format!("{k}={v}"));
         }
+        // The key and kubeconfig files the prefix names: swapping one between plan and apply
+        // changes what the apply runs as.
+        let mut words = self.conn.prefix.iter();
+        while let Some(w) = words.next() {
+            let file = match w.split_once('=') {
+                Some((f, v)) if CONTEXT_FILE_FLAGS.contains(&f) => Some(v),
+                _ if CONTEXT_FILE_FLAGS.contains(&w.as_str()) => words.next().map(String::as_str),
+                _ => None,
+            };
+            if let Some(f) = file {
+                parts.push(std::fs::read(f).map_or_else(|_| "-".into(), |b| sha256_of(&b)));
+            }
+        }
         sha256_of(&serde_json::to_vec(&parts).unwrap_or_default())
     }
 
@@ -477,7 +506,9 @@ impl Runner {
         if let Err(e) = self.check_policy(&cmd) {
             return Err(self.refuse(who, &target, e));
         }
-        if cmd.class != Class::Apply
+        // A tofu apply runs in the working directory itself, so it needs the same trusted
+        // tree as a plan; the other kinds apply from the snapshot.
+        if (cmd.class != Class::Apply || cmd.kind == Kind::Tofu)
             && let Err(e) = self.trusted_tree()
         {
             return Err(self.refuse(who, &target, e));
@@ -629,6 +660,9 @@ impl Runner {
                 files.insert(rel.clone(), sha256_of(&bytes));
             }
         }
+        if c.kind == Kind::Tofu {
+            self.check_tofu_backend(who, target)?;
+        }
         let plan_file = scratch.join("plan.tfplan");
         let cwd = if files.is_empty() {
             &self.conn.workdir
@@ -640,6 +674,18 @@ impl Runner {
             Ok(o) if !o.timed_out && o.code.is_some_and(|x| c.ok_codes.contains(&x)) => o,
             other => return self.finish(who, c, target, other, None),
         };
+        if c.kind == Kind::Helm && c.verb == "template" {
+            // The rendered chart is manifests: never one that carries a Secret, and never
+            // one cut short, where a Secret could sit past the cap.
+            if out.truncated {
+                return Err(self.refuse(
+                    who,
+                    target,
+                    "the rendered chart is longer than the output cap, so it cannot be checked for Secrets".into(),
+                ));
+            }
+            self.check_manifest(who, target, "the rendered chart", &out.stdout)?;
+        }
         let Some(apply) = c.apply.clone() else {
             // A listing (ansible --list-hosts, --list-tasks) loads the playbook like a plan
             // but has no apply, so nothing is saved.
@@ -668,22 +714,44 @@ impl Runner {
         } else {
             plan.hash = plan.compute_hash();
         }
-        if self
-            .applying
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_deref()
-            == Some(plan.hash.as_str())
         {
+            // The check and the commit happen under the apply lock, so an apply cannot start
+            // on this plan's directory while the commit replaces it.
+            let held = self.applying.lock().unwrap_or_else(PoisonError::into_inner);
+            if held.as_deref() == Some(plan.hash.as_str()) {
+                drop(held);
+                return Err(self.refuse(
+                    who,
+                    target,
+                    "the apply of this same plan is running; plan again when it ends".into(),
+                ));
+            }
+            self.store.commit(scratch, &plan).map_err(io)?;
+        }
+        let hash = plan.hash.clone();
+        self.finish(who, c, target, Ok(out), Some(hash))
+    }
+
+    /// A tofu plan keeps its state somewhere that outlives the snapshot: a `local` backend
+    /// would write it into the working directory, which the apply then trusts. Refused
+    /// when `.terraform/terraform.tfstate` (written by `tofu init`) says `local`.
+    fn check_tofu_backend(&self, who: &str, target: &str) -> Result<(), InfraError> {
+        let Ok(text) =
+            std::fs::read_to_string(self.conn.workdir.join(".terraform/terraform.tfstate"))
+        else {
+            return Ok(());
+        };
+        let kind = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v["backend"]["type"].as_str().map(str::to_owned));
+        if kind.as_deref() == Some("local") {
             return Err(self.refuse(
                 who,
                 target,
-                "the apply of this same plan is running; plan again when it ends".into(),
+                "this tofu working directory uses the local backend; use a remote backend, because the plan runs on a snapshot and local state would be lost or edited".into(),
             ));
         }
-        self.store.commit(scratch, &plan).map_err(io)?;
-        let hash = plan.hash.clone();
-        self.finish(who, c, target, Ok(out), Some(hash))
+        Ok(())
     }
 
     async fn apply(
@@ -707,6 +775,17 @@ impl Runner {
         let Some(ap) = approval else {
             return deny("an apply needs an approval pinned to a saved plan's hash");
         };
+        // The lock first, so a plan of the same hash cannot replace the directory between
+        // the load and the run.
+        let _lock = {
+            let mut held = self.applying.lock().unwrap_or_else(PoisonError::into_inner);
+            if held.is_some() {
+                drop(held);
+                return deny("another apply on this connection is running");
+            }
+            *held = Some(ap.plan_hash.clone());
+            Applying(&self.applying)
+        };
         let (plan, dir) = match self.store.load(&ap.plan_hash) {
             Ok(p) => p,
             Err(e) => return deny(&e),
@@ -723,15 +802,6 @@ impl Runner {
         if plan.context_sha256 != self.context_sha256() {
             return deny("the connection's context changed since the plan; plan again");
         }
-        let _lock = {
-            let mut held = self.applying.lock().unwrap_or_else(PoisonError::into_inner);
-            if held.is_some() {
-                drop(held);
-                return deny("another apply on this connection is running");
-            }
-            *held = Some(plan.hash.clone());
-            Applying(&self.applying)
-        };
         if let Err(Denied(e)) = self.approvals.spend(ap, &plan.hash) {
             return deny(&e);
         }
@@ -854,20 +924,18 @@ fn key_values(text: &str, key: &str) -> Vec<String> {
     out
 }
 
-/// Registers what this connection holds secret with its redactor: env values under
-/// secret-looking names, values of secret flags in the prefix, and the contents of key
+/// Registers what this connection holds secret with its redactor: every env value that is
+/// not a path, values of secret flags in the prefix, and the contents of key
 /// files (prefix key flags and env values that are absolute paths to small files).
 fn learn_secrets(conn: &Conn, r: &redact::Redactor) {
-    for (k, v) in &conn.env {
-        let up = k.to_ascii_uppercase();
-        if ["TOKEN", "SECRET", "KEY", "PASS", "CREDENTIAL"]
-            .iter()
-            .any(|w| up.contains(w))
-        {
-            r.register(v);
-        }
+    for v in conn.env.values() {
+        // Every value of the connection's environment, whatever its name: the redactor
+        // ignores the short ones (it keeps `1` and `true` from garbling output), and a
+        // path is a place, learned as a file below, not a value to hide.
         if Path::new(v).is_absolute() {
             learn_file(Path::new(v), r);
+        } else {
+            r.register(v);
         }
     }
     let key_flags: &[&str] = if conn.kind == Kind::Ssh {

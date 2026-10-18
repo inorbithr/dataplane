@@ -194,6 +194,7 @@ fn redact_with(text: &str, owner: Option<&Redactor>) -> String {
     pem_spans(text, &mut spans);
     keyed_spans(text, &mut spans);
     word_spans(text, &mut spans);
+    userinfo_spans(text, &mut spans);
     process().spans(text, &mut spans);
     if let Some(o) = owner {
         o.spans(text, &mut spans);
@@ -441,6 +442,29 @@ fn is_harmless_value(v: &str) -> bool {
     )
 }
 
+/// `scheme://user:pass@host` becomes `scheme://[redacted]@host`: the userinfo of a URL that
+/// carries a password. A bare user (`ssh://git@host`) is a name, not a secret.
+fn userinfo_spans(text: &str, spans: &mut Vec<(usize, usize)>) {
+    let mut from = 0;
+    while let Some(i) = text.get(from..).and_then(|t| t.find("://")) {
+        let start = from + i + 3;
+        from = start;
+        let rest = text.get(start..).unwrap_or_default();
+        let end = rest
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, '/' | '?' | '#' | '"' | '\'' | '`' | '<' | '>')
+            })
+            .unwrap_or(rest.len());
+        let authority = rest.get(..end).unwrap_or_default();
+        if let Some(at) = authority.rfind('@') {
+            let info = authority.get(..at).unwrap_or_default();
+            if info.contains(':') {
+                spans.push((start, start + at));
+            }
+        }
+    }
+}
+
 /// Known token shapes and long high-entropy words.
 #[allow(clippy::many_single_char_names)] // a byte scanner: text, bytes, length, index
 fn word_spans(text: &str, spans: &mut Vec<(usize, usize)>) {
@@ -555,6 +579,21 @@ fn high_entropy(w: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn url_userinfo_is_redacted_and_the_host_stays() {
+        assert_eq!(
+            redact("clone postgres://admin:s3cret-pw@db.internal:5432/app?x=1 now"),
+            "clone postgres://[redacted]@db.internal:5432/app?x=1 now"
+        );
+        assert_eq!(
+            redact("https://u:p%40ss@host/path and https://u:q@other"),
+            "https://[redacted]@host/path and https://[redacted]@other"
+        );
+        // No password, no secret: a bare user and a plain URL stay readable.
+        assert_eq!(redact("ssh://git@host/x"), "ssh://git@host/x");
+        assert_eq!(redact("https://host:8443/a@b"), "https://host:8443/a@b");
+    }
 
     #[test]
     fn a_json_answer_stays_json_and_references_stay_readable() {

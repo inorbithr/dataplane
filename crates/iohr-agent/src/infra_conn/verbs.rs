@@ -113,6 +113,12 @@ fn values(v: &Verb, p: &Parsed) -> Values {
     for (check, x) in v.pos.iter().zip(&p.pos) {
         match check {
             V::Res | V::One(_) => out.resources.extend(resource_types(x)),
+            // `get pod/a secret/db`: every `type/name` is a resource type of its own.
+            V::Obj => out.resources.extend(
+                x.split(',')
+                    .filter_map(|p| p.split_once('/'))
+                    .map(|(t, _)| t.to_owned()),
+            ),
             V::Chart => out.chart = Some(x.clone()),
             V::Unit => out.units.push(x.clone()),
             _ => {}
@@ -145,6 +151,9 @@ enum V {
     Name,
     /// Resources: names joined by `,` or `/`; never a secret.
     Res,
+    /// The object names after the resource: plain names, or `type/name` forms whose type is
+    /// checked like a resource (never a secret) and counted for the allow-list.
+    Obj,
     /// A label or field selector.
     Sel,
     /// A whole number up to the bound.
@@ -253,6 +262,13 @@ impl V {
         let ok = match self {
             Self::Name => name_chars(s, b":/=", 253),
             Self::Res => name_chars(s, b",/:", 253) && !s.split([',', '/']).any(names_secrets),
+            Self::Obj => {
+                name_chars(s, b",:/=", 253)
+                    && !s
+                        .split(',')
+                        .filter_map(|p| p.split_once('/'))
+                        .any(|(t, _)| names_secrets(t))
+            }
             Self::Sel => name_chars(s, b",=!()/: ", 253) && !s.starts_with(' '),
             Self::Int(max) => s.parse::<u32>().is_ok_and(|n| n >= 1 && n <= max),
             Self::Out => matches!(s, "json" | "yaml" | "name" | "wide" | "table"),
@@ -389,7 +405,7 @@ const VERBS: &[Verb] = &[
         words: &["get"],
         aux: false,
         fixed: &[],
-        pos: &[V::Res, V::Name],
+        pos: &[V::Res, V::Obj],
         min_pos: 1,
         flags: &[
             NS,
@@ -424,7 +440,7 @@ const VERBS: &[Verb] = &[
         words: &["describe"],
         aux: false,
         fixed: &[],
-        pos: &[V::Res, V::Name],
+        pos: &[V::Res, V::Obj],
         min_pos: 1,
         flags: &[NS, SEL],
         bools: NONE_B,
@@ -1298,6 +1314,10 @@ mod tests {
             "get secrets -n shop",
             "get secret/db -n shop",
             "get pods,secrets",
+            "get pod/a secret/db",
+            "get pod/a Secrets.v1/db",
+            "get pod/a,secret/db",
+            "describe pod/a secrets/db",
             "get pods --kubeconfig /etc/x",
             "get pods --raw /api",
             "get pods -o jsonpath={.items}",

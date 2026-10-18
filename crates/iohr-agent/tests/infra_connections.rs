@@ -371,6 +371,12 @@ async fn the_ssh_remote_command_is_one_word_from_the_table_after_the_forced_opti
             "StrictHostKeyChecking=yes",
             "-o",
             "ControlPath=none",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "ForwardAgent=no",
+            "-o",
+            "ClearAllForwardings=yes",
             "-p",
             "2222",
             "ops@db1",
@@ -605,4 +611,173 @@ async fn every_run_is_audited_and_the_chain_verifies() {
     );
     assert!(recent.iter().any(|x| x.action == "infra.kubectl.refused"));
     assert!(audit.verify().is_ok());
+}
+
+#[tokio::test]
+async fn a_secret_in_any_positional_of_get_or_describe_is_refused() {
+    let e = env_with(Kind::Kubectl, KUBECTL, |c| {
+        c.resources = Some(vec!["pods".into()]);
+    });
+    for bad in [
+        "get pod/a secret/db",
+        "get pod/a Secrets.v1/db",
+        "get pod/a,secret/db",
+        "describe pod/a secrets/db",
+        "get pod/a configmap/c",
+    ] {
+        let r = e.runner.run("a", &s(bad), None).await;
+        assert!(matches!(r, Err(InfraError::Refused(_))), "{bad}: {r:?}");
+    }
+    for good in ["get pod/a", "get pods a", "describe pod/a"] {
+        let r = e.runner.run("a", &s(good), None).await;
+        assert!(r.is_ok(), "{good}: {r:?}");
+    }
+}
+
+#[tokio::test]
+async fn helm_template_output_with_a_secret_is_refused_and_never_saved() {
+    let body = r"printf 'apiVersion: v1\nkind: Secret\ndata:\n  a: Yg==\n'";
+    let e = env(Kind::Helm, body);
+    let r = e
+        .runner
+        .run("a", &s("template web repo/web --version 1.2.3"), None)
+        .await;
+    assert!(matches!(r, Err(InfraError::Refused(_))), "{r:?}");
+    let plans = e.tmp.path().join("plans");
+    let saved = std::fs::read_dir(&plans).map_or(0, |d| {
+        d.filter_map(Result::ok)
+            .filter(|x| x.path().join("plan.json").exists() || x.path().is_dir())
+            .count()
+    });
+    assert_eq!(saved, 0, "no plan is saved for a refused render");
+    let ok = env(Kind::Helm, "printf 'kind: Deployment\\n'");
+    let r = ok
+        .runner
+        .run("a", &s("template web repo/web --version 1.2.3"), None)
+        .await;
+    assert!(r.is_ok(), "{r:?}");
+}
+
+#[tokio::test]
+async fn url_passwords_and_every_env_value_are_redacted() {
+    let e = env_with(
+        Kind::Kubectl,
+        r#"echo "dsn postgres://admin:pw-not-in-env@db:5432/x"; echo "ctx=$APP_CONTEXT""#,
+        |c| {
+            c.env
+                .insert("APP_CONTEXT".into(), "plain-context-value".into());
+        },
+    );
+    let r = e.runner.run("a", &s("get pods"), None).await.unwrap();
+    assert!(
+        r.stdout.contains("postgres://[redacted]@db:5432/x"),
+        "{}",
+        r.stdout
+    );
+    assert!(!r.stdout.contains("pw-not-in-env"), "{}", r.stdout);
+    assert!(!r.stdout.contains("plain-context-value"), "{}", r.stdout);
+}
+
+#[tokio::test]
+async fn swapping_the_kubeconfig_file_between_plan_and_apply_is_denied() {
+    let dir = tempfile::tempdir().unwrap();
+    let kc = dir.path().join("kc");
+    std::fs::write(&kc, "users: [one]").unwrap();
+    let kcfile = kc.to_string_lossy().into_owned();
+    let body = "shift 2; case \"$1\" in diff) echo diff; exit 1 ;; *) echo applied ;; esac";
+    let e = env_with(Kind::Kubectl, body, |c| {
+        c.prefix = vec!["--kubeconfig".into(), kcfile.clone()];
+    });
+    e.write("m.yaml", "kind: Deployment\n");
+    let hash = e
+        .runner
+        .run("a", &s("diff -f m.yaml"), None)
+        .await
+        .unwrap()
+        .plan_hash
+        .unwrap();
+    std::fs::write(&kc, "users: [two]").unwrap();
+    e.fed.feed("kc", &hash);
+    let ap = Approval {
+        id: "kc".into(),
+        plan_hash: hash,
+    };
+    let res = e
+        .runner
+        .run("a", &s("apply --server-side -f m.yaml"), Some(&ap))
+        .await;
+    assert!(
+        matches!(res, Err(InfraError::Denied(ref m)) if m.contains("context")),
+        "{res:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_tofu_apply_needs_the_trusted_tree_too() {
+    let e = env(Kind::Tofu, TOFU);
+    let hash = e
+        .runner
+        .run("a", &s("plan"), None)
+        .await
+        .unwrap()
+        .plan_hash
+        .unwrap();
+    mode(&e.work, 0o755);
+    e.fed.feed("tt", &hash);
+    let ap = Approval {
+        id: "tt".into(),
+        plan_hash: hash,
+    };
+    let r = e.runner.run("a", &s("apply"), Some(&ap)).await;
+    assert!(matches!(r, Err(InfraError::Refused(_))), "{r:?}");
+    assert!(!e.marks.join("tofu-applied").exists());
+}
+
+#[tokio::test]
+async fn a_background_process_does_not_outlive_a_command_that_exited() {
+    let e = env(
+        Kind::Ssh,
+        r#"sleep 30 > /dev/null 2>&1 & echo $! > "$MARKS/gc"; echo done"#,
+    );
+    let r = e.runner.run("a", &s("uptime"), None).await.unwrap();
+    assert_eq!(r.stdout.trim(), "done");
+    let gc = std::fs::read_to_string(e.marks.join("gc")).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let alive = std::process::Command::new("kill")
+        .args(["-0", gc.trim()])
+        .status()
+        .unwrap()
+        .success();
+    assert!(
+        !alive,
+        "the background process {} outlived the command",
+        gc.trim()
+    );
+}
+
+#[tokio::test]
+async fn a_tofu_plan_on_the_local_backend_is_refused() {
+    let e = env(Kind::Tofu, TOFU);
+    mode(&e.work, 0o755);
+    std::fs::create_dir_all(e.work.join(".terraform")).unwrap();
+    std::fs::write(
+        e.work.join(".terraform/terraform.tfstate"),
+        r#"{"version":3,"backend":{"type":"local","config":{}}}"#,
+    )
+    .unwrap();
+    mode(&e.work, 0o555);
+    let r = e.runner.run("a", &s("plan"), None).await;
+    assert!(
+        matches!(r, Err(InfraError::Refused(ref m)) if m.contains("local backend")),
+        "{r:?}"
+    );
+    mode(&e.work, 0o755);
+    std::fs::write(
+        e.work.join(".terraform/terraform.tfstate"),
+        r#"{"version":3,"backend":{"type":"s3","config":{}}}"#,
+    )
+    .unwrap();
+    mode(&e.work, 0o555);
+    let r = e.runner.run("a", &s("plan"), None).await;
+    assert!(r.is_ok(), "{r:?}");
 }
