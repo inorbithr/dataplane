@@ -238,6 +238,7 @@ mod tests {
             level: crate::actions::Level::Crit,
             series: 2,
             at: "t".into(),
+            host: None,
         });
         assert_eq!(
             serde_json::to_value(sig).unwrap(),
