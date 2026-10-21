@@ -79,6 +79,10 @@ jobs:
         with:
           install_args: "rust cargo-binstall cargo:cargo-deb cargo:cargo-generate-rpm cargo:cargo-cyclonedx cyclonedx cargo:bpf-linker"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # The bundled sqlite in libsqlite3-sys is compiled by the C compiler dist-bin.sh
+      # picks; the host gcc uses glibc headers, so the musl link fails on glibc-only
+      # symbols (__memcpy_chk, open64, stat64). musl-gcc compiles it against musl.
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: mise run dist:packages
       - run: mise run dist:sbom
       - run: python3 tools/ext_artifact.py --version 0.0.0-ci
