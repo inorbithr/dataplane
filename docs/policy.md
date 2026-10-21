@@ -126,6 +126,25 @@ The host observers need no privilege. With `CAP_SYS_ADMIN` (and nothing else) th
 read PCI config space past 64 bytes, which gives the per-link ASPM state; without it that
 state is reported as not observed. See [host.md](host.md#privileges).
 
+## `[sensors]`
+
+The agent's own probes as sensor readings (PRD 0152 slice 2). Off by default. It needs
+`[work] host = true` and `[share] host = true`, and a platform whose welcome accepts
+`signal` frames; an older platform simply gets none.
+
+```toml
+[sensors]
+enabled = true        # default false
+interval_secs = 60    # 15 to 3600, default 60
+```
+
+Each interval the agent sends up to four `signal` frames on its existing session (no second
+connection or token): `host.load_1m`, `host.memory_used_percent`,
+`host.disk_used_percent_max` and `host.temperature_c_max`, template `host-probe`. Each
+carries `host`, the agent's id. Only numbers leave the machine: no mount names, no sensor
+labels. A reload (the page, `POST /policy/reload`) opens a new session with the new
+settings, so there is no restart. Every frame is in the egress ledger (kind `signal`).
+
 ## `[examples]`
 
 SDK example sets the agent runs on a timer, one table per set key (RFC 0165). A set is

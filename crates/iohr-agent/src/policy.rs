@@ -57,6 +57,10 @@ pub struct Policy {
     /// of the hashed form while absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<HostPolicy>,
+    /// Whether this agent publishes its own host probes as sensor readings (`signal`
+    /// frames, PRD 0152 slice 2) and how often. Left out of the hashed form while absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sensors: Option<SensorsPolicy>,
     /// What the hello tells the platform about this agent's checks and host
     /// (`docs/policy.md`). Left out of the hashed form while absent; absent means the
     /// defaults: targets as a keyed hash and a label, no host name.
@@ -322,6 +326,32 @@ pub struct Work {
     /// left out of the hashed form while off.
     #[serde(default, skip_serializing_if = "is_false")]
     pub host: bool,
+}
+
+/// `[sensors]`: the agent's own probes (load, memory, the root disk, the hottest
+/// temperature) sent as readings. Off by default; needs `[work] host` and `[share] host`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SensorsPolicy {
+    /// Send the readings (to a platform whose welcome accepts `signal`).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Seconds between readings (15 to 3600).
+    #[serde(default = "sensors_interval_secs")]
+    pub interval_secs: u64,
+}
+
+impl Default for SensorsPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: sensors_interval_secs(),
+        }
+    }
+}
+
+fn sensors_interval_secs() -> u64 {
+    60
 }
 
 /// `[host]`.
@@ -685,6 +715,11 @@ impl Policy {
             }
             cap.layers = seen;
         }
+        if let Some(s) = &self.sensors
+            && !(15..=3600).contains(&s.interval_secs)
+        {
+            return Err("sensors.interval_secs must be 15 to 3600".into());
+        }
         if let Some(h) = &self.host {
             if !(5..=300).contains(&h.sample_secs) {
                 return Err("host.sample_secs must be 5 to 300".into());
@@ -777,6 +812,16 @@ impl Policy {
         self.work
             .host
             .then(|| self.host.clone().unwrap_or_default())
+    }
+
+    /// The agent's own sensor readings in force: `Some` only when `[sensors] enabled` and
+    /// `[work] host` is on (the probes read the host sampler) and `[share] host` allows host
+    /// numbers to leave the machine.
+    #[must_use]
+    pub fn sensors(&self) -> Option<SensorsPolicy> {
+        self.sensors
+            .clone()
+            .filter(|s| s.enabled && self.work.host && self.share().host)
     }
 
     /// What the hello shares: `[share]`, or its defaults.
@@ -1004,6 +1049,31 @@ allow = ["vault:kv/staging/*", "env:CHECK_TOKEN"]
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn sensors_are_off_until_enabled_with_the_host_on_and_keep_old_hashes() {
+        let base = "environment = \"staging\"\n";
+        let p = Policy::from_toml(base).unwrap();
+        assert!(p.sensors().is_none());
+        assert!(!p.to_toml().unwrap().contains("sensors"));
+        let on = Policy::from_toml(&format!(
+            "{base}[work]\nhost = true\n[share]\nhost = true\n[sensors]\nenabled = true\ninterval_secs = 30\n"
+        ))
+        .unwrap();
+        assert_eq!(on.sensors().unwrap().interval_secs, 30);
+        assert_ne!(on.hash(), p.hash());
+        let no_host = Policy::from_toml(&format!("{base}[sensors]\nenabled = true\n")).unwrap();
+        assert!(
+            no_host.sensors().is_none(),
+            "needs [work] host and [share] host"
+        );
+        for bad in ["interval_secs = 5", "interval_secs = 7200", "speed = 1"] {
+            assert!(
+                Policy::from_toml(&format!("{base}[sensors]\nenabled = true\n{bad}\n")).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

@@ -480,6 +480,7 @@ impl Executor {
             level: crate::actions::evaluate(value, s.warn, s.crit, s.below),
             series,
             at,
+            host: None,
         })
     }
 

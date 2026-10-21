@@ -32,6 +32,7 @@ pub mod mcp_door;
 pub mod metadata;
 pub mod platform;
 pub mod policy;
+pub mod probes;
 pub mod protocol;
 pub mod redact;
 pub mod run_once;
