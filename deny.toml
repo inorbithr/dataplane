@@ -6,6 +6,12 @@ all-features = true
 
 [advisories]
 yanked = "deny"
+ignore = [
+  # unsafe-libyaml is unmaintained (RUSTSEC-2024-0449); it comes in through serde_yaml_ng
+  # 0.10.0 in iohr-agent and has no safe upgrade. The swap to a maintained YAML crate is
+  # tracked under PRD 0152.
+  { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml via serde_yaml_ng; swap tracked under PRD 0152" },
+]
 
 [licenses]
 # crates/iohr-capture-ebpf (MIT OR GPL-2.0) is not a workspace member and has its own
