@@ -1064,7 +1064,10 @@ allow = ["vault:kv/staging/*", "env:CHECK_TOKEN"]
         assert_eq!(on.sensors().unwrap().interval_secs, 30);
         assert_ne!(on.hash(), p.hash());
         let no_host = Policy::from_toml(&format!("{base}[sensors]\nenabled = true\n")).unwrap();
-        assert!(no_host.sensors().is_none(), "needs [work] host and [share] host");
+        assert!(
+            no_host.sensors().is_none(),
+            "needs [work] host and [share] host"
+        );
         for bad in ["interval_secs = 5", "interval_secs = 7200", "speed = 1"] {
             assert!(
                 Policy::from_toml(&format!("{base}[sensors]\nenabled = true\n{bad}\n")).is_err(),

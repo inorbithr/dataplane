@@ -49,7 +49,11 @@ pub fn signals(summary: &Value, host: &str, at: &str) -> Vec<Signal> {
             });
         }
     };
-    let cpus = summary.get("cpus").and_then(Value::as_f64).unwrap_or(1.0).max(1.0);
+    let cpus = summary
+        .get("cpus")
+        .and_then(Value::as_f64)
+        .unwrap_or(1.0)
+        .max(1.0);
     push(
         LOAD,
         summary.get("load_1m").and_then(Value::as_f64),

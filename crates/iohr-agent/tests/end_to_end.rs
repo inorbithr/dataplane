@@ -855,7 +855,10 @@ async fn the_hello_carries_the_inventory_unless_turned_off() {
 /// frames on its interval, each carrying the host id; with it off, none.
 #[tokio::test]
 async fn the_agent_publishes_its_probes_with_the_host_id_on_its_interval() {
-    for (sensors, on) in [("", false), ("[sensors]\nenabled = true\ninterval_secs = 15\n", true)] {
+    for (sensors, on) in [
+        ("", false),
+        ("[sensors]\nenabled = true\ninterval_secs = 15\n", true),
+    ] {
         let mut h = harness_with(
             KeyAlg::Es256,
             &format!(
@@ -887,7 +890,10 @@ async fn the_agent_publishes_its_probes_with_the_host_id_on_its_interval() {
                 }
                 names.push(s["sensor"].as_str().unwrap().to_owned());
             }
-            assert!(names.contains(&"host.memory_used_percent".to_owned()), "{names:?}");
+            assert!(
+                names.contains(&"host.memory_used_percent".to_owned()),
+                "{names:?}"
+            );
         } else {
             let r = tokio::time::timeout(Duration::from_secs(3), async {
                 loop {
