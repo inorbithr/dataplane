@@ -23,7 +23,7 @@ env:
 jobs:
   repo:
     name: repo
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_LIGHT_RUNNER || vars.LINUX_RUNNER || 'ubuntu-latest' }}
     permissions:
       contents: read
     steps:
@@ -37,7 +37,7 @@ jobs:
 
   rust:
     name: rust
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINUX_RUNNER || 'ubuntu-latest' }}
     permissions:
       contents: read
     steps:
@@ -52,7 +52,7 @@ jobs:
 
   helm:
     name: helm
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINUX_RUNNER || 'ubuntu-latest' }}
     permissions:
       contents: read
     steps:
@@ -68,7 +68,7 @@ jobs:
   # layout. Catches packaging breakage before a tag does.
   package:
     name: package
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINUX_DOCKER_RUNNER || 'ubuntu-latest' }}
     permissions:
       contents: read
     steps:
@@ -90,7 +90,7 @@ jobs:
     name: ci-ok
     if: always()
     needs: [repo, rust, helm, package]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_LIGHT_RUNNER || vars.LINUX_RUNNER || 'ubuntu-latest' }}
     permissions: {}
     steps:
       - env:

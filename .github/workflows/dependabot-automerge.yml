@@ -16,7 +16,7 @@ jobs:
     # Opened by Dependabot. fetch-metadata returns no metadata unless every commit is
     # Dependabot's, so a commit from anyone else on the branch leaves it for review.
     if: github.event.pull_request.user.login == 'dependabot[bot]'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_LIGHT_RUNNER || vars.LINUX_RUNNER || 'ubuntu-latest' }}
     permissions:
       contents: write
       pull-requests: write

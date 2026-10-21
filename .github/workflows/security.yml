@@ -16,7 +16,7 @@ jobs:
   zizmor:
     name: zizmor
     if: ${{ !github.event.repository.private }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINUX_RUNNER || 'ubuntu-latest' }}
     permissions:
       contents: read
       security-events: write
@@ -29,7 +29,7 @@ jobs:
   codeql:
     name: codeql ${{ matrix.language }}
     if: ${{ !github.event.repository.private }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINUX_RUNNER || 'ubuntu-latest' }}
     permissions:
       contents: read
       security-events: write
@@ -65,7 +65,7 @@ jobs:
   dependency-review:
     name: dependency review
     if: ${{ github.event_name == 'pull_request' && !github.event.repository.private }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINUX_RUNNER || 'ubuntu-latest' }}
     permissions:
       contents: read
       pull-requests: write
