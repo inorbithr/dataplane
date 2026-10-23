@@ -97,7 +97,7 @@ answer must carry:
 | Key | Meaning |
 |---|---|
 | `location` | The `Location` of the answer, whole. Needs `status` 300 to 399. An absolute `http` or `https` address. |
-| `location_prefix` | The start of the `Location`, for example `"https://auth.example.com/"`. Not together with `location`. |
+| `location_prefix` | The start of the `Location`, for example `"https://auth.example.com/"`. Not together with `location`. The host must be followed by `/` and carry no user info; the scheme, host and port are compared as parsed, so `https://auth.example.com/` does not match `https://auth.example.com.evil.net/` or `https://auth.example.com@evil.net/`. Only the path and query are matched as text. |
 | `headers` | Up to 8 headers the answer must carry, `{ Strict-Transport-Security = "max-age=" }`: the name, and the start of its value (`""` for any value). Names are not case sensitive. |
 
 ```toml
@@ -107,6 +107,7 @@ name = "room-needs-sign-in"
 category = "security"
 target = "https://app.example.com/room/"
 every = "5m"
+fail_after = 2
 notify = true
 expect = { status = 302, location_prefix = "https://auth.example.com/" }
 
@@ -119,6 +120,12 @@ every = "15m"
 notify = true
 expect = { headers = { Strict-Transport-Security = "max-age=", X-Content-Type-Options = "nosniff", X-Frame-Options = "" } }
 ```
+
+A header value is matched by its start, so `max-age=` also accepts `max-age=0`: write the
+whole value you require (`max-age=31536000`) when it matters. For header checks set
+`fail_after` to 2 or more (the default for `[[check]]` is 2; a `[[refuse]]` defaults to 1, so
+set it): alerts go out on a state change, and a flapping edge or CDN on a check that fails
+after one run can mail about twice a minute.
 
 The status is judged first; headers and the redirect only when the status is the wanted
 one. A broken rule fails the run with the error class `answer` and the invariants

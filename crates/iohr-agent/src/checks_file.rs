@@ -23,7 +23,8 @@ use crate::policy::{NameRule, Policy, normalize_host};
 
 /// Bounds a checks file must respect (the platform enforces the same).
 pub mod limits {
-    /// Most entries, `[[check]]` and `[[refuse]]` together.
+    /// Most entries, `[[check]]` and `[[refuse]]` together. The platform holds the same
+    /// number (core `crates/agents/src/reconcile.rs` `MAX_CHECKS`); a test pins this one.
     pub const MAX_CHECKS: usize = 50;
     /// Longest name.
     pub const MAX_NAME: usize = 64;
@@ -981,6 +982,22 @@ fn assertions(x: &FileExpect) -> std::result::Result<Assert, String> {
 
 /// A redirect target the check compares against: an absolute http or https address.
 fn check_location(u: &str, field: &str) -> std::result::Result<String, String> {
+    check_location_url(u, field)?;
+    if field == "location_prefix" {
+        // A prefix must end at the authority: a path after the host, so that
+        // `https://auth.example.com` cannot also mean `https://auth.example.com.evil.net/`.
+        let rest = u.split_once("://").map_or("", |(_, r)| r);
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        if !rest[authority.len()..].starts_with('/') || authority.contains('@') {
+            return Err(format!(
+                "expect.{field} must name the host and a path (end the host with /) and carry no user info"
+            ));
+        }
+    }
+    Ok(u.to_owned())
+}
+
+fn check_location_url(u: &str, field: &str) -> std::result::Result<String, String> {
     if u.len() > limits::MAX_URL || u.chars().any(char::is_control) {
         return Err(format!(
             "expect.{field} must be at most {} printable characters",
@@ -2082,6 +2099,32 @@ every = "60s"
         assert!(!plain.notify);
         let wire = plain.to_wire();
         assert!(wire.get("notify").is_none() && wire.get("expect").is_none());
+    }
+
+    #[test]
+    fn the_entry_limit_is_the_platforms() {
+        // core crates/agents/src/reconcile.rs MAX_CHECKS = 50: change both or neither.
+        assert_eq!(limits::MAX_CHECKS, 50);
+    }
+
+    #[test]
+    fn a_location_prefix_must_end_the_host_and_carry_no_user_info() {
+        let file = |prefix: &str| {
+            one(&format!(
+                "[[refuse]]\nname = \"t\"\ntarget = \"https://a.example.com/room/\"\nevery = \"5m\"\nexpect = {{ status = 302, location_prefix = \"{prefix}\" }}\n"
+            ))
+        };
+        for bad in [
+            "https://auth.example.com",
+            "https://auth.example.com?x=",
+            "https://auth.example.com@evil.net/",
+            "https://user@auth.example.com/",
+        ] {
+            let e = file(bad).unwrap_err().clone();
+            assert!(e.contains("location_prefix"), "{bad}: {e}");
+        }
+        assert!(file("https://auth.example.com/").is_ok());
+        assert!(file("https://auth.example.com:8443/login").is_ok());
     }
 
     #[test]

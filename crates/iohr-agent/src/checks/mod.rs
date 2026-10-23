@@ -230,6 +230,23 @@ pub enum Location {
     Prefix(String),
 }
 
+/// Whether the redirect address `got` is under `want`: the scheme, host and port are
+/// compared as parsed, and `want` only decides the path and query, so
+/// `https://auth.example.com/` is not `https://auth.example.com.evil.net/` nor
+/// `https://auth.example.com@evil.net/`. A relative or unparsable `got` is no match.
+fn prefix_matches(want: &str, got: &str) -> bool {
+    use url::Position;
+    let (Ok(w), Ok(g)) = (Url::parse(want), Url::parse(got)) else {
+        return false;
+    };
+    g.scheme() == w.scheme()
+        && g.host_str() == w.host_str()
+        && g.port_or_known_default() == w.port_or_known_default()
+        && g.username().is_empty()
+        && g.password().is_none()
+        && g[Position::BeforePath..].starts_with(&w[Position::BeforePath..])
+}
+
 impl Assert {
     /// No rule at all.
     #[must_use]
@@ -248,9 +265,7 @@ impl Assert {
                 .and_then(|v| v.to_str().ok());
             let (ok, how) = match rule {
                 Location::Exact(want) => (got == Some(want.as_str()), "exact"),
-                Location::Prefix(want) => {
-                    (got.is_some_and(|g| g.starts_with(want.as_str())), "prefix")
-                }
+                Location::Prefix(want) => (got.is_some_and(|g| prefix_matches(want, g)), "prefix"),
             };
             if !ok {
                 out.push(Invariant::broke("location", "location", how));
@@ -661,6 +676,40 @@ mod tests {
 
     fn spec(v: serde_json::Value) -> CheckSpec {
         serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn a_location_prefix_is_matched_on_the_parsed_host_not_the_text() {
+        let want = "https://auth.example.com/";
+        for ok in [
+            "https://auth.example.com/",
+            "https://auth.example.com/login?next=%2Froom",
+            "https://AUTH.example.com:443/x",
+            // A browser reads `\` as `/`, so the host here is auth.example.com.
+            "https://auth.example.com\\@evil.net/",
+        ] {
+            assert!(prefix_matches(want, ok), "{ok}");
+        }
+        for bad in [
+            "https://auth.example.com.evil.net/",
+            "https://auth.example.com@evil.net/",
+            "https://auth.example.com:8443@evil.net/",
+            "https://user@auth.example.com/",
+            "http://auth.example.com/",
+            "https://auth.example.com:8443/",
+            "//auth.example.com/",
+            "/login",
+        ] {
+            assert!(!prefix_matches(want, bad), "{bad}");
+        }
+        assert!(prefix_matches(
+            "https://auth.example.com/login?next=",
+            "https://auth.example.com/login?next=%2Froom"
+        ));
+        assert!(!prefix_matches(
+            "https://auth.example.com/login",
+            "https://auth.example.com/other"
+        ));
     }
 
     #[test]
