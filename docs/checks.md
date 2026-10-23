@@ -74,7 +74,8 @@ Unknown keys are errors, so a typo never silently changes what is checked.
 | `surface` | no | `http`, `tcp`, `tls`, `grpc_health`, or a transport surface: `grpc`, `sse`, `ws`, `mqtt`, `mcp`, `graphql` ([below](#transport-surfaces)). Default: `http` for a URL target, `tcp` for host and port. |
 | `target` | yes | A URL (`"https://api.example.com/healthz"`), `"host:port"`, a bare host for `tls` (port 443), or a table: `{ url = "…" }` or `{ host = "…", port = 5432, tls = true }` (`tls` for `grpc_health`). No user or password in a URL; credentials go in `auth`. |
 | `every` | yes | `"60s"`, `"5m"`, `"1h"`, `"1d"`: from one minute to 24 hours. |
-| `expect` | no | `status` (100 to 599; `http`, `sse`, `mcp`, `graphql`), `max_ms` (1 to 30000), `valid_for_days` (1 to 365, `tls` and `http`: the certificate must stay valid that long; judged by the platform from the expiry the agent reports). Without `status`, any status below 400 passes. |
+| `expect` | no | `status` (100 to 599; `http`, `sse`, `mcp`, `graphql`), `max_ms` (1 to 30000), `valid_for_days` (1 to 365, `tls` and `http`: the certificate must stay valid that long; judged by the platform from the expiry the agent reports), and for `http` the [redirect and header rules](#redirects-and-headers-http). Without `status`, any status below 400 passes. |
+| `notify` | no | `true` makes the monitor tell the account's owners and admins when it goes down and when it recovers (bell and mail; RFC 0051). Default `false`: the monitor shows its state and nothing is sent. Phone paging is a separate path: an account subscription on the `state` events. |
 | `fail_after` | no | Failed runs in a row before the monitor goes down, 1 to 5. Default 2 for `[[check]]`, 1 for `[[refuse]]`. |
 | `service` | no | The gRPC health service name (`grpc_health` only); empty means the whole server. |
 | `auth` | no | A secret reference (`env:NAME`, `file:/path`, `k8s:ns/name#key`, `vault:path#key`) sent as the `authorization` header of every surface but `tcp` and `tls` (on `ws` and `mqtt`, of the WebSocket upgrade; on `grpc`, as metadata). Never a value; the policy's `[secrets] allow` must permit it. |
@@ -86,6 +87,45 @@ Unknown keys are errors, so a typo never silently changes what is checked.
 | `by` | `[[refuse]]` | Who must refuse: `"policy"` or `"platform"`. Leave it out and give `expect` for a refusal the target answers. |
 
 At most 50 entries, `[[check]]` and `[[refuse]]` together.
+
+## Redirects and headers (`http`)
+
+An `http` check does not follow a redirect (the next hop would be a second, unchecked
+target), so a `3xx` answer is judged as it stands. Three `expect` rules say what the
+answer must carry:
+
+| Key | Meaning |
+|---|---|
+| `location` | The `Location` of the answer, whole. Needs `status` 300 to 399. An absolute `http` or `https` address. |
+| `location_prefix` | The start of the `Location`, for example `"https://auth.example.com/"`. Not together with `location`. |
+| `headers` | Up to 8 headers the answer must carry, `{ Strict-Transport-Security = "max-age=" }`: the name, and the start of its value (`""` for any value). Names are not case sensitive. |
+
+```toml
+# The room is behind the sign-in: it answers 302 and the redirect goes to the sign-in.
+[[refuse]]
+name = "room-needs-sign-in"
+category = "security"
+target = "https://app.example.com/room/"
+every = "5m"
+notify = true
+expect = { status = 302, location_prefix = "https://auth.example.com/" }
+
+# The edge sends HSTS and the other browser headers.
+[[check]]
+name = "edge-security-headers"
+category = "security"
+target = "https://app.example.com/"
+every = "15m"
+notify = true
+expect = { headers = { Strict-Transport-Security = "max-age=", X-Content-Type-Options = "nosniff", X-Frame-Options = "" } }
+```
+
+The status is judged first; headers and the redirect only when the status is the wanted
+one. A broken rule fails the run with the error class `answer` and the invariants
+`location` or `header` (the header's name is the path, `exact`, `prefix` or `present` is
+how it was judged). The values you wrote, the address the redirect went to and what a
+header held stay on this machine; the hello tells the platform only that a `location`
+(`exact` or `prefix`) and which header names are asserted.
 
 ## Transport surfaces
 
@@ -308,7 +348,7 @@ secret, `uses_secret: true`; with `"label"`, without the hash too
 So at `"full"` the targets and names you declare leave the machine: full URLs (path and
 query included), host names and ports, secret *references*, RFC numbers, categories and
 tags. At the default only names, labels, keyed hashes, schedules, expectations, RFC
-numbers, categories and tags do. A transport check's request (method, params, query, topic, tool, body, headers) and
+numbers, categories, tags and `notify` do. For the redirect and header rules only that a `location` is asserted (`exact` or `prefix`) and the header names do; the addresses and values do not. A transport check's request (method, params, query, topic, tool, body, headers) and
 `auth_scheme` do not. Secret values never
 do; neither do results beyond what any job reports. The platform answers what it accepted
 and why it rejected the rest; the agent's page in the console shows both.
