@@ -74,7 +74,8 @@ Unknown keys are errors, so a typo never silently changes what is checked.
 | `surface` | no | `http`, `tcp`, `tls`, `grpc_health`, or a transport surface: `grpc`, `sse`, `ws`, `mqtt`, `mcp`, `graphql` ([below](#transport-surfaces)). Default: `http` for a URL target, `tcp` for host and port. |
 | `target` | yes | A URL (`"https://api.example.com/healthz"`), `"host:port"`, a bare host for `tls` (port 443), or a table: `{ url = "…" }` or `{ host = "…", port = 5432, tls = true }` (`tls` for `grpc_health`). No user or password in a URL; credentials go in `auth`. |
 | `every` | yes | `"60s"`, `"5m"`, `"1h"`, `"1d"`: from one minute to 24 hours. |
-| `expect` | no | `status` (100 to 599; `http`, `sse`, `mcp`, `graphql`), `max_ms` (1 to 30000), `valid_for_days` (1 to 365, `tls` and `http`: the certificate must stay valid that long; judged by the platform from the expiry the agent reports). Without `status`, any status below 400 passes. |
+| `expect` | no | `status` (100 to 599; `http`, `sse`, `mcp`, `graphql`), `max_ms` (1 to 30000), `valid_for_days` (1 to 365, `tls` and `http`: the certificate must stay valid that long; judged by the platform from the expiry the agent reports), and for `http` the [redirect and header rules](#redirects-and-headers-http). Without `status`, any status below 400 passes. |
+| `notify` | no | `true` makes the monitor tell the account's owners and admins when it goes down and when it recovers (bell and mail; RFC 0051). Default `false`: the monitor shows its state and nothing is sent. Phone paging is a separate path: an account subscription on the `state` events. |
 | `fail_after` | no | Failed runs in a row before the monitor goes down, 1 to 5. Default 2 for `[[check]]`, 1 for `[[refuse]]`. |
 | `service` | no | The gRPC health service name (`grpc_health` only); empty means the whole server. |
 | `auth` | no | A secret reference (`env:NAME`, `file:/path`, `k8s:ns/name#key`, `vault:path#key`) sent as the `authorization` header of every surface but `tcp` and `tls` (on `ws` and `mqtt`, of the WebSocket upgrade; on `grpc`, as metadata). Never a value; the policy's `[secrets] allow` must permit it. |
@@ -86,6 +87,52 @@ Unknown keys are errors, so a typo never silently changes what is checked.
 | `by` | `[[refuse]]` | Who must refuse: `"policy"` or `"platform"`. Leave it out and give `expect` for a refusal the target answers. |
 
 At most 50 entries, `[[check]]` and `[[refuse]]` together.
+
+## Redirects and headers (`http`)
+
+An `http` check does not follow a redirect (the next hop would be a second, unchecked
+target), so a `3xx` answer is judged as it stands. Three `expect` rules say what the
+answer must carry:
+
+| Key | Meaning |
+|---|---|
+| `location` | The `Location` of the answer, whole. Needs `status` 300 to 399. An absolute `http` or `https` address. |
+| `location_prefix` | The start of the `Location`, for example `"https://auth.example.com/"`. Not together with `location`. The host must be followed by `/` and carry no user info; the scheme, host and port are compared as parsed, so `https://auth.example.com/` does not match `https://auth.example.com.evil.net/` or `https://auth.example.com@evil.net/`. Only the path and query are matched as text. |
+| `headers` | Up to 8 headers the answer must carry, `{ Strict-Transport-Security = "max-age=" }`: the name, and the start of its value (`""` for any value). Names are not case sensitive. |
+
+```toml
+# The room is behind the sign-in: it answers 302 and the redirect goes to the sign-in.
+[[refuse]]
+name = "room-needs-sign-in"
+category = "security"
+target = "https://app.example.com/room/"
+every = "5m"
+fail_after = 2
+notify = true
+expect = { status = 302, location_prefix = "https://auth.example.com/" }
+
+# The edge sends HSTS and the other browser headers.
+[[check]]
+name = "edge-security-headers"
+category = "security"
+target = "https://app.example.com/"
+every = "15m"
+notify = true
+expect = { headers = { Strict-Transport-Security = "max-age=", X-Content-Type-Options = "nosniff", X-Frame-Options = "" } }
+```
+
+A header value is matched by its start, so `max-age=` also accepts `max-age=0`: write the
+whole value you require (`max-age=31536000`) when it matters. For header checks set
+`fail_after` to 2 or more (the default for `[[check]]` is 2; a `[[refuse]]` defaults to 1, so
+set it): alerts go out on a state change, and a flapping edge or CDN on a check that fails
+after one run can mail about twice a minute.
+
+The status is judged first; headers and the redirect only when the status is the wanted
+one. A broken rule fails the run with the error class `answer` and the invariants
+`location` or `header` (the header's name is the path, `exact`, `prefix` or `present` is
+how it was judged). The values you wrote, the address the redirect went to and what a
+header held stay on this machine; the hello tells the platform only that a `location`
+(`exact` or `prefix`) and which header names are asserted.
 
 ## Transport surfaces
 
@@ -208,6 +255,37 @@ A reading is a measurement of the agent's own machine, not of a target's answer:
 sensor key, the numbers and the level leave the machine; nothing else about the host does
 (the topology, mounts and boots stay in local `atlas observe host` output).
 
+## SDK examples: `examples`
+
+Reads the latest run of a named example set that this agent runs from its own checkout
+(RFC 0165). The agent runs the set on a timer in the background, because a run takes
+minutes and a job waits seconds; the check only reads the newest finished run, so it
+answers at once. It needs `examples` in `[work] surfaces` and the set in
+[`[examples.<key>]`](policy.md#examples). The set's command writes
+`examples-results.json` (schema 1, the file the SDK's `tools/run-examples.py` writes);
+the agent reads that file and nothing else.
+
+```toml
+[[check]]
+name = "sdk-examples"
+surface = "examples"
+target = { set = "sdk" }     # the key under [examples.<key>] in policy.toml
+every = "5m"
+fail_after = 1
+category = "availability"
+```
+
+The check fails with `error_class = "examples"` when any example failed. `detail.invariants`
+lists `language/example` with `status` `ok`, `failed` or `skipped`, failures first, at
+most 64. Run-level conditions are listed the same way: `run/missing` (the command wrote no
+fresh results file), `run/exit` (the command failed or timed out), `run/stale` (the newest
+run is older than `max_age_secs`), `run/empty` (no example passed). Before the first run
+has finished the check is not a pass.
+
+Only names and statuses leave the machine: not the command, its output, a note from a
+result, or a path. The set key is shown as a label (the platform never gets a hash of it),
+and a job for `examples` that does not name a declared check is refused.
+
 ## Tests that must fail: `[[refuse]]`
 
 A `[[refuse]]` entry passes when the target is refused. A guard that stops guarding then
@@ -277,7 +355,7 @@ secret, `uses_secret: true`; with `"label"`, without the hash too
 So at `"full"` the targets and names you declare leave the machine: full URLs (path and
 query included), host names and ports, secret *references*, RFC numbers, categories and
 tags. At the default only names, labels, keyed hashes, schedules, expectations, RFC
-numbers, categories and tags do. A transport check's request (method, params, query, topic, tool, body, headers) and
+numbers, categories, tags and `notify` do. For the redirect and header rules only that a `location` is asserted (`exact` or `prefix`) and the header names do; the addresses and values do not. A transport check's request (method, params, query, topic, tool, body, headers) and
 `auth_scheme` do not. Secret values never
 do; neither do results beyond what any job reports. The platform answers what it accepted
 and why it rejected the rest; the agent's page in the console shows both.

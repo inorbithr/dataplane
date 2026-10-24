@@ -850,3 +850,63 @@ async fn the_hello_carries_the_inventory_unless_turned_off() {
         let _ = task.await;
     }
 }
+
+/// PRD 0152 slice 2: with `[sensors]` on, the agent publishes its own probes as `signal`
+/// frames on its interval, each carrying the host id; with it off, none.
+#[tokio::test]
+async fn the_agent_publishes_its_probes_with_the_host_id_on_its_interval() {
+    for (sensors, on) in [
+        ("", false),
+        ("[sensors]\nenabled = true\ninterval_secs = 15\n", true),
+    ] {
+        let mut h = harness_with(
+            KeyAlg::Es256,
+            &format!(
+                "[work]\nhost = true\nsurfaces = [\"http\", \"hwmon\"]\n[host]\nsample_secs = 5\nwindow_secs = 60\n[share]\nhost = true\n{sensors}"
+            ),
+        )
+        .await;
+        let (agent, stop, task) = start_on_fixture(&h).await;
+        next(&mut h.frames, "hello").await;
+        if on {
+            let mut names = Vec::new();
+            // The first batch is sent at once, the second one interval later.
+            let mut batches = 0;
+            while batches < 2 {
+                let s = tokio::time::timeout(Duration::from_secs(25), async {
+                    loop {
+                        let (_, f) = h.frames.recv().await.expect("fake control plane gone");
+                        if f["type"] == "signal" {
+                            return f;
+                        }
+                    }
+                })
+                .await
+                .expect("a reading within the interval");
+                assert_eq!(s["host"], agent.enrollment.agent_id.as_str());
+                assert_eq!(s["template"], "host-probe");
+                if s["sensor"] == "host.load_1m" {
+                    batches += 1;
+                }
+                names.push(s["sensor"].as_str().unwrap().to_owned());
+            }
+            assert!(
+                names.contains(&"host.memory_used_percent".to_owned()),
+                "{names:?}"
+            );
+        } else {
+            let r = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let (_, f) = h.frames.recv().await.expect("fake control plane gone");
+                    if f["type"] == "signal" {
+                        return f;
+                    }
+                }
+            })
+            .await;
+            assert!(r.is_err(), "no readings while [sensors] is off");
+        }
+        stop.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+}

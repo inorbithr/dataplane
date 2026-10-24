@@ -53,11 +53,15 @@ pub enum Surface {
     /// A hardware sensor on this host against thresholds in `checks.toml` (needs
     /// `[work] host`); reports the reading and a level, nothing else.
     Hwmon,
+    /// A named set of the SDK's examples this machine runs on a timer from its own
+    /// checkout (`[examples.<key>]` in the policy); the check reads the latest finished
+    /// run. RFC 0165.
+    Examples,
 }
 
 impl Surface {
     /// Every surface this version can check.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Http,
         Self::Tcp,
         Self::Tls,
@@ -69,6 +73,7 @@ impl Surface {
         Self::Mcp,
         Self::Graphql,
         Self::Hwmon,
+        Self::Examples,
     ];
 
     /// The surfaces on when the policy names none. The transport surfaces read an answer
@@ -90,6 +95,7 @@ impl Surface {
             Self::Mcp => "mcp",
             Self::Graphql => "graphql",
             Self::Hwmon => "hwmon",
+            Self::Examples => "examples",
         }
     }
 
@@ -106,19 +112,22 @@ impl Surface {
     /// `checks.toml`, never in a job.
     #[must_use]
     pub fn needs_declared(self) -> bool {
-        matches!(self, Self::Grpc | Self::Ws | Self::Mqtt | Self::Hwmon)
+        matches!(
+            self,
+            Self::Grpc | Self::Ws | Self::Mqtt | Self::Hwmon | Self::Examples
+        )
     }
 
-    /// Reads this host, never the network.
+    /// Reads this host, never the network: a sensor, or the latest run of an example set.
     #[must_use]
     pub fn is_host(self) -> bool {
-        matches!(self, Self::Hwmon)
+        matches!(self, Self::Hwmon | Self::Examples)
     }
 
     /// Sends a credential when the check names one (everything but `tcp` and `tls`).
     #[must_use]
     pub fn takes_auth(self) -> bool {
-        !matches!(self, Self::Tcp | Self::Tls | Self::Hwmon)
+        !matches!(self, Self::Tcp | Self::Tls | Self::Hwmon | Self::Examples)
     }
 
     /// Has an HTTP status to expect.
@@ -197,12 +206,98 @@ pub struct Params {
     pub expect_error: Option<String>,
     /// `grpc`: the gRPC status code to expect (default 0, OK).
     pub expect_code: Option<u32>,
+    /// `http`: what the answer's headers must say (RFC 0040.2).
+    pub assert: Assert,
+}
+
+/// `http`: the answer's headers a check asserts. Values live in the file only; a failure
+/// names the header, never what it held or what was wanted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Assert {
+    /// Where a 3xx must point (the `Location` header, compared as sent).
+    pub location: Option<Location>,
+    /// Required headers, by lower-case name, with a value prefix (empty: only present).
+    /// Sorted by name.
+    pub headers: Vec<(String, String)>,
+}
+
+/// How the `Location` of a redirect is matched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Location {
+    /// The whole value.
+    Exact(String),
+    /// The start of the value.
+    Prefix(String),
+}
+
+/// Whether the redirect address `got` is under `want`: the scheme, host and port are
+/// compared as parsed, and `want` only decides the path and query, so
+/// `https://auth.example.com/` is not `https://auth.example.com.evil.net/` nor
+/// `https://auth.example.com@evil.net/`. A relative or unparsable `got` is no match.
+fn prefix_matches(want: &str, got: &str) -> bool {
+    use url::Position;
+    let (Ok(w), Ok(g)) = (Url::parse(want), Url::parse(got)) else {
+        return false;
+    };
+    g.scheme() == w.scheme()
+        && g.host_str() == w.host_str()
+        && g.port_or_known_default() == w.port_or_known_default()
+        && g.username().is_empty()
+        && g.password().is_none()
+        && g[Position::BeforePath..].starts_with(&w[Position::BeforePath..])
+}
+
+impl Assert {
+    /// No rule at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.location.is_none() && self.headers.is_empty()
+    }
+
+    /// The broken rules for an answer carrying `headers`: `location` for the redirect,
+    /// `header` (path: the header) for each missing or mismatched one.
+    #[must_use]
+    pub fn broken(&self, headers: &reqwest::header::HeaderMap) -> Vec<Invariant> {
+        let mut out = Vec::new();
+        if let Some(rule) = &self.location {
+            let got = headers
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok());
+            let (ok, how) = match rule {
+                Location::Exact(want) => (got == Some(want.as_str()), "exact"),
+                Location::Prefix(want) => (got.is_some_and(|g| prefix_matches(want, g)), "prefix"),
+            };
+            if !ok {
+                out.push(Invariant::broke("location", "location", how));
+            }
+        }
+        for (name, prefix) in &self.headers {
+            let present = headers
+                .get_all(name.as_str())
+                .iter()
+                .any(|v| v.to_str().is_ok_and(|v| v.starts_with(prefix.as_str())));
+            if !present {
+                let how = if prefix.is_empty() {
+                    "present"
+                } else {
+                    "prefix"
+                };
+                out.push(Invariant::broke("header", name, how));
+            }
+        }
+        out
+    }
 }
 
 /// A target: a URL, a host and port, or (for `hwmon`) a sensor on this host.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum Target {
+    /// `{"set": "sdk"}`: an example set named in the policy (`examples` checks).
+    Set {
+        /// The `[examples.<key>]` key.
+        set: String,
+    },
     /// `{"sensor": "asusec/Chipset"}`.
     Sensor {
         /// `chip/label` or `chip/kind/label`.
@@ -306,6 +401,66 @@ pub enum ErrorClass {
     /// A transport answered, but not in the shape the check expects: a GraphQL `errors`,
     /// an `error` frame, too few events or tools, an answer past its size bound.
     Answer,
+    /// One or more examples of the set failed, or its run did not finish (the invariants
+    /// say which).
+    Examples,
+}
+
+/// One named thing a check judged: an example (`language/example`) or a run-level
+/// condition (`run/stale`, `run/timeout`, ...). Never a body, a path or a message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Invariant {
+    /// The slug.
+    pub name: String,
+    /// How it came out.
+    pub status: InvariantStatus,
+    /// What it judged (an assertion's header), when it names one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// How it was judged (`exact`, `prefix`, `present`), never the wanted value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected: Option<String>,
+}
+
+/// An [`Invariant`]'s outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvariantStatus {
+    /// Held.
+    Ok,
+    /// Broke.
+    Failed,
+    /// Did not run.
+    Skipped,
+}
+
+impl Invariant {
+    /// An invariant with `status`.
+    #[must_use]
+    pub fn new(name: String, status: InvariantStatus) -> Self {
+        Self {
+            name,
+            status,
+            path: None,
+            expected: None,
+        }
+    }
+
+    /// A broken assertion on `path`, judged by `expected`.
+    #[must_use]
+    pub fn broke(name: &str, path: &str, expected: &str) -> Self {
+        Self {
+            path: Some(path.to_owned()),
+            expected: Some(expected.to_owned()),
+            ..Self::failed(name.to_owned())
+        }
+    }
+
+    /// A broken invariant.
+    #[must_use]
+    pub fn failed(name: String) -> Self {
+        Self::new(name, InvariantStatus::Failed)
+    }
 }
 
 /// A check's result `detail`: timings, a status code, a class of error. Never a body.
@@ -327,6 +482,9 @@ pub struct CheckDetail {
     /// `hwmon`: the reading, its peak since the previous run, its rate and its level.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reading: Option<crate::host::check::Reading>,
+    /// `examples`: the examples of the set, failures first, then run-level conditions.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub invariants: Vec<Invariant>,
 }
 
 impl CheckDetail {
@@ -373,6 +531,17 @@ impl CheckSpec {
     /// A description of what is missing or wrong.
     pub fn endpoint(&self) -> Result<Endpoint, String> {
         match (&self.target, self.surface) {
+            (Target::Set { set }, Surface::Examples) => Ok(Endpoint {
+                host: format!("examples:{set}"),
+                port: 0,
+                tls: false,
+                url: None,
+            }),
+            (Target::Set { .. }, s) => Err(format!(
+                "a set target is for examples checks, not {}",
+                s.as_str()
+            )),
+            (_, Surface::Examples) => Err("an examples check names a set target".into()),
             (Target::Sensor { sensor }, Surface::Hwmon) => Ok(Endpoint {
                 host: format!("sensor:{sensor}"),
                 port: 0,
@@ -451,8 +620,8 @@ pub async fn run(tls: &TlsContext, p: Prepared<'_>) -> Result<CheckDetail, Strin
         Surface::Mqtt => mqtt::check(tls, &p).await,
         Surface::Mcp => mcp::check(tls, &p).await?,
         Surface::Graphql => graphql::check(tls, &p).await,
-        Surface::Hwmon => {
-            return Err("an hwmon check reads the host sampler, not the network".into());
+        Surface::Hwmon | Surface::Examples => {
+            return Err("a host check reads this machine, not the network".into());
         }
     };
     Ok(detail.apply_max_ms(&p.spec.expect))
@@ -474,6 +643,7 @@ fn judged(started: Instant, status: Option<u16>, outcome: Result<(), ErrorClass>
         error_class: outcome.err(),
         tls_expires_at: None,
         reading: None,
+        invariants: Vec::new(),
     }
 }
 
@@ -506,6 +676,40 @@ mod tests {
 
     fn spec(v: serde_json::Value) -> CheckSpec {
         serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn a_location_prefix_is_matched_on_the_parsed_host_not_the_text() {
+        let want = "https://auth.example.com/";
+        for ok in [
+            "https://auth.example.com/",
+            "https://auth.example.com/login?next=%2Froom",
+            "https://AUTH.example.com:443/x",
+            // A browser reads `\` as `/`, so the host here is auth.example.com.
+            "https://auth.example.com\\@evil.net/",
+        ] {
+            assert!(prefix_matches(want, ok), "{ok}");
+        }
+        for bad in [
+            "https://auth.example.com.evil.net/",
+            "https://auth.example.com@evil.net/",
+            "https://auth.example.com:8443@evil.net/",
+            "https://user@auth.example.com/",
+            "http://auth.example.com/",
+            "https://auth.example.com:8443/",
+            "//auth.example.com/",
+            "/login",
+        ] {
+            assert!(!prefix_matches(want, bad), "{bad}");
+        }
+        assert!(prefix_matches(
+            "https://auth.example.com/login?next=",
+            "https://auth.example.com/login?next=%2Froom"
+        ));
+        assert!(!prefix_matches(
+            "https://auth.example.com/login",
+            "https://auth.example.com/other"
+        ));
     }
 
     #[test]
@@ -542,6 +746,7 @@ mod tests {
                         | Surface::Mcp
                         | Surface::Graphql
                         | Surface::Hwmon
+                        | Surface::Examples
                 )
             );
         }

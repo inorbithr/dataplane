@@ -40,6 +40,7 @@ pub(super) async fn check(tls: &TlsContext, p: &Prepared<'_>) -> CheckDetail {
         error_class: None,
         tls_expires_at: expires,
         reading: None,
+        invariants: Vec::new(),
     };
     let is_stream = resp
         .headers()

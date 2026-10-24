@@ -64,6 +64,15 @@ proptest.workspace = true
 tempfile.workspace = true
 wiremock.workspace = true
 
+[features]
+# Builds `infra_conn::FedApprovals`, the approval double the integration tests feed.
+# Never on in a release: an agent built with it could be fed approvals in process.
+test-approvals = []
+
+[[test]]
+name = "infra_connections"
+required-features = ["test-approvals"]
+
 [lints]
 workspace = true
 

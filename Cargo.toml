@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/iohr-agent", "crates/iohr-capture", "crates/iohr-capture-common", "crates/iohr-evidence"]
+members = ["crates/iohr-agent", "crates/iohr-capture", "crates/iohr-capture-common", "crates/iohr-evidence", "crates/iohr-ext-host"]
 # The eBPF programs build for the BPF target with a pinned nightly, through
 # crates/iohr-capture/build.rs (aya-build); never with the workspace's stable toolchain.
 exclude = ["crates/iohr-capture-ebpf"]
@@ -29,6 +29,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 clap = { version = "4.6", features = ["derive", "env", "wrap_help"] }
 ed25519-dalek = { version = "3", features = ["pkcs8", "pem"] }
 iohr-evidence = { path = "crates/iohr-evidence" }
+iohr-ext-host = { path = "crates/iohr-ext-host" }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 getrandom = "0.4"
 h2 = "0.4"
@@ -62,6 +63,12 @@ tracing-opentelemetry = "0.34"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "json", "std", "ansi"] }
 url = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["v7", "serde"] }
+# iohr-ext-host only (RFC on PRD 0152, WASM extensions): the same wasmtime core's gate
+# evaluator pins (core crates/gate-eval), with the component model and WASI 0.2 added.
+# Cranelift and the runtime only: no cache, no profiling, no parallel compilation.
+wasmtime = { version = "49.0.4", default-features = false, features = ["cranelift", "runtime", "std", "component-model"] }
+wasmtime-wasi = { version = "49.0.4", default-features = false, features = ["p2"] }
+wat = "1.262"
 zeroize = "1"
 
 axum = { version = "0.8", features = ["ws"] }

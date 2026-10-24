@@ -1135,6 +1135,10 @@ pub struct Signal {
     pub series: usize,
     /// When it ran, RFC 3339.
     pub at: String,
+    /// The host the reading is about (the agent's id), on the agent's own probes
+    /// (`[sensors]`); absent on `[[actions.sensors]]` readings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
 }
 
 /// The `detail` of an action's result: a status and a class, never a body.

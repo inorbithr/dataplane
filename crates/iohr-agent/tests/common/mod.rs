@@ -241,8 +241,8 @@ pub async fn session(f: Arc<Fake>, socket: WebSocket) {
     let hello: Value = serde_json::from_str(hello.as_str()).unwrap();
     assert_eq!(hello["type"], "hello");
     let _ = f.frames.send((n, hello));
-    let welcome =
-        json!({"type": "welcome", "agent_id": AGENT_ID, "heartbeat_secs": 1, "server_time": "now"});
+    let welcome = json!({"type": "welcome", "agent_id": AGENT_ID, "heartbeat_secs": 1, "server_time": "now",
+               "accepts": ["hello", "heartbeat", "result", "signal"]});
     tx.send(Message::Text(welcome.to_string().into()))
         .await
         .unwrap();

@@ -15,13 +15,16 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use url::Url;
 
-use crate::checks::{AuthSpec, CheckSpec, Expect, Params, Surface, Target, bounds};
+use crate::checks::{
+    Assert, AuthSpec, CheckSpec, Expect, Location, Params, Surface, Target, bounds,
+};
 use crate::error::{Error, Result};
 use crate::policy::{NameRule, Policy, normalize_host};
 
 /// Bounds a checks file must respect (the platform enforces the same).
 pub mod limits {
-    /// Most entries, `[[check]]` and `[[refuse]]` together.
+    /// Most entries, `[[check]]` and `[[refuse]]` together. The platform holds the same
+    /// number (core `crates/agents/src/reconcile.rs` `MAX_CHECKS`); a test pins this one.
     pub const MAX_CHECKS: usize = 50;
     /// Longest name.
     pub const MAX_NAME: usize = 64;
@@ -43,6 +46,8 @@ pub mod limits {
     pub const MAX_CANONICAL_BYTES: usize = 48 * 1024;
     /// Most tags on one check (the platform's limit).
     pub const MAX_TAGS: usize = 10;
+    /// Most headers one check asserts.
+    pub const MAX_ASSERT_HEADERS: usize = 8;
     /// Longest GraphQL query, RPC method, MQTT topic or MCP tool name.
     pub const MAX_QUERY: usize = 8 * 1024;
     /// Longest method, topic or tool name.
@@ -128,6 +133,9 @@ pub struct DeclaredCheck {
     /// What the console calls it when its target is not shared (`[share]` in the
     /// policy); defaults to the name.
     pub label: Option<String>,
+    /// Page the account's owners and admins when it goes down or recovers (RFC 0051);
+    /// default off.
+    pub notify: bool,
 }
 
 impl DeclaredCheck {
@@ -151,6 +159,7 @@ impl DeclaredCheck {
             "target",
             match &self.spec.target {
                 Target::Sensor { sensor } => json!({"sensor": sensor}),
+                Target::Set { set } => json!({"set": set}),
                 Target::Url { url } => json!({"url": url.as_str()}),
                 Target::HostPort { host, port, tls } => match tls {
                     Some(t) => json!({"host": host, "port": port, "tls": t}),
@@ -169,6 +178,27 @@ impl DeclaredCheck {
         }
         if let Some(d) = self.valid_for_days {
             expect.insert("valid_for_days".into(), json!(d));
+        }
+        // Only that a redirect and which headers are asserted; the values stay here.
+        match &self.spec.params.assert.location {
+            Some(Location::Exact(_)) => {
+                expect.insert("location".into(), json!("exact"));
+            }
+            Some(Location::Prefix(_)) => {
+                expect.insert("location".into(), json!("prefix"));
+            }
+            None => {}
+        }
+        if !self.spec.params.assert.headers.is_empty() {
+            let names: Vec<&str> = self
+                .spec
+                .params
+                .assert
+                .headers
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect();
+            expect.insert("headers".into(), json!(names));
         }
         if !expect.is_empty() {
             m.insert("expect", Value::Object(expect));
@@ -190,6 +220,9 @@ impl DeclaredCheck {
         }
         if let Some(l) = &self.label {
             m.insert("label", json!(l));
+        }
+        if self.notify {
+            m.insert("notify", json!(true));
         }
         if let Some(h) = &self.spec.params.hwmon {
             let mut t = serde_json::Map::new();
@@ -361,6 +394,8 @@ struct FileEntry {
     tags: BTreeMap<String, String>,
     #[serde(default)]
     label: Option<String>,
+    #[serde(default)]
+    notify: Option<bool>,
     // The transport surfaces' requests (RFC 0040.2); each is for the surfaces named.
     /// http: the method; ws, grpc: the RPC's full name.
     #[serde(default)]
@@ -429,9 +464,16 @@ struct FileEntry {
 #[serde(untagged)]
 enum FileTarget {
     Text(String),
+    Set(SetTarget),
     Sensor(SensorTarget),
     Url(UrlTarget),
     HostPort(HostPortTarget),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetTarget {
+    set: String,
 }
 
 #[derive(Deserialize)]
@@ -464,11 +506,25 @@ struct FileExpect {
     max_ms: Option<u64>,
     #[serde(default)]
     valid_for_days: Option<u16>,
+    /// http: the 3xx's `Location`, whole.
+    #[serde(default)]
+    location: Option<String>,
+    /// http: the 3xx's `Location`, its start.
+    #[serde(default)]
+    location_prefix: Option<String>,
+    /// http: required answer headers, each with the start of its value ("" for any).
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
 }
 
 impl FileExpect {
     fn is_empty(&self) -> bool {
-        self.status.is_none() && self.max_ms.is_none() && self.valid_for_days.is_none()
+        self.status.is_none()
+            && self.max_ms.is_none()
+            && self.valid_for_days.is_none()
+            && self.location.is_none()
+            && self.location_prefix.is_none()
+            && self.headers.is_empty()
     }
 }
 
@@ -552,7 +608,7 @@ fn entry(kind: Kind, table: toml::Table) -> std::result::Result<DeclaredCheck, S
         Some(r) => {
             check_reference(&r)?;
             if !surface.takes_auth() {
-                return Err("auth is not used by tcp, tls and hwmon checks".into());
+                return Err("auth is not used by tcp, tls, hwmon and examples checks".into());
             }
             Some(AuthSpec {
                 header: None,
@@ -571,6 +627,7 @@ fn entry(kind: Kind, table: toml::Table) -> std::result::Result<DeclaredCheck, S
     }
     check_tags(&e.tags)?;
     let mut params = params(surface, &input)?;
+    params.assert = assertions(&x)?;
     params.hwmon = hwmon_params(surface, &target, hwmon_input)?;
     let target = match (&target, &params.hwmon) {
         (Target::Sensor { .. }, Some(h)) => Target::Sensor {
@@ -604,6 +661,7 @@ fn entry(kind: Kind, table: toml::Table) -> std::result::Result<DeclaredCheck, S
         category: e.category,
         tags: e.tags,
         label: e.label,
+        notify: e.notify.unwrap_or(false),
     })
 }
 
@@ -805,6 +863,7 @@ fn params(surface: Surface, i: &ParamsInput) -> std::result::Result<Params, Stri
         expect_error: i.expect_error.clone(),
         expect_code: i.expect_code,
         hwmon: None,
+        assert: Assert::default(),
     })
 }
 
@@ -863,7 +922,94 @@ fn check_expect(x: &FileExpect, surface: Surface) -> std::result::Result<(), Str
     if x.status.is_some() && !surface.has_status() {
         return Err("expect.status is for http, sse, mcp and graphql checks".into());
     }
+    let asserts = x.location.is_some() || x.location_prefix.is_some() || !x.headers.is_empty();
+    if asserts && surface != Surface::Http {
+        return Err("expect.location, location_prefix and headers are for http checks".into());
+    }
+    if (x.location.is_some() || x.location_prefix.is_some())
+        && !x.status.is_some_and(|s| (300..=399).contains(&s))
+    {
+        return Err(
+            "expect.location needs expect.status 300 to 399 (a redirect is not followed)".into(),
+        );
+    }
     Ok(())
+}
+
+/// The `expect.location`, `location_prefix` and `headers` rules of an http check.
+fn assertions(x: &FileExpect) -> std::result::Result<Assert, String> {
+    let location = match (&x.location, &x.location_prefix) {
+        (Some(_), Some(_)) => {
+            return Err("expect names either location or location_prefix, not both".into());
+        }
+        (Some(u), None) => Some(Location::Exact(check_location(u, "location")?)),
+        (None, Some(u)) => Some(Location::Prefix(check_location(u, "location_prefix")?)),
+        (None, None) => None,
+    };
+    if x.headers.len() > limits::MAX_ASSERT_HEADERS {
+        return Err(format!(
+            "expect.headers names at most {} headers",
+            limits::MAX_ASSERT_HEADERS
+        ));
+    }
+    let mut headers: BTreeMap<String, String> = BTreeMap::new();
+    for (name, value) in &x.headers {
+        if !(1..=64).contains(&name.len())
+            || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err(format!(
+                "expect.headers: {name:?} is not a header name (letters, digits and \"-\", at most 64)"
+            ));
+        }
+        if value.len() > limits::MAX_NAME_FIELD || value.chars().any(char::is_control) {
+            return Err(format!(
+                "expect.headers.{name}: at most {} printable characters",
+                limits::MAX_NAME_FIELD
+            ));
+        }
+        if headers
+            .insert(name.to_ascii_lowercase(), value.clone())
+            .is_some()
+        {
+            return Err(format!("expect.headers names {name} twice"));
+        }
+    }
+    Ok(Assert {
+        location,
+        headers: headers.into_iter().collect(),
+    })
+}
+
+/// A redirect target the check compares against: an absolute http or https address.
+fn check_location(u: &str, field: &str) -> std::result::Result<String, String> {
+    check_location_url(u, field)?;
+    if field == "location_prefix" {
+        // A prefix must end at the authority: a path after the host, so that
+        // `https://auth.example.com` cannot also mean `https://auth.example.com.evil.net/`.
+        let rest = u.split_once("://").map_or("", |(_, r)| r);
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        if !rest[authority.len()..].starts_with('/') || authority.contains('@') {
+            return Err(format!(
+                "expect.{field} must name the host and a path (end the host with /) and carry no user info"
+            ));
+        }
+    }
+    Ok(u.to_owned())
+}
+
+fn check_location_url(u: &str, field: &str) -> std::result::Result<String, String> {
+    if u.len() > limits::MAX_URL || u.chars().any(char::is_control) {
+        return Err(format!(
+            "expect.{field} must be at most {} printable characters",
+            limits::MAX_URL
+        ));
+    }
+    match Url::parse(u) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") && url.has_host() => Ok(u.to_owned()),
+        _ => Err(format!(
+            "expect.{field} must be an absolute http or https address"
+        )),
+    }
 }
 
 type HwmonInput = (
@@ -960,6 +1106,18 @@ fn target(
     surface: Option<Surface>,
 ) -> std::result::Result<(Target, Surface), String> {
     match t {
+        FileTarget::Set(SetTarget { set }) => {
+            if !crate::examples::is_slug(&set) {
+                return Err("an examples set is a short name: letters, digits, - _ .".into());
+            }
+            Ok((Target::Set { set }, Surface::Examples))
+        }
+        FileTarget::Text(s) if surface == Some(Surface::Examples) => {
+            if !crate::examples::is_slug(&s) {
+                return Err("an examples check names a set: target = { set = \"sdk\" }".into());
+            }
+            Ok((Target::Set { set: s }, Surface::Examples))
+        }
         FileTarget::Sensor(SensorTarget { sensor }) => {
             Ok((Target::Sensor { sensor }, Surface::Hwmon))
         }
@@ -1260,7 +1418,10 @@ enum Refusal {
 /// What the agent's admission path would say before any DNS query.
 fn policy_refusal(c: &DeclaredCheck, policy: &Policy) -> Refusal {
     if !policy.surface_allowed(c.spec.surface) {
-        return Refusal::Refused(if c.spec.surface.is_host() {
+        return Refusal::Refused(if c.spec.surface == Surface::Examples {
+            "the examples surface is not enabled ([work] checks, surfaces, and an [examples.<key>] set)"
+                .into()
+        } else if c.spec.surface.is_host() {
             format!(
                 "the {} surface is not enabled ([work] host = true and surfaces)",
                 c.spec.surface.as_str()
@@ -1273,7 +1434,13 @@ fn policy_refusal(c: &DeclaredCheck, policy: &Policy) -> Refusal {
         });
     }
     if c.spec.surface.is_host() {
-        // Reads this host; no target to admit.
+        // Reads this host; no target to admit. An examples check also names a set the
+        // policy has.
+        if let Target::Set { set } = &c.spec.target
+            && policy.examples_set(set).is_none()
+        {
+            return Refusal::Refused(format!("the policy has no [examples.{set}] set"));
+        }
         return Refusal::Allowed;
     }
     if let Some(r) = c.auth()
@@ -1896,5 +2063,140 @@ every = "60s"
         );
         assert!(matches!(v[0].1, Verdict::Warning(_)), "{:?}", v[0]);
         assert!(matches!(v[1].1, Verdict::Warning(_)), "{:?}", v[1]);
+    }
+
+    /// A security check: the redirect goes to the sign-in, and the answer carries the
+    /// headers that keep a browser safe (RFC 0040.2).
+    const SSO_GUARD: &str = "[[refuse]]\nname = \"sso\"\ncategory = \"security\"\ntarget = \"https://a.example.com/room/\"\nevery = \"5m\"\nnotify = true\nexpect = { status = 302, location_prefix = \"https://auth.example.com/\", headers = { Strict-Transport-Security = \"max-age=\", X-Content-Type-Options = \"nosniff\", Content-Security-Policy = \"\" } }\n";
+
+    #[test]
+    fn notify_and_the_redirect_and_header_assertions_reach_the_wire_as_flags_only() {
+        let c = one(SSO_GUARD).unwrap();
+        assert!(c.notify);
+        assert_eq!(c.refuse_by, Some(RefuseBy::Answer));
+        let wire = c.to_wire();
+        assert_eq!(wire["notify"], true);
+        // The platform learns that a redirect and three headers are asserted, never the
+        // address or the values: those stay in the file, like a request does.
+        assert_eq!(wire["expect"]["location"], "prefix");
+        assert_eq!(
+            wire["expect"]["headers"],
+            json!([
+                "content-security-policy",
+                "strict-transport-security",
+                "x-content-type-options"
+            ])
+        );
+        let text = wire.to_string();
+        assert!(
+            !text.contains("auth.example.com") && !text.contains("max-age"),
+            "{text}"
+        );
+        // A check that asks for none of it keeps its wire form, hence its hash.
+        let plain =
+            one("[[check]]\nname = \"a\"\ntarget = \"https://a.example.com/\"\nevery = \"1m\"\n")
+                .unwrap();
+        assert!(!plain.notify);
+        let wire = plain.to_wire();
+        assert!(wire.get("notify").is_none() && wire.get("expect").is_none());
+    }
+
+    #[test]
+    fn the_entry_limit_is_the_platforms() {
+        // core crates/agents/src/reconcile.rs MAX_CHECKS = 50: change both or neither.
+        assert_eq!(limits::MAX_CHECKS, 50);
+    }
+
+    #[test]
+    fn a_location_prefix_must_end_the_host_and_carry_no_user_info() {
+        let file = |prefix: &str| {
+            one(&format!(
+                "[[refuse]]\nname = \"t\"\ntarget = \"https://a.example.com/room/\"\nevery = \"5m\"\nexpect = {{ status = 302, location_prefix = \"{prefix}\" }}\n"
+            ))
+        };
+        for bad in [
+            "https://auth.example.com",
+            "https://auth.example.com?x=",
+            "https://auth.example.com@evil.net/",
+            "https://user@auth.example.com/",
+        ] {
+            let e = file(bad).unwrap_err().clone();
+            assert!(e.contains("location_prefix"), "{bad}: {e}");
+        }
+        assert!(file("https://auth.example.com/").is_ok());
+        assert!(file("https://auth.example.com:8443/login").is_ok());
+    }
+
+    #[test]
+    fn location_and_header_rules_are_for_http_and_bounded() {
+        let entry = |surface: &str, expect: &str| {
+            format!(
+                "[[check]]\nname = \"t\"\nsurface = \"{surface}\"\ntarget = \"https://a.example.com/\"\nevery = \"5m\"\nexpect = {{ {expect} }}\n"
+            )
+        };
+        let ok = one(&entry(
+            "http",
+            "status = 301, location = \"https://b.example.com/x\"",
+        ))
+        .unwrap();
+        assert_eq!(ok.to_wire()["expect"]["location"], "exact");
+        let rules = &ok.spec.params.assert;
+        assert!(
+            matches!(&rules.location, Some(Location::Exact(u)) if u == "https://b.example.com/x")
+        );
+        for (surface, expect, why) in [
+            (
+                "sse",
+                "location = \"https://b.example.com/\"",
+                "location is for http",
+            ),
+            (
+                "graphql",
+                "headers = { x-frame-options = \"\" }",
+                "headers are for http",
+            ),
+            (
+                "http",
+                "location = \"https://b.example.com/\", location_prefix = \"https://b.example.com/\"",
+                "exact and prefix together",
+            ),
+            (
+                "http",
+                "location = \"/relative\"",
+                "not an absolute address",
+            ),
+            (
+                "http",
+                "location = \"ftp://b.example.com/\"",
+                "not http or https",
+            ),
+            (
+                "http",
+                "status = 200, location = \"https://b.example.com/\"",
+                "a location needs a 3xx",
+            ),
+            (
+                "http",
+                "headers = { \"bad name\" = \"\" }",
+                "not a header name",
+            ),
+            (
+                "http",
+                "headers = { x-a = \"line\\nbreak\" }",
+                "control character",
+            ),
+            (
+                "http",
+                "headers = { a1 = \"\", a2 = \"\", a3 = \"\", a4 = \"\", a5 = \"\", a6 = \"\", a7 = \"\", a8 = \"\", a9 = \"\" }",
+                "more than eight",
+            ),
+            (
+                "http",
+                "headers = { X-A = \"\", x-a = \"\" }",
+                "the same header twice",
+            ),
+        ] {
+            assert!(one(&entry(surface, expect)).is_err(), "{why}");
+        }
     }
 }
