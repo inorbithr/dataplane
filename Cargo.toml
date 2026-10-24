@@ -51,6 +51,7 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # atlas observe only: Kubernetes manifests, kubeconfigs and Envoy config are YAML.
+psl = "2"
 serde_yaml_ng = "0.10"
 sha2 = "0.11"
 thiserror = "2"

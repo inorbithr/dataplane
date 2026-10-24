@@ -242,3 +242,81 @@ read in its HTML; such a site needs a prerendered build or its provider's API.
 
 Tests: `tests/docs_site.rs` with Docusaurus-, MkDocs- and Sphinx-shaped pages in
 `tests/fixtures/site/`.
+
+## Whole-site crawl (`atlas crawl`)
+
+`atlas crawl` (RFC 0163) reads a public site end to end with the same reader: the same
+robots.txt and sitemap handling, the same HTML tokenizer. It answers "what is this
+company's public surface": pages, hosts, outgoing links by kind, and public listings.
+
+```sh
+iohr-agent atlas crawl https://acme.example --policy policy.toml --out acme.json \
+  --state acme-state.json
+```
+
+**Public pages only, no credential, on the agent only.** InOrbit never runs it from its
+cloud. Page text stays in memory. The output is derived only: URLs, statuses, titles,
+sizes, hosts, link classes and listing counts.
+
+**Scope.** The start URL's registrable domain by the Public Suffix List (`www.acme.co.uk`
+gives `acme.co.uk`), and every subdomain of it that a link, a sitemap or a redirect
+reaches. No DNS or certificate-transparency guessing. URLs outside the scope are recorded
+as outgoing links and never fetched. The policy still decides every host: name the
+domain under `[domains] bound` (or `[networks] allow`), plus the listing hosts below you
+want read.
+
+**Order.** Breadth first from the start URL. Each host's robots.txt comes first
+(`iohr-agent` group, else `*`), then its sitemaps, then pages. Redirects are followed in
+scope only, at most 10 hops. A redirect out of scope is recorded as an outgoing link.
+Media links (images, video, audio, fonts, archives) are counted and never fetched. A link
+marked `rel="nofollow"` is recorded and not followed. Query strings used for tracking (`utm_*`, `gclid`,
+`fbclid`) and fragments are dropped before a URL is compared.
+
+**Politeness.** At most one request a second and one connection per host. A longer
+`Crawl-delay` wins. A 429 or 503 backs off and retries.
+
+**Render fallback.** A page whose static HTML has no readable text (under 40
+non-space characters) and no links is loaded once in a local Chrome or Chromium
+(`--headless --dump-dom`), and the printed DOM is read instead. No browser library is
+linked: the browser on the machine runs as a process (`--browser <path>`, else the first
+Chrome or Chromium found, `--render off` to disable). The trade-off: the browser fetches
+the page's own scripts and styles outside the crawler's pacing. Its name resolution is
+pinned to the address the policy admitted for that host, and every other name fails, so
+a page whose scripts come from a CDN stays empty.
+
+**Budgets.**
+
+| Flag | Default | Hard cap |
+|---|---|---|
+| `--max-pages` | 2,000 | 20,000 |
+| `--max-hosts` | 50 | |
+| `--max-minutes` | 30 | 240 |
+| `--max-mb` | 200 MB | |
+| `--max-page-mb` | 5 MB | |
+
+A budget stop marks the result `complete: false` and names the budget in `stopped_by`
+(exit 1). `used` reports what was spent. With `--state`, the crawl writes its frontier
+every 25 pages and at the end. A later run with the same file and start URL continues
+where it stopped. A state file of another start URL is refused.
+
+**Outgoing links** are classified as `app_store`, `code_host`, `registry`, `api_docs`,
+`sign_up` or `other`.
+
+**Listings** are read from public, anonymous endpoints, each bounded:
+
+| Link | Read | Fields |
+|---|---|---|
+| Google Play, App Store page | the page (robots.txt applies) | title, name, category, developer, updated |
+| `github.com/<org>` | `api.github.com/orgs/<org>/repos` (anonymous, else `users/<org>/repos`) | repository count, names |
+| npm, PyPI, crates.io package | the registry's JSON API | name, latest version |
+| an OpenAPI or Swagger document | the document (JSON or YAML) | format, title, version, servers, operations (channels for AsyncAPI) |
+
+Many links to one account or app are one listing, keyed by the URL it is read from. At
+most 100 are read per run, the site's own first (links that name the domain's first
+label), so GitHub's anonymous limit of 60 requests an hour goes to the site's account
+before third-party ones a blog post links to.
+
+Tests: `tests/crawl.rs`, with two hosts of one domain played by wiremock: links, a
+subdomain, redirects in and out of scope, a robots.txt disallow, a sitemap, an OpenAPI
+document, a JavaScript-only page rendered by a stand-in browser, a budget stop and a
+resumed run.

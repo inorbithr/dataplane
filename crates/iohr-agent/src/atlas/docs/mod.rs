@@ -19,6 +19,7 @@
 pub mod adf;
 pub mod config;
 pub mod confluence;
+pub mod crawl;
 pub mod html;
 pub mod http;
 pub mod markdown;

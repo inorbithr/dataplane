@@ -88,6 +88,11 @@
         },
         {
           "type": "toml",
+          "path": "Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value==='iohr-ext-host')].version"
+        },
+        {
+          "type": "toml",
           "path": "crates/iohr-capture-ebpf/Cargo.lock",
           "jsonpath": "$.package[?(@.name.value==='iohr-capture-common')].version"
         },
