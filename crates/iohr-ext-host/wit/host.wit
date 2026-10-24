@@ -1,0 +1,66 @@
+/// The host world an InOrbit agent extension runs in (RFC: WASI 0.2 component
+/// extensions). An extension is a WASI 0.2 component that exports `init` and `tick`
+/// and imports only the interfaces its manifest declares and the machine's policy
+/// grants. Plain WASI is linked deny-all: no files, no environment, no sockets.
+package iohr:ext@0.1.0;
+
+/// Lines into the agent's log, tagged with the extension id.
+interface log {
+  enum level { trace, debug, info, warn, error }
+
+  /// Writes one line. Longer than 1 KiB is cut; control characters are dropped.
+  write: func(level: level, message: string);
+}
+
+/// The extension's settings: the manifest's `[config]`, overridden by the policy.
+interface config {
+  get: func(key: string) -> option<string>;
+  keys: func() -> list<string>;
+}
+
+/// Time, and how often the agent calls `tick`.
+interface timer {
+  /// Milliseconds since the Unix epoch.
+  now-ms: func() -> u64;
+  /// Asks for `tick` every `ms`; the host clamps it to its bounds and returns the
+  /// interval it will use.
+  set-interval: func(ms: u32) -> u32;
+}
+
+/// The agent's sensor readings (its probes and checks), read-only.
+interface sensor {
+  record reading {
+    name: string,
+    value: f64,
+    unit: string,
+    /// When it was read, milliseconds since the Unix epoch.
+    at-ms: u64,
+  }
+
+  read: func(name: string) -> option<reading>;
+  %list: func() -> list<string>;
+}
+
+/// Events into the agent's trail. Each tick has a budget; `emit` returns false once
+/// it is spent or when the event is over the size bounds.
+interface trail {
+  record event {
+    name: string,
+    attrs: list<tuple<string, string>>,
+  }
+
+  emit: func(event: event) -> bool;
+}
+
+world extension {
+  import log;
+  import config;
+  import timer;
+  import sensor;
+  import trail;
+
+  /// Called once after instantiation; an error refuses the start.
+  export init: func() -> result<_, string>;
+  /// Called every interval.
+  export tick: func() -> result<_, string>;
+}
