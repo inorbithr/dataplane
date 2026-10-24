@@ -1,5 +1,6 @@
 //! The command line: `init`, `enroll`, `run`, `status`, `policy check`, `checks lint`,
 //! `config validate|show|schema`, `capture status`, `atlas observe`, `atlas docs sync|sources`,
+//! `atlas crawl`,
 //! `page`, `ledger verify|export`. As an iohr
 //! extension the same commands are `iohr agent …`.
 
@@ -221,6 +222,57 @@ pub enum AtlasCommand {
     /// Documentation sources (`[[docs.sources]]` in agent.toml): Notion first.
     #[command(subcommand)]
     Docs(AtlasDocsCommand),
+    /// Crawl a public site and its subdomains (RFC 0163): pages, hosts, outgoing links by
+    /// class and public listings, as one JSON document. Obeys robots.txt, one request a
+    /// second per host, within budgets; every host must pass the policy. Page text stays
+    /// in memory; nothing is sent anywhere.
+    Crawl(Box<AtlasCrawlArgs>),
+}
+
+/// Whether `atlas crawl` tries pages without text or links in a headless browser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum RenderMode {
+    /// When Chrome or Chromium is installed (or `--browser` names one).
+    Auto,
+    /// Never.
+    Off,
+}
+
+/// `atlas crawl`.
+#[derive(Debug, Args)]
+pub struct AtlasCrawlArgs {
+    /// Where to start; its registrable domain (Public Suffix List) is the scope.
+    pub url: Url,
+    /// The policy (default: the one agent.toml names).
+    #[arg(long)]
+    pub policy: Option<PathBuf>,
+    /// Where to write the result (default: standard output).
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+    /// A state file: written as the crawl goes; a later run with it continues.
+    #[arg(long)]
+    pub state: Option<PathBuf>,
+    /// Most page requests (at most 20,000).
+    #[arg(long, default_value_t = 2_000)]
+    pub max_pages: usize,
+    /// Most hosts.
+    #[arg(long, default_value_t = 50)]
+    pub max_hosts: usize,
+    /// Most minutes, summed over resumed runs (at most 240).
+    #[arg(long, default_value_t = 30)]
+    pub max_minutes: u64,
+    /// Most megabytes read.
+    #[arg(long, default_value_t = 200)]
+    pub max_mb: u64,
+    /// Largest page read, in megabytes.
+    #[arg(long, default_value_t = 5)]
+    pub max_page_mb: usize,
+    /// The headless render fallback.
+    #[arg(long, value_enum, default_value_t = RenderMode::Auto)]
+    pub render: RenderMode,
+    /// The browser for the render fallback (default: the first Chrome or Chromium found).
+    #[arg(long)]
+    pub browser: Option<PathBuf>,
 }
 
 /// `atlas docs …`.
@@ -618,6 +670,7 @@ async fn dispatch(cmd: Command, config_path: &Path) -> Result<ExitCode> {
         Command::Atlas(AtlasCommand::Docs(AtlasDocsCommand::Sync(a))) => {
             atlas_docs_sync(&a, config_path).await
         }
+        Command::Atlas(AtlasCommand::Crawl(a)) => atlas_crawl(&a, config_path).await,
         Command::Atlas(AtlasCommand::Docs(AtlasDocsCommand::Sources)) => {
             atlas_docs_sources(config_path)
         }
@@ -1021,6 +1074,79 @@ async fn atlas_docs_sync(args: &AtlasDocsSyncArgs, config_path: &Path) -> Result
         }
     }
     Ok(if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
+}
+
+async fn atlas_crawl(args: &AtlasCrawlArgs, config_path: &Path) -> Result<ExitCode> {
+    use crate::atlas::docs::crawl::{self, Budgets, CrawlConfig, Render};
+    let cfg = AgentConfig::load(config_path).ok();
+    let policy_path = match (&args.policy, &cfg) {
+        (Some(p), _) => p.clone(),
+        (None, Some(c)) => c.policy.clone(),
+        (None, None) => {
+            return Err(Error::Atlas(
+                "no agent.toml; name the policy with --policy".into(),
+            ));
+        }
+    };
+    let policy = Policy::load(&policy_path)?;
+    let tls = TlsContext::new(cfg.as_ref().and_then(|c| c.tls.ca_file.as_deref()))?;
+    let crawl_cfg = CrawlConfig {
+        start: args.url.clone(),
+        budgets: Budgets {
+            pages: args.max_pages,
+            hosts: args.max_hosts,
+            minutes: args.max_minutes,
+            bytes: args.max_mb.saturating_mul(1024 * 1024),
+            page_bytes: args.max_page_mb.saturating_mul(1024 * 1024),
+        },
+        render: match args.render {
+            RenderMode::Off => Render::Off,
+            RenderMode::Auto => Render::Auto(args.browser.clone()),
+        },
+        state: args.state.clone(),
+        per_minute: crawl::RATE_PER_MINUTE,
+    };
+    let r = crawl::crawl(&crawl_cfg, &policy, &tls)
+        .await
+        .map_err(|e| Error::Atlas(e.to_string()))?;
+    let json = serde_json::to_vec_pretty(&r).map_err(|e| Error::Atlas(e.to_string()))?;
+    if let Some(path) = &args.out {
+        std::fs::write(path, &json).map_err(|e| Error::io(path, e))?;
+    } else {
+        let mut o = std::io::stdout().lock();
+        let _ = o.write_all(&json);
+        let _ = o.write_all(b"\n");
+    }
+    let mut err = std::io::stderr().lock();
+    let u = &r.used;
+    let _ = writeln!(
+        err,
+        "atlas crawl {}: {} pages ({} HTML, {} rendered), {} hosts, {} blocked, {} outgoing links, {} listings; {} requests, {} KB, {} s; {}",
+        r.scope,
+        r.pages.len(),
+        r.html_pages(),
+        u.renders,
+        r.hosts.len(),
+        r.blocked.len(),
+        r.links.len(),
+        r.listings.len(),
+        u.requests,
+        u.bytes / 1024,
+        u.seconds,
+        if r.complete {
+            "complete".to_owned()
+        } else {
+            format!("incomplete (budget: {})", r.stopped_by.join(", "))
+        }
+    );
+    for (class, n) in r.link_counts() {
+        let _ = writeln!(err, "  {class:<10} {n}");
+    }
+    Ok(if r.complete {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)

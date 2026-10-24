@@ -187,7 +187,7 @@ pub fn valid_id(id: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-/// `https`, or `http` to a loopback address; no credentials, query or fragment.
+/// `https`, or `http` to a loopback address or a `localhost` name; no credentials, query or fragment.
 ///
 /// # Errors
 /// What is wrong with it.
@@ -203,7 +203,7 @@ pub fn check_base_url(u: &Url) -> Result<(), String> {
         "http" => match u.host() {
             Some(url::Host::Ipv4(ip)) if ip.is_loopback() => Ok(()),
             Some(url::Host::Ipv6(ip)) if ip.is_loopback() => Ok(()),
-            Some(url::Host::Domain("localhost")) => Ok(()),
+            Some(url::Host::Domain(d)) if d == "localhost" || d.ends_with(".localhost") => Ok(()),
             _ => Err("http is allowed only to a loopback address".into()),
         },
         other => Err(format!("scheme {other} is not https")),
