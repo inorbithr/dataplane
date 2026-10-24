@@ -1590,6 +1590,7 @@ dependencies = [
  "h2",
  "http",
  "iohr-evidence",
+ "iohr-redact",
  "ipnet",
  "opentelemetry",
  "opentelemetry-appender-tracing",
@@ -1678,6 +1679,13 @@ dependencies = [
  "wasmtime",
  "wasmtime-wasi",
  "wat",
+]
+
+[[package]]
+name = "iohr-redact"
+version = "0.1.0-alpha.10"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

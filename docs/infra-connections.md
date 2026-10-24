@@ -164,7 +164,7 @@ process-wide values. When the runner is built it registers:
   to files up to 64 KiB. The whole file, each line of 16 characters or more, and each such
   value after a `key:` or `key=` (a kubeconfig's token) are registered.
 
-Every redaction also hides the userinfo of a URL that carries a password:
+The rules live in the shared `iohr-redact` crate (also used by Atlas core's infra worker); the agent's `redact.rs` adds only the process-wide values. Every redaction also hides the userinfo of a URL that carries a password:
 `postgres://admin:pw@db/x` becomes `postgres://[redacted]@db/x`. A bare user
 (`ssh://git@host`) stays. A password with a raw `/`, `?` or `#` is covered: when the text
 before it reads `user:word` (not a port), the userinfo runs to the last `@` of the token. A
