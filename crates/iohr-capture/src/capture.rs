@@ -583,7 +583,11 @@ async fn relay(
         .stdout
         .take()
         .ok_or_else(|| io::Error::other("no pipe from the parser"))?;
+    // tokio 1.54 deprecates `with_interest` for `register_with_interest`, which is `unsafe`; this
+    // workspace forbids unsafe code. Each ring owns its fd, so the deprecated call is sound here.
+    #[allow(deprecated)]
     let mut ring = AsyncFd::with_interest(ring, tokio::io::Interest::READABLE)?;
+    #[allow(deprecated)]
     let mut packet_ring = match packet_ring {
         Some(r) => Some(AsyncFd::with_interest(r, tokio::io::Interest::READABLE)?),
         None => None,
