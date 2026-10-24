@@ -151,6 +151,7 @@ impl DeclaredCheck {
             "target",
             match &self.spec.target {
                 Target::Sensor { sensor } => json!({"sensor": sensor}),
+                Target::Set { set } => json!({"set": set}),
                 Target::Url { url } => json!({"url": url.as_str()}),
                 Target::HostPort { host, port, tls } => match tls {
                     Some(t) => json!({"host": host, "port": port, "tls": t}),
@@ -429,9 +430,16 @@ struct FileEntry {
 #[serde(untagged)]
 enum FileTarget {
     Text(String),
+    Set(SetTarget),
     Sensor(SensorTarget),
     Url(UrlTarget),
     HostPort(HostPortTarget),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetTarget {
+    set: String,
 }
 
 #[derive(Deserialize)]
@@ -552,7 +560,7 @@ fn entry(kind: Kind, table: toml::Table) -> std::result::Result<DeclaredCheck, S
         Some(r) => {
             check_reference(&r)?;
             if !surface.takes_auth() {
-                return Err("auth is not used by tcp, tls and hwmon checks".into());
+                return Err("auth is not used by tcp, tls, hwmon and examples checks".into());
             }
             Some(AuthSpec {
                 header: None,
@@ -960,6 +968,18 @@ fn target(
     surface: Option<Surface>,
 ) -> std::result::Result<(Target, Surface), String> {
     match t {
+        FileTarget::Set(SetTarget { set }) => {
+            if !crate::examples::is_slug(&set) {
+                return Err("an examples set is a short name: letters, digits, - _ .".into());
+            }
+            Ok((Target::Set { set }, Surface::Examples))
+        }
+        FileTarget::Text(s) if surface == Some(Surface::Examples) => {
+            if !crate::examples::is_slug(&s) {
+                return Err("an examples check names a set: target = { set = \"sdk\" }".into());
+            }
+            Ok((Target::Set { set: s }, Surface::Examples))
+        }
         FileTarget::Sensor(SensorTarget { sensor }) => {
             Ok((Target::Sensor { sensor }, Surface::Hwmon))
         }
@@ -1260,7 +1280,10 @@ enum Refusal {
 /// What the agent's admission path would say before any DNS query.
 fn policy_refusal(c: &DeclaredCheck, policy: &Policy) -> Refusal {
     if !policy.surface_allowed(c.spec.surface) {
-        return Refusal::Refused(if c.spec.surface.is_host() {
+        return Refusal::Refused(if c.spec.surface == Surface::Examples {
+            "the examples surface is not enabled ([work] checks, surfaces, and an [examples.<key>] set)"
+                .into()
+        } else if c.spec.surface.is_host() {
             format!(
                 "the {} surface is not enabled ([work] host = true and surfaces)",
                 c.spec.surface.as_str()
@@ -1273,7 +1296,13 @@ fn policy_refusal(c: &DeclaredCheck, policy: &Policy) -> Refusal {
         });
     }
     if c.spec.surface.is_host() {
-        // Reads this host; no target to admit.
+        // Reads this host; no target to admit. An examples check also names a set the
+        // policy has.
+        if let Target::Set { set } = &c.spec.target
+            && policy.examples_set(set).is_none()
+        {
+            return Refusal::Refused(format!("the policy has no [examples.{set}] set"));
+        }
         return Refusal::Allowed;
     }
     if let Some(r) = c.auth()

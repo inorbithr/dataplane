@@ -608,6 +608,7 @@ fn target_text(t: &Target) -> String {
         Target::Url { url } => url.to_string(),
         Target::HostPort { host, port, .. } => format!("{host}:{port}"),
         Target::Sensor { sensor } => format!("sensor {sensor}"),
+        Target::Set { set } => format!("examples set {set}"),
     }
 }
 

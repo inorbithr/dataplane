@@ -343,7 +343,7 @@ async fn judge(executor: &Executor, entry: &DeclaredCheck, deadline: Instant) ->
     if entry.spec.surface.is_host() {
         report.outcome = Outcome::Skipped;
         report.reason = Some(
-            "host sensor checks judge a window of readings; the running agent judges them".into(),
+            "host sensor and examples checks read the running agent's state; the running agent judges them".into(),
         );
         return report;
     }

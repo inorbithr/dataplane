@@ -208,6 +208,37 @@ A reading is a measurement of the agent's own machine, not of a target's answer:
 sensor key, the numbers and the level leave the machine; nothing else about the host does
 (the topology, mounts and boots stay in local `atlas observe host` output).
 
+## SDK examples: `examples`
+
+Reads the latest run of a named example set that this agent runs from its own checkout
+(RFC 0165). The agent runs the set on a timer in the background, because a run takes
+minutes and a job waits seconds; the check only reads the newest finished run, so it
+answers at once. It needs `examples` in `[work] surfaces` and the set in
+[`[examples.<key>]`](policy.md#examples). The set's command writes
+`examples-results.json` (schema 1, the file the SDK's `tools/run-examples.py` writes);
+the agent reads that file and nothing else.
+
+```toml
+[[check]]
+name = "sdk-examples"
+surface = "examples"
+target = { set = "sdk" }     # the key under [examples.<key>] in policy.toml
+every = "5m"
+fail_after = 1
+category = "availability"
+```
+
+The check fails with `error_class = "examples"` when any example failed. `detail.invariants`
+lists `language/example` with `status` `ok`, `failed` or `skipped`, failures first, at
+most 64. Run-level conditions are listed the same way: `run/missing` (the command wrote no
+fresh results file), `run/exit` (the command failed or timed out), `run/stale` (the newest
+run is older than `max_age_secs`), `run/empty` (no example passed). Before the first run
+has finished the check is not a pass.
+
+Only names and statuses leave the machine: not the command, its output, a note from a
+result, or a path. The set key is shown as a label (the platform never gets a hash of it),
+and a job for `examples` that does not name a declared check is refused.
+
 ## Tests that must fail: `[[refuse]]`
 
 A `[[refuse]]` entry passes when the target is refused. A guard that stops guarding then

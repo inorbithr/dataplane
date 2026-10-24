@@ -34,6 +34,8 @@ pub struct Executor {
     /// When each hwmon check last ran (sampler milliseconds): the next run judges the
     /// window since then, so a spike between runs is not missed.
     host_runs: Mutex<std::collections::HashMap<String, u64>>,
+    /// The latest finished run of each example set (`examples` checks).
+    examples: Arc<crate::examples::Store>,
     /// `[share] targets`, and the key target hashes are made with.
     share: (crate::policy::TargetShare, Vec<u8>),
     /// `inorbit/monitors` is not installed: check jobs are refused.
@@ -104,6 +106,7 @@ impl Executor {
             checks: None,
             host: None,
             host_runs: Mutex::new(std::collections::HashMap::new()),
+            examples: Arc::new(crate::examples::Store::default()),
             share: (crate::policy::TargetShare::Full, Vec::new()),
             monitors_off: false,
             slots,
@@ -247,7 +250,8 @@ impl Executor {
             .ok_or_else(|| format!("no declared check named {key:?} in checks.toml"))?;
         let same_target = match (&entry.spec.target, &spec.target) {
             (Target::Url { url: a }, Target::Url { url: b }) => a == b,
-            (Target::Sensor { sensor: a }, Target::Sensor { sensor: b }) => a == b,
+            (Target::Sensor { sensor: a }, Target::Sensor { sensor: b })
+            | (Target::Set { set: a }, Target::Set { set: b }) => a == b,
             (
                 Target::HostPort {
                     host: a, port: p, ..
@@ -267,6 +271,12 @@ impl Executor {
         spec.auth.clone_from(&entry.spec.auth);
         spec.target.clone_from(&entry.spec.target);
         Ok(())
+    }
+
+    /// The store the example sets' background loop writes ([`crate::examples::run_loop`]).
+    #[must_use]
+    pub fn examples_store(&self) -> Arc<crate::examples::Store> {
+        Arc::clone(&self.examples)
     }
 
     /// Capabilities to announce: what this version can do and the policy allows.
@@ -470,6 +480,7 @@ impl Executor {
             level: crate::actions::evaluate(value, s.warn, s.crit, s.below),
             series,
             at,
+            host: None,
         })
     }
 
@@ -722,6 +733,19 @@ impl Executor {
         }
     }
 
+    /// `examples`: the latest finished run of the named set (RFC 0165). The run itself is
+    /// the background loop's ([`crate::examples::run_loop`]).
+    fn run_examples(&self, a: &Admitted, started: Instant) -> Result<CheckDetail, String> {
+        let Target::Set { set } = &a.spec.target else {
+            return Err("an examples check names a set".into());
+        };
+        let policy = self
+            .policy
+            .examples_set(set)
+            .ok_or("the local policy has no such example set")?;
+        self.examples.judge(set, policy, started)
+    }
+
     fn run_host(&self, a: &Admitted, started: Instant) -> Result<CheckDetail, String> {
         use crate::host::check::{Level, NoReading, judge};
         let spec = a
@@ -766,6 +790,9 @@ impl Executor {
     }
 
     async fn run(&self, a: &Admitted, started: Instant) -> Result<CheckDetail, String> {
+        if a.spec.surface == checks::Surface::Examples {
+            return self.run_examples(a, started);
+        }
         if a.spec.surface.is_host() {
             return self.run_host(a, started);
         }

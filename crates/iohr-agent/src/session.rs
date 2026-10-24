@@ -74,6 +74,20 @@ fn host_summary(agent: &Agent, seq: u64) -> Option<serde_json::Value> {
     Some(crate::host::summary::summary(&root, &chips))
 }
 
+/// The host summary now, for the agent's own probes (`[sensors]`); `None` when the host
+/// is not observed.
+fn host_probe_summary(agent: &Agent) -> Option<serde_json::Value> {
+    let sampler = agent.host.as_ref()?;
+    let (root, chips) = match sampler.lock() {
+        Ok(g) => (g.root().clone(), g.chips().to_vec()),
+        Err(p) => {
+            let g = p.into_inner();
+            (g.root().clone(), g.chips().to_vec())
+        }
+    };
+    Some(crate::host::summary::summary(&root, &chips))
+}
+
 /// Exponential backoff with full jitter.
 #[derive(Debug)]
 pub struct Backoff {
@@ -302,6 +316,17 @@ async fn once(agent: &Arc<Agent>, shutdown: &mut watch::Receiver<bool>) -> Resul
     let (sig_tx, mut sig_rx) = mpsc::channel::<crate::actions::Signal>(64);
     let mut sensor_tick = tokio::time::interval(SENSOR_TICK);
     sensor_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The agent's own probes (`[sensors]`, PRD 0152): only to a platform that accepts
+    // `signal`, and only while the policy has them on. A reload opens a new session, so a
+    // changed interval or switch takes effect without a restart.
+    let probes = agent
+        .policy
+        .sensors()
+        .filter(|_| accepts.iter().any(|a| a == "signal"));
+    let mut probe_tick = tokio::time::interval(Duration::from_secs(
+        probes.as_ref().map_or(3600, |p| p.interval_secs),
+    ));
+    probe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Dropping `tasks` at any return aborts every running job: no work without a session.
     loop {
@@ -348,6 +373,17 @@ async fn once(agent: &Arc<Agent>, shutdown: &mut watch::Receiver<bool>) -> Resul
                             let _ = tx.send(sig).await;
                         }
                     });
+                }
+            }
+            _ = probe_tick.tick(), if probes.is_some() => {
+                if let Some(summary) = host_probe_summary(agent) {
+                    for sig in crate::probes::signals(
+                        &summary,
+                        &agent.enrollment.agent_id,
+                        &crate::enroll::now_rfc3339(),
+                    ) {
+                        send(agent, &mut sink, &AgentFrame::Signal(sig), "sensors.probes", None).await?;
+                    }
                 }
             }
             Some(sig) = sig_rx.recv() => {

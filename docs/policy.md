@@ -83,7 +83,7 @@ How a target is decided:
 | `checks` | `true` | Accept surface checks. |
 | `load` | `false` | Load generation. Not in this version: always refused. |
 | `faults` | `false` | Faults through the proxy. Not in this version: always refused. |
-| `surfaces` | `http`, `tcp`, `tls`, `grpc_health` | Which check surfaces are accepted. The transport surfaces `grpc`, `sse`, `ws`, `mqtt`, `mcp` and `graphql` read a bounded answer (never reported) and are accepted only when listed ([checks](checks.md#transport-surfaces)). |
+| `surfaces` | `http`, `tcp`, `tls`, `grpc_health` | Which check surfaces are accepted. The transport surfaces `grpc`, `sse`, `ws`, `mqtt`, `mcp` and `graphql` read a bounded answer (never reported) and are accepted only when listed ([checks](checks.md#transport-surfaces)). `examples` is accepted only when listed and a set exists ([`[examples]`](#examples)). |
 | `capture` | `false` | Read the capture companion's counts ([`[capture]`](#capture)) and announce `capture:*`. Needs an agent newer than 0.1.0-alpha.4. |
 | `host` | `false` | Observe this machine, read-only: `atlas observe host` and the `hwmon` check surface with its sampler ([`[host]`](#host), [host.md](host.md)). `hwmon` must also be listed in `surfaces` for checks. Needs an agent newer than 0.1.0-alpha.8. |
 
@@ -125,6 +125,52 @@ and do not start, so upgrade the agent first. A policy without them keeps its ha
 The host observers need no privilege. With `CAP_SYS_ADMIN` (and nothing else) they also
 read PCI config space past 64 bytes, which gives the per-link ASPM state; without it that
 state is reported as not observed. See [host.md](host.md#privileges).
+
+## `[sensors]`
+
+The agent's own probes as sensor readings (PRD 0152 slice 2). Off by default. It needs
+`[work] host = true` and `[share] host = true`, and a platform whose welcome accepts
+`signal` frames; an older platform simply gets none.
+
+```toml
+[sensors]
+enabled = true        # default false
+interval_secs = 60    # 15 to 3600, default 60
+```
+
+Each interval the agent sends up to four `signal` frames on its existing session (no second
+connection or token): `host.load_1m`, `host.memory_used_percent`,
+`host.disk_used_percent_max` and `host.temperature_c_max`, template `host-probe`. Each
+carries `host`, the agent's id. Only numbers leave the machine: no mount names, no sensor
+labels. A reload (the page, `POST /policy/reload`) opens a new session with the new
+settings, so there is no restart. Every frame is in the egress ledger (kind `signal`).
+
+## `[examples]`
+
+SDK example sets the agent runs on a timer, one table per set key (RFC 0165). A set is
+read by `examples` checks ([checks](checks.md#sdk-examples-examples)); the surface is
+accepted only when `examples` is in `[work] surfaces` and at least one set exists. Older
+agents ignore the table with a warning, so the check is refused there. A policy without it
+keeps its hash.
+
+```toml
+[examples.sdk]
+dir = "/srv/sdk"
+command = ["mise", "run", "examples:run"]
+every_secs = 3600
+timeout_secs = 1800
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `dir` | required | Absolute path of the checkout the command runs in. |
+| `command` | required | Program and arguments, no shell. Stdio is discarded. |
+| `results` | `examples-results.json` | Relative path under `dir` the command writes (schema 1); no `..`. It must be newer than the run's start. |
+| `every_secs` | `3600` | 60 to 86400. Seconds between runs; a set never overlaps itself. |
+| `timeout_secs` | `1800` | 10 to 7200. The run is killed past this. |
+| `max_age_secs` | `2 x every_secs + timeout_secs` | At least `every_secs`. A newest run older than this reads `run/stale`. |
+
+The set key is a lowercase slug. Nothing from the command's output leaves the machine.
 
 ## `[ceilings]`
 
