@@ -937,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn a_strict_redactor_redacts_references_and_the_look_alikes_always() {
+    fn a_strict_redactor_redacts_references_and_the_lookalike_names_always() {
         for c in [
             "password=env:hunter2",
             "token=vault:hvs.X",
