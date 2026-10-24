@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.1.0-alpha.11](https://github.com/inorbithr/dataplane/compare/v0.1.0-alpha.10...v0.1.0-alpha.11) (2026-10-24)
+
+
+### Features
+
+* **agent:** atlas crawl reads a whole public site (RFC 0163) ([#58](https://github.com/inorbithr/dataplane/issues/58)) ([91753cd](https://github.com/inorbithr/dataplane/commit/91753cd021615f37b1bb069de35c3a5c4dfeb30b))
+* **agent:** dashboard layouts kept on this machine (PRD 0024) ([#49](https://github.com/inorbithr/dataplane/issues/49)) ([0e3ecbb](https://github.com/inorbithr/dataplane/commit/0e3ecbb6512a7f31e97eb0c4dff661cbf0e5ad75))
+* **agent:** examples check surface, runs a named SDK example set and reports the latest run ([#60](https://github.com/inorbithr/dataplane/issues/60)) ([2dfae2f](https://github.com/inorbithr/dataplane/commit/2dfae2f6e57a1fa2655395a0b84c839c28330259))
+* **agent:** histogram bucket bounds and hourly --at ranges for the metrics reader ([#44](https://github.com/inorbithr/dataplane/issues/44)) ([f22b3b9](https://github.com/inorbithr/dataplane/commit/f22b3b9852c0c647d8ecdab6cc4f7c0f89afc901))
+* **agent:** infrastructure connection kinds, verb classes, plan-pinned applies ([#57](https://github.com/inorbithr/dataplane/issues/57)) ([1e2cae6](https://github.com/inorbithr/dataplane/commit/1e2cae6c08932236adbcd9850d0426aeb009e50e))
+* **agent:** Kubernetes extension, read-only first slice (RFC 0112) ([#48](https://github.com/inorbithr/dataplane/issues/48)) ([2f4c447](https://github.com/inorbithr/dataplane/commit/2f4c447f6f643671a364d61d770e0202444ddc39))
+* **agent:** notify and redirect and header assertions on declared http checks ([#68](https://github.com/inorbithr/dataplane/issues/68)) ([1216236](https://github.com/inorbithr/dataplane/commit/12162361f45ef47395a4016c13345539f9b3bbde))
+* **agent:** publish own host probes as sensor readings ([#64](https://github.com/inorbithr/dataplane/issues/64)) ([0abab8c](https://github.com/inorbithr/dataplane/commit/0abab8c4a7ae327d7539d34a0d2f6a9ec1d7eee0))
+* **agent:** rollouts and metrics as Atlas evidence, for investigations ([#43](https://github.com/inorbithr/dataplane/issues/43)) ([74bb26e](https://github.com/inorbithr/dataplane/commit/74bb26eca1dfaf6773cf9224ceb0d686d08f6010))
+* **agent:** run --once, the declared checks one time with exit codes for CI ([#46](https://github.com/inorbithr/dataplane/issues/46)) ([3e16415](https://github.com/inorbithr/dataplane/commit/3e164154b6ee5e74d0b69bb694275b47c1db8485))
+* **agent:** signed http_action jobs for grafana-self-hosted and sensors ([#52](https://github.com/inorbithr/dataplane/issues/52)) ([30a7591](https://github.com/inorbithr/dataplane/commit/30a75919628b177155f871f383845d69660f044c))
+* **agent:** the agent's inventory in the hello (RFC 0088.1) ([#47](https://github.com/inorbithr/dataplane/issues/47)) ([f706327](https://github.com/inorbithr/dataplane/commit/f706327ecaad703254468e8b8feaccabc0c315bf))
+* **agent:** the console in the agent, slice 1: a local API, trial storage and the console bundle (RFC 0100.4) ([#45](https://github.com/inorbithr/dataplane/issues/45)) ([c3b3ebd](https://github.com/inorbithr/dataplane/commit/c3b3ebd7956073db1bac52279aed08d586bb796b))
+* **agent:** the MCP door, one local holder of the platform sign-in ([#54](https://github.com/inorbithr/dataplane/issues/54)) ([92a525c](https://github.com/inorbithr/dataplane/commit/92a525ca6807a31b1822746a843f9a3b3ce8f040))
+* **ext-host:** WASI component extension host with signed packages and bounded calls ([#67](https://github.com/inorbithr/dataplane/issues/67)) ([c50982b](https://github.com/inorbithr/dataplane/commit/c50982b5b662559ee7d4782b715521c82abe3543))
+* **redact:** one shared iohr-redact crate ([#59](https://github.com/inorbithr/dataplane/issues/59)) ([046b5a1](https://github.com/inorbithr/dataplane/commit/046b5a121d5e68243c4f45617e5c4363dee65ae2))
+
+
+### Bug fixes
+
+* **ci:** clear cargo-deny advisories and link the musl binaries with musl-gcc ([#65](https://github.com/inorbithr/dataplane/issues/65)) ([e6f5e2e](https://github.com/inorbithr/dataplane/commit/e6f5e2e2c2b45f3ed2019d0e21529999f5444bab))
+* **deps:** rustls 0.23.46 for RUSTSEC-2026-0346 to 0349 ([#56](https://github.com/inorbithr/dataplane/issues/56)) ([9927410](https://github.com/inorbithr/dataplane/commit/99274107435d1a1b3242e6f7d041e9e31aafb2b3))
+* **release:** bump the extension host's Cargo.lock version in every release PR ([#70](https://github.com/inorbithr/dataplane/issues/70)) ([9d6e5a9](https://github.com/inorbithr/dataplane/commit/9d6e5a98a75fac2254250e6a06f1c7669ea7aea6))
+
+
+### Dependencies
+
+* **deps:** bump the cargo group across 1 directory with 14 updates ([#69](https://github.com/inorbithr/dataplane/issues/69)) ([ba2c85d](https://github.com/inorbithr/dataplane/commit/ba2c85df01a4b5284864a080d6c58038174301c3))
+
 ## [0.1.0-alpha.10](https://github.com/inorbithr/dataplane/compare/v0.1.0-alpha.9...v0.1.0-alpha.10) (2026-10-09)
 
 
