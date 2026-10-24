@@ -68,21 +68,36 @@ pub(super) async fn check(tls: &TlsContext, p: &Prepared<'_>) -> CheckDetail {
         Ok(resp) => {
             let status = resp.status().as_u16();
             let expires = expiry(&resp);
-            // The body is never read: dropping the response closes the connection.
-            drop(resp);
-            let ok = p
+            let status_ok = p
                 .spec
                 .expect
                 .status
                 .map_or(status < 400, |want| want == status);
+            // Headers are judged only once the status is the wanted one; a wrong status
+            // is the failure to report.
+            let broken = if status_ok {
+                p.spec.params.assert.broken(resp.headers())
+            } else {
+                Vec::new()
+            };
+            // The body is never read: dropping the response closes the connection.
+            drop(resp);
+            let ok = status_ok && broken.is_empty();
+            let error_class = if !status_ok {
+                Some(ErrorClass::Status)
+            } else if ok {
+                None
+            } else {
+                Some(ErrorClass::Answer)
+            };
             CheckDetail {
                 ok,
                 latency_ms: elapsed_ms(started),
                 status_code: Some(status),
-                error_class: (!ok).then_some(ErrorClass::Status),
+                error_class,
                 tls_expires_at: expires,
                 reading: None,
-                invariants: Vec::new(),
+                invariants: broken,
             }
         }
         Err(e) => CheckDetail::failed(classify(&e), started),
@@ -169,4 +184,127 @@ pub(super) fn classify(e: &reqwest::Error) -> ErrorClass {
         source = s.source();
     }
     ErrorClass::Connect
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    use super::*;
+
+    const GOOD: &str = "HTTP/1.1 302 Found\r\nlocation: https://auth.example.com/login?next=1\r\nstrict-transport-security: max-age=63072000\r\nx-content-type-options: nosniff";
+    const BAD: &str = "HTTP/1.1 302 Found\r\nlocation: https://evil.example.net/\r\nstrict-transport-security: max-age=0\r\nx-content-type-options: nosniff";
+    const NONE: &str = "HTTP/1.1 200 OK";
+    use crate::checks::{Assert, CheckSpec, InvariantStatus, Location};
+
+    /// A server answering every request with `head` (status line and headers).
+    async fn serve(head: &'static str) -> std::net::SocketAddr {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = l.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock
+                        .write_all(
+                            format!("{head}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                                .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+        addr
+    }
+
+    async fn run(addr: std::net::SocketAddr, status: u16, assert: Assert) -> CheckDetail {
+        let mut spec: CheckSpec = serde_json::from_value(serde_json::json!({
+            "surface": "http",
+            "target": {"url": format!("http://{addr}/room/")},
+            "expect": {"status": status},
+        }))
+        .unwrap();
+        spec.params.assert = assert;
+        let endpoint = spec.endpoint().unwrap();
+        let p = Prepared {
+            spec: &spec,
+            endpoint: &endpoint,
+            addr,
+            auth: None,
+            timeout: Duration::from_secs(5),
+        };
+        check(&TlsContext::new(None).unwrap(), &p).await
+    }
+
+    fn rules() -> Assert {
+        Assert {
+            location: Some(Location::Prefix("https://auth.example.com/".into())),
+            headers: vec![
+                ("strict-transport-security".into(), "max-age=".into()),
+                ("x-content-type-options".into(), String::new()),
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn a_redirect_and_headers_are_judged_and_a_failure_names_only_the_rule() {
+        let d = run(serve(GOOD).await, 302, rules()).await;
+        assert!(d.ok, "{d:?}");
+        assert_eq!(d.status_code, Some(302));
+        assert_eq!(d.invariants.len(), 0);
+
+        // Redirected somewhere else, and the HSTS value is not what was asked.
+        let mut a = rules();
+        a.headers[0].1 = "max-age=6".into();
+        let d = run(serve(BAD).await, 302, a).await;
+        assert!(!d.ok);
+        assert_eq!(d.error_class, Some(ErrorClass::Answer));
+        let names: Vec<_> = d
+            .invariants
+            .iter()
+            .map(|i| (i.name.as_str(), i.path.as_deref(), i.expected.as_deref()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("location", Some("location"), Some("prefix")),
+                ("header", Some("strict-transport-security"), Some("prefix")),
+            ]
+        );
+        assert!(
+            d.invariants
+                .iter()
+                .all(|i| i.status == InvariantStatus::Failed)
+        );
+        let text = serde_json::to_string(&d.invariants).unwrap();
+        assert!(
+            !text.contains("evil.example.net") && !text.contains("max-age"),
+            "{text}"
+        );
+
+        // A header that is missing, and a redirect that was not sent at all.
+        let d = run(
+            serve(NONE).await,
+            200,
+            Assert {
+                location: None,
+                headers: rules().headers,
+            },
+        )
+        .await;
+        assert_eq!(d.invariants.len(), 2, "{d:?}");
+        assert_eq!(d.error_class, Some(ErrorClass::Answer));
+
+        // The wrong status is the failure to report, not the headers.
+        let d = run(serve(GOOD).await, 301, rules()).await;
+        assert_eq!(d.error_class, Some(ErrorClass::Status));
+        assert_eq!(d.invariants.len(), 0);
+
+        // Without rules the check is what it was.
+        let d = run(serve(NONE).await, 200, Assert::default()).await;
+        assert!(d.ok);
+    }
 }

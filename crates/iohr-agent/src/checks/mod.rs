@@ -206,6 +206,87 @@ pub struct Params {
     pub expect_error: Option<String>,
     /// `grpc`: the gRPC status code to expect (default 0, OK).
     pub expect_code: Option<u32>,
+    /// `http`: what the answer's headers must say (RFC 0040.2).
+    pub assert: Assert,
+}
+
+/// `http`: the answer's headers a check asserts. Values live in the file only; a failure
+/// names the header, never what it held or what was wanted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Assert {
+    /// Where a 3xx must point (the `Location` header, compared as sent).
+    pub location: Option<Location>,
+    /// Required headers, by lower-case name, with a value prefix (empty: only present).
+    /// Sorted by name.
+    pub headers: Vec<(String, String)>,
+}
+
+/// How the `Location` of a redirect is matched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Location {
+    /// The whole value.
+    Exact(String),
+    /// The start of the value.
+    Prefix(String),
+}
+
+/// Whether the redirect address `got` is under `want`: the scheme, host and port are
+/// compared as parsed, and `want` only decides the path and query, so
+/// `https://auth.example.com/` is not `https://auth.example.com.evil.net/` nor
+/// `https://auth.example.com@evil.net/`. A relative or unparsable `got` is no match.
+fn prefix_matches(want: &str, got: &str) -> bool {
+    use url::Position;
+    let (Ok(w), Ok(g)) = (Url::parse(want), Url::parse(got)) else {
+        return false;
+    };
+    g.scheme() == w.scheme()
+        && g.host_str() == w.host_str()
+        && g.port_or_known_default() == w.port_or_known_default()
+        && g.username().is_empty()
+        && g.password().is_none()
+        && g[Position::BeforePath..].starts_with(&w[Position::BeforePath..])
+}
+
+impl Assert {
+    /// No rule at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.location.is_none() && self.headers.is_empty()
+    }
+
+    /// The broken rules for an answer carrying `headers`: `location` for the redirect,
+    /// `header` (path: the header) for each missing or mismatched one.
+    #[must_use]
+    pub fn broken(&self, headers: &reqwest::header::HeaderMap) -> Vec<Invariant> {
+        let mut out = Vec::new();
+        if let Some(rule) = &self.location {
+            let got = headers
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok());
+            let (ok, how) = match rule {
+                Location::Exact(want) => (got == Some(want.as_str()), "exact"),
+                Location::Prefix(want) => (got.is_some_and(|g| prefix_matches(want, g)), "prefix"),
+            };
+            if !ok {
+                out.push(Invariant::broke("location", "location", how));
+            }
+        }
+        for (name, prefix) in &self.headers {
+            let present = headers
+                .get_all(name.as_str())
+                .iter()
+                .any(|v| v.to_str().is_ok_and(|v| v.starts_with(prefix.as_str())));
+            if !present {
+                let how = if prefix.is_empty() {
+                    "present"
+                } else {
+                    "prefix"
+                };
+                out.push(Invariant::broke("header", name, how));
+            }
+        }
+        out
+    }
 }
 
 /// A target: a URL, a host and port, or (for `hwmon`) a sensor on this host.
@@ -333,6 +414,12 @@ pub struct Invariant {
     pub name: String,
     /// How it came out.
     pub status: InvariantStatus,
+    /// What it judged (an assertion's header), when it names one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// How it was judged (`exact`, `prefix`, `present`), never the wanted value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected: Option<String>,
 }
 
 /// An [`Invariant`]'s outcome.
@@ -351,7 +438,22 @@ impl Invariant {
     /// An invariant with `status`.
     #[must_use]
     pub fn new(name: String, status: InvariantStatus) -> Self {
-        Self { name, status }
+        Self {
+            name,
+            status,
+            path: None,
+            expected: None,
+        }
+    }
+
+    /// A broken assertion on `path`, judged by `expected`.
+    #[must_use]
+    pub fn broke(name: &str, path: &str, expected: &str) -> Self {
+        Self {
+            path: Some(path.to_owned()),
+            expected: Some(expected.to_owned()),
+            ..Self::failed(name.to_owned())
+        }
     }
 
     /// A broken invariant.
@@ -574,6 +676,40 @@ mod tests {
 
     fn spec(v: serde_json::Value) -> CheckSpec {
         serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn a_location_prefix_is_matched_on_the_parsed_host_not_the_text() {
+        let want = "https://auth.example.com/";
+        for ok in [
+            "https://auth.example.com/",
+            "https://auth.example.com/login?next=%2Froom",
+            "https://AUTH.example.com:443/x",
+            // A browser reads `\` as `/`, so the host here is auth.example.com.
+            "https://auth.example.com\\@evil.net/",
+        ] {
+            assert!(prefix_matches(want, ok), "{ok}");
+        }
+        for bad in [
+            "https://auth.example.com.evil.net/",
+            "https://auth.example.com@evil.net/",
+            "https://auth.example.com:8443@evil.net/",
+            "https://user@auth.example.com/",
+            "http://auth.example.com/",
+            "https://auth.example.com:8443/",
+            "//auth.example.com/",
+            "/login",
+        ] {
+            assert!(!prefix_matches(want, bad), "{bad}");
+        }
+        assert!(prefix_matches(
+            "https://auth.example.com/login?next=",
+            "https://auth.example.com/login?next=%2Froom"
+        ));
+        assert!(!prefix_matches(
+            "https://auth.example.com/login",
+            "https://auth.example.com/other"
+        ));
     }
 
     #[test]
