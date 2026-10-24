@@ -10,4 +10,5 @@ inh = "inh"
 rto = "rto"
 
 [files]
-extend-exclude = ["LICENSE", "CODE_OF_CONDUCT.md", "crates/iohr-agent/tests/fixtures/*", "crates/iohr-capture/tests/fixtures/*", "*.svg"]
+# CHANGELOG.md is written by release-please; commit hashes in it (ba2c85d) read as typos.
+extend-exclude = ["LICENSE", "CODE_OF_CONDUCT.md", "CHANGELOG.md", "crates/iohr-agent/tests/fixtures/*", "crates/iohr-capture/tests/fixtures/*", "*.svg"]
