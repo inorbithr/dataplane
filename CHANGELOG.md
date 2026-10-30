@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.1.0-alpha.12](https://github.com/inorbithr/dataplane/compare/v0.1.0-alpha.11...v0.1.0-alpha.12) (2026-10-30)
+
+
+### Bug fixes
+
+* **deps:** wasmtime 49.0.5 for RUSTSEC-2026-0422 and 0423 ([#80](https://github.com/inorbithr/dataplane/issues/80)) ([cbb381e](https://github.com/inorbithr/dataplane/commit/cbb381e9e49510b82bb06ca8e9d4c2caeb2277c7))
+
+
+### Documentation
+
+* **readme:** banner and intro say what the agent is today ([#79](https://github.com/inorbithr/dataplane/issues/79)) ([74d08bf](https://github.com/inorbithr/dataplane/commit/74d08bf133308d2c35c80c0f179316db9ffa9b40))
+
+
+### Dependencies
+
+* **deps:** bump psl from 2.1.242 to 2.1.243 in the cargo group ([#74](https://github.com/inorbithr/dataplane/issues/74)) ([37cbd91](https://github.com/inorbithr/dataplane/commit/37cbd91e27a1fd17a8f758fac8d689d7c85f6c11))
+
 ## [0.1.0-alpha.11](https://github.com/inorbithr/dataplane/compare/v0.1.0-alpha.10...v0.1.0-alpha.11) (2026-10-24)
 
 
