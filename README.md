@@ -1,11 +1,9 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset=".github/assets/hero-dark.png">
-    <img alt="dataplane: The agent in your network: checks from inside, connects outbound only. (preview)" src=".github/assets/hero-light.png" width="100%">
+    <img alt="dataplane: the InOrbit agent runs checks inside your network and connects outbound only (preview)" src=".github/assets/hero-light.png" width="100%">
   </picture>
 </p>
-
-<p align="center">InOrbit data plane for reliability testing, observability, and experiment execution.</p>
 
 <p align="center">
   <a href="https://github.com/inorbithr/dataplane/actions/workflows/ci.yml"><img alt="ci (builds the agent and capture images)" src="https://github.com/inorbithr/dataplane/actions/workflows/ci.yml/badge.svg?branch=main"></a>
@@ -14,13 +12,12 @@
 
 # InOrbit data plane: the agent
 
-`iohr-agent` runs checks for the InOrbit platform inside your own network, where the
-systems are. It dials out to the platform, does only what a local policy file allows, and
-sends back timings and verdicts, never content. Design: [RFC 0029](https://inorbit.hr/lab/)
-and [ADR 0001](docs/adr/0001-architecture.md).
+`iohr-agent` is the InOrbit agent. It runs checks for the platform inside your own network,
+next to the systems being checked. It dials out to the platform, does only what a local policy file allows, and sends back
+timings and verdicts, never content. Design: [ADR 0001](docs/adr/0001-architecture.md).
 
-Status: pre-release (`0.1.0-alpha`). Before 1.0 only the latest release gets fixes
-([SUPPORT.md](SUPPORT.md)).
+Status: pre-release (`0.1.0-alpha`). Before 1.0 only the latest
+release gets fixes ([SUPPORT.md](SUPPORT.md)).
 
 ## What it does
 
@@ -38,7 +35,7 @@ Status: pre-release (`0.1.0-alpha`). Before 1.0 only the latest release gets fix
   the agent reads it at the moment of the call and forgets it after.
 - **Declares what it watches.** An optional [`checks.toml`](docs/checks.md) lists checks,
   and refusals that must keep happening (`[[refuse]]`); the platform turns them into
-  monitors managed by this agent ([RFC 0040.1](https://inorbit.hr/lab/rfc/0040.1-declared-checks-and-self-tests/)).
+  monitors managed by this agent.
 - **Checks today:** `http` (status, latency, certificate expiry; `GET` to `POST` with a
   small JSON body), `tcp`, `tls`, `grpc_health` (`grpc.health.v1`), and, when the policy
   lists them, the transport surfaces `grpc`, `sse`, `ws`, `mqtt`, `mcp` and `graphql`
@@ -140,8 +137,10 @@ Every artifact is an OCI artifact; copy them into your registry with their signa
 | `iohr-agent config validate` | check `agent.toml` with `IOHR_AGENT_META_*` overrides applied; every problem names its line; exit 2 on any error |
 | `iohr-agent config show` | the effective configuration as TOML, the Vault token reference redacted |
 | `iohr-agent config schema` | the JSON Schema of `agent.toml` ([docs/schema/agent.schema.json](docs/schema/agent.schema.json)) |
-| `iohr-agent atlas observe host --report` | read this machine (sensors, PCI topology and ASPM, storage and mounts, pressure, boots) as Atlas evidence, with derived findings; needs `[work] host = true` ([docs/host.md](docs/host.md)) |
-| `iohr-agent atlas observe --repo DIR --kube-context CTX` | read a checkout and a cluster (through the policy) and write Atlas evidence as JSON lines, locally; nothing is sent ([docs/atlas.md](docs/atlas.md)) |
+| `iohr-agent atlas observe host --report` | read this machine (sensors, PCI topology and ASPM, storage and mounts, pressure, boots) as evidence, with derived findings; needs `[work] host = true` ([docs/host.md](docs/host.md)) |
+| `iohr-agent atlas observe --repo DIR --kube-context CTX` | read a checkout and a cluster (through the policy) and write evidence as JSON lines, locally; nothing is sent ([docs/atlas.md](docs/atlas.md)) |
+| `iohr-agent atlas docs sync\|sources` | read your internal documentation from inside your network, locally ([docs/docs-connectors.md](docs/docs-connectors.md)) |
+| `iohr-agent atlas crawl URL` | read a public site end to end, public pages only, no credential ([docs/docs-connectors.md](docs/docs-connectors.md#whole-site-crawl-atlas-crawl)) |
 
 `agent.toml` is described in [docs/config.md](docs/config.md), including the `[metadata]`
 sections (where the agent runs, who owns it, what binds it) that devops fills so the
