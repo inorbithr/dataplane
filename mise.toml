@@ -42,6 +42,12 @@ CARGO_TARGET_DIR = "{{config_root}}/target"
 description = "Everything CI checks, in the same order"
 depends = ["repo:check", "check", "helm:check"]
 
+[tasks."ci:changed"]
+description = "What `ci` runs for the files changed since origin/main, with CI's path rules: repo:check always, helm:check for the chart, check for Rust and its build config. The coordinator's Checked gate runs it (RFC 0120). `--plan` prints the steps without running them"
+usage = 'flag "--plan" help="print the steps without running them"'
+shell = "bash -e -o pipefail -c"
+run = 'exec bash tools/ci-changed.sh ${usage_plan:+--plan}'
+
 [tasks.check]
 shell = "bash -e -o pipefail -c"
 description = "fmt, clippy (pedantic, -D warnings), nextest, doctests, cargo-deny"
