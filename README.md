@@ -137,8 +137,10 @@ Every artifact is an OCI artifact; copy them into your registry with their signa
 | `iohr-agent config validate` | check `agent.toml` with `IOHR_AGENT_META_*` overrides applied; every problem names its line; exit 2 on any error |
 | `iohr-agent config show` | the effective configuration as TOML, the Vault token reference redacted |
 | `iohr-agent config schema` | the JSON Schema of `agent.toml` ([docs/schema/agent.schema.json](docs/schema/agent.schema.json)) |
-| `iohr-agent atlas observe host --report` | read this machine (sensors, PCI topology and ASPM, storage and mounts, pressure, boots) as Atlas evidence, with derived findings; needs `[work] host = true` ([docs/host.md](docs/host.md)) |
-| `iohr-agent atlas observe --repo DIR --kube-context CTX` | read a checkout and a cluster (through the policy) and write Atlas evidence as JSON lines, locally; nothing is sent ([docs/atlas.md](docs/atlas.md)) |
+| `iohr-agent atlas observe host --report` | read this machine (sensors, PCI topology and ASPM, storage and mounts, pressure, boots) as evidence, with derived findings; needs `[work] host = true` ([docs/host.md](docs/host.md)) |
+| `iohr-agent atlas observe --repo DIR --kube-context CTX` | read a checkout and a cluster (through the policy) and write evidence as JSON lines, locally; nothing is sent ([docs/atlas.md](docs/atlas.md)) |
+| `iohr-agent atlas docs sync\|sources` | read your internal documentation from inside your network, locally ([docs/docs-connectors.md](docs/docs-connectors.md)) |
+| `iohr-agent atlas crawl URL` | read a public site end to end, public pages only, no credential ([docs/docs-connectors.md](docs/docs-connectors.md#whole-site-crawl-atlas-crawl)) |
 
 `agent.toml` is described in [docs/config.md](docs/config.md), including the `[metadata]`
 sections (where the agent runs, who owns it, what binds it) that devops fills so the
