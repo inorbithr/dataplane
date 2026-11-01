@@ -24,8 +24,9 @@ use crate::policy::{NameRule, Policy, normalize_host};
 /// Bounds a checks file must respect (the platform enforces the same).
 pub mod limits {
     /// Most entries, `[[check]]` and `[[refuse]]` together. The platform holds the same
-    /// number (core `crates/agents/src/reconcile.rs` `MAX_CHECKS`); a test pins this one.
-    pub const MAX_CHECKS: usize = 50;
+    /// number (core `tbd_common::monitor_class::MAX_DECLARED_CHECKS`, raised to 100 in core
+    /// #1397); a test pins this one.
+    pub const MAX_CHECKS: usize = 100;
     /// Longest name.
     pub const MAX_NAME: usize = 64;
     /// Shortest interval, in seconds.
@@ -42,8 +43,9 @@ pub mod limits {
     pub const MAX_URL: usize = 2_048;
     /// Longest gRPC service name.
     pub const MAX_SERVICE: usize = 256;
-    /// Largest canonical form; keeps the hello well under the platform's 64 KiB frame.
-    pub const MAX_CANONICAL_BYTES: usize = 48 * 1024;
+    /// Largest canonical form; keeps the hello well under the platform's 128 KiB frame
+    /// (core `configs/agents/base.toml` `[session] max_frame_bytes`).
+    pub const MAX_CANONICAL_BYTES: usize = 96 * 1024;
     /// Most tags on one check (the platform's limit).
     pub const MAX_TAGS: usize = 10;
     /// Most headers one check asserts.
@@ -1984,10 +1986,14 @@ every = "60s"
         assert!(DeclaredChecks::from_toml("[[checks]]\nname = \"a\"\n").is_err());
         let twice = format!("{}{}", base(""), base(""));
         assert!(parse(&twice).is_err(), "duplicate names");
-        let many = numbered(51);
-        assert!(parse(&many).is_err(), "more than 50");
-        let fifty = numbered(50);
-        assert_eq!(DeclaredChecks::from_toml(&fifty).unwrap().entries.len(), 50);
+        let limit = u16::try_from(limits::MAX_CHECKS).unwrap();
+        let many = numbered(limit + 1);
+        assert!(parse(&many).is_err(), "more than the limit");
+        let most = numbered(limit);
+        assert_eq!(
+            DeclaredChecks::from_toml(&most).unwrap().entries.len(),
+            limits::MAX_CHECKS
+        );
     }
 
     #[test]
@@ -2103,8 +2109,10 @@ every = "60s"
 
     #[test]
     fn the_entry_limit_is_the_platforms() {
-        // core crates/agents/src/reconcile.rs MAX_CHECKS = 50: change both or neither.
-        assert_eq!(limits::MAX_CHECKS, 50);
+        // core tbd_common::monitor_class::MAX_DECLARED_CHECKS = 100: change both or neither.
+        assert_eq!(limits::MAX_CHECKS, 100);
+        // The hello must fit core's [session] max_frame_bytes = 128 KiB.
+        const { assert!(limits::MAX_CANONICAL_BYTES < 128 * 1024) };
     }
 
     #[test]

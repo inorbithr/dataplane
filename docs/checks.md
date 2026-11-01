@@ -86,7 +86,7 @@ Unknown keys are errors, so a typo never silently changes what is checked.
 | `rfc` | no | The platform RFC this check proves (`"0029"`, `"0040.1"`); the RFC's page then shows "proved since". |
 | `by` | `[[refuse]]` | Who must refuse: `"policy"` or `"platform"`. Leave it out and give `expect` for a refusal the target answers. |
 
-At most 50 entries, `[[check]]` and `[[refuse]]` together.
+At most 100 entries, `[[check]]` and `[[refuse]]` together (the platform holds the same number).
 
 ## Redirects and headers (`http`)
 
