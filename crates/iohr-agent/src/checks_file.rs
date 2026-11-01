@@ -1986,10 +1986,10 @@ every = "60s"
         assert!(DeclaredChecks::from_toml("[[checks]]\nname = \"a\"\n").is_err());
         let twice = format!("{}{}", base(""), base(""));
         assert!(parse(&twice).is_err(), "duplicate names");
-        let many = numbered(51);
-        assert!(parse(&many).is_err(), "more than 50");
-        let fifty = numbered(50);
-        assert_eq!(DeclaredChecks::from_toml(&fifty).unwrap().entries.len(), 50);
+        let many = numbered(limits::MAX_CHECKS as u16 + 1);
+        assert!(parse(&many).is_err(), "more than the limit");
+        let most = numbered(limits::MAX_CHECKS as u16);
+        assert_eq!(DeclaredChecks::from_toml(&most).unwrap().entries.len(), limits::MAX_CHECKS);
     }
 
     #[test]
