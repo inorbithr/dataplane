@@ -1986,9 +1986,10 @@ every = "60s"
         assert!(DeclaredChecks::from_toml("[[checks]]\nname = \"a\"\n").is_err());
         let twice = format!("{}{}", base(""), base(""));
         assert!(parse(&twice).is_err(), "duplicate names");
-        let many = numbered(limits::MAX_CHECKS as u16 + 1);
+        let limit = u16::try_from(limits::MAX_CHECKS).unwrap();
+        let many = numbered(limit + 1);
         assert!(parse(&many).is_err(), "more than the limit");
-        let most = numbered(limits::MAX_CHECKS as u16);
+        let most = numbered(limit);
         assert_eq!(DeclaredChecks::from_toml(&most).unwrap().entries.len(), limits::MAX_CHECKS);
     }
 
@@ -2108,7 +2109,7 @@ every = "60s"
         // core tbd_common::monitor_class::MAX_DECLARED_CHECKS = 100: change both or neither.
         assert_eq!(limits::MAX_CHECKS, 100);
         // The hello must fit core's [session] max_frame_bytes = 128 KiB.
-        assert!(limits::MAX_CANONICAL_BYTES < 128 * 1024);
+        const { assert!(limits::MAX_CANONICAL_BYTES < 128 * 1024) };
     }
 
     #[test]
