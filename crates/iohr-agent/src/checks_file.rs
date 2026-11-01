@@ -1990,7 +1990,10 @@ every = "60s"
         let many = numbered(limit + 1);
         assert!(parse(&many).is_err(), "more than the limit");
         let most = numbered(limit);
-        assert_eq!(DeclaredChecks::from_toml(&most).unwrap().entries.len(), limits::MAX_CHECKS);
+        assert_eq!(
+            DeclaredChecks::from_toml(&most).unwrap().entries.len(),
+            limits::MAX_CHECKS
+        );
     }
 
     #[test]
