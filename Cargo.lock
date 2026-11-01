@@ -1577,7 +1577,7 @@ checksum = "2f0fb0570afe1fed943c5c3d4102d5358592d8625fda6a0007fdbe65a92fba96"
 
 [[package]]
 name = "iohr-agent"
-version = "0.1.0-alpha.11"
+version = "0.1.0-alpha.12"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -1627,7 +1627,7 @@ dependencies = [
 
 [[package]]
 name = "iohr-capture"
-version = "0.1.0-alpha.11"
+version = "0.1.0-alpha.12"
 dependencies = [
  "aya",
  "aya-build",
@@ -1645,14 +1645,14 @@ dependencies = [
 
 [[package]]
 name = "iohr-capture-common"
-version = "0.1.0-alpha.11"
+version = "0.1.0-alpha.12"
 dependencies = [
  "aya",
 ]
 
 [[package]]
 name = "iohr-evidence"
-version = "0.1.0-alpha.11"
+version = "0.1.0-alpha.12"
 dependencies = [
  "chrono",
  "proptest",
@@ -1665,7 +1665,7 @@ dependencies = [
 
 [[package]]
 name = "iohr-ext-host"
-version = "0.1.0-alpha.11"
+version = "0.1.0-alpha.12"
 dependencies = [
  "base64 0.23.1",
  "ed25519-dalek",
@@ -1683,7 +1683,7 @@ dependencies = [
 
 [[package]]
 name = "iohr-redact"
-version = "0.1.0-alpha.11"
+version = "0.1.0-alpha.12"
 dependencies = [
  "serde_json",
 ]
