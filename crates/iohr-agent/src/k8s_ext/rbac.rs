@@ -161,8 +161,8 @@ mod tests {
     fn it_parses_as_yaml_documents_scoped_to_the_namespaces() {
         let y = all();
         let mut n = 0;
-        for doc in serde_yaml_ng::Deserializer::from_str(&y) {
-            let v: serde_json::Value = serde::Deserialize::deserialize(doc).unwrap();
+        for doc in crate::yaml::docs::<serde_json::Value>(&y, 1 << 20) {
+            let v = doc.unwrap();
             n += 1;
             let kind = v["kind"].as_str().unwrap();
             let ns = v["metadata"]["namespace"].as_str().unwrap();

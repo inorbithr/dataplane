@@ -264,7 +264,7 @@ pub struct AtlasCrawlArgs {
     /// Most megabytes read.
     #[arg(long, default_value_t = 200)]
     pub max_mb: u64,
-    /// Largest page read, in megabytes.
+    /// Largest page read, in megabytes (at most 64).
     #[arg(long, default_value_t = 5)]
     pub max_page_mb: usize,
     /// The headless render fallback.

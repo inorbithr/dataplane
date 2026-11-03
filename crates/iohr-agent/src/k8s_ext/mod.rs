@@ -141,7 +141,7 @@ mod tests {
 
     #[test]
     fn the_manifest_reads_and_sends_nothing_out() {
-        let v: serde_json::Value = serde_yaml_ng::from_str(MANIFEST).unwrap();
+        let v: serde_json::Value = crate::yaml::from_str(MANIFEST, 1 << 20).unwrap();
         assert_eq!(v["id"], ID);
         assert_eq!(v["data"]["leaves"], serde_json::json!([]));
         assert_eq!(v["privileges"], serde_json::json!([]));

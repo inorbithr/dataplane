@@ -45,5 +45,6 @@ pub mod telemetry;
 pub mod tls;
 pub mod token;
 pub mod x509;
+pub mod yaml;
 
 pub use error::{Error, Result};

@@ -41,6 +41,9 @@ use scope::{LinkClass, classify, in_scope, is_media, key, registrable};
 pub const MAX_PAGES: usize = 20_000;
 /// Longest a crawl may be given, in minutes.
 pub const MAX_MINUTES: u64 = 240;
+/// The most one page may be, however large `--max-page-mb` is set: a page is held in
+/// memory whole and parsed (YAML in the worst case), so its size is a memory bound.
+pub const MAX_PAGE_BYTES: usize = 64 * 1024 * 1024;
 /// Most redirects followed from one URL.
 pub const MAX_HOPS: u8 = 10;
 /// Most sitemaps read (an index and the sitemaps it lists).
@@ -97,7 +100,7 @@ impl Default for Budgets {
 }
 
 impl Budgets {
-    /// These budgets within the hard caps (20,000 pages, 4 hours) and at least 1 each.
+    /// These budgets within the hard caps (20,000 pages, 4 hours, 64 MiB a page) and at least 1 each.
     #[must_use]
     pub fn capped(self) -> Self {
         Self {
@@ -105,7 +108,7 @@ impl Budgets {
             hosts: self.hosts.max(1),
             minutes: self.minutes.clamp(1, MAX_MINUTES),
             bytes: self.bytes.max(1),
-            page_bytes: self.page_bytes.max(1024),
+            page_bytes: self.page_bytes.clamp(1024, MAX_PAGE_BYTES),
         }
     }
 }
@@ -1007,7 +1010,7 @@ impl Crawler<'_> {
             Target::Store(_) => {
                 l.fields = listings::store_fields(&String::from_utf8_lossy(&body), u);
             }
-            Target::Spec(_) => match listings::spec_fields(&body) {
+            Target::Spec(_) => match listings::spec_fields(&body, self.budgets.page_bytes) {
                 Ok(f) => l.fields = f,
                 Err(e) => l.error = Some(e),
             },
@@ -1075,5 +1078,24 @@ impl Crawler<'_> {
         std::fs::write(&tmp, bytes)
             .and_then(|()| std::fs::rename(&tmp, p))
             .map_err(|e| CrawlError::State(format!("{}: {e}", p.display())))
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn a_page_is_never_more_than_64_mib_whatever_the_flag_says() {
+        let b = |page_bytes| {
+            Budgets {
+                page_bytes,
+                ..Budgets::default()
+            }
+            .capped()
+        };
+        assert_eq!(b(usize::MAX).page_bytes, MAX_PAGE_BYTES);
+        assert_eq!(b(5 * 1024 * 1024).page_bytes, 5 * 1024 * 1024);
+        assert_eq!(b(0).page_bytes, 1024);
     }
 }
