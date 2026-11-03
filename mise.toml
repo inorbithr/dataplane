@@ -75,10 +75,11 @@ cargo deny --manifest-path Cargo.toml check licenses bans sources
 
 [tasks."capture:toolchain-check"]
 shell = "bash -e -o pipefail -c"
-description = "The nightly pinned in mise.toml is the one crates/iohr-capture-ebpf/rust-toolchain.toml names"
+description = "The nightly pinned in mise.toml and .clusterfuzzlite/Dockerfile is the one crates/iohr-capture-ebpf/rust-toolchain.toml names"
 run = """
 pin=$(grep '^channel' crates/iohr-capture-ebpf/rust-toolchain.toml | cut -d'"' -f2)
 grep -q "version = .$pin.," mise.toml || { echo "rust-toolchain.toml names $pin; mise.toml pins another nightly" >&2; exit 1; }
+grep -q "RUSTUP_TOOLCHAIN=$pin\\$" .clusterfuzzlite/Dockerfile || { echo "rust-toolchain.toml names $pin; .clusterfuzzlite/Dockerfile pins another nightly" >&2; exit 1; }
 """
 
 [tasks."capture:e2e"]

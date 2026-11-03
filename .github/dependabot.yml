@@ -32,3 +32,19 @@ updates:
       docker: { patterns: ["*"], update-types: [minor, patch] }
       docker-major: { patterns: ["*"], update-types: [major] }
     commit-message: { prefix: "build(deps)" }
+
+  # The fuzz crate is outside the root workspace (nightly, libFuzzer), so it has its own
+  # lockfile and its own entries; the ClusterFuzzLite builder image is pinned by digest.
+  - package-ecosystem: cargo
+    directory: /fuzz
+    schedule: { interval: weekly, day: monday }
+    cooldown: { default-days: 7 }
+    groups:
+      fuzz: { patterns: ["*"] }
+    commit-message: { prefix: "build(deps)" }
+
+  - package-ecosystem: docker
+    directory: /.clusterfuzzlite
+    schedule: { interval: weekly, day: monday }
+    cooldown: { default-days: 7 }
+    commit-message: { prefix: "build(deps)" }

@@ -1,0 +1,37 @@
+[package]
+name = "iohr-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+# Not a member of the root workspace: it builds with nightly and libFuzzer only.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+iohr-agent = { path = "../crates/iohr-agent" }
+
+[[bin]]
+name = "checks_file"
+path = "fuzz_targets/checks_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "x509_not_after"
+path = "fuzz_targets/x509_not_after.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "capture_answers"
+path = "fuzz_targets/capture_answers.rs"
+test = false
+doc = false
+bench = false
