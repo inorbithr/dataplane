@@ -1007,7 +1007,7 @@ impl Crawler<'_> {
             Target::Store(_) => {
                 l.fields = listings::store_fields(&String::from_utf8_lossy(&body), u);
             }
-            Target::Spec(_) => match listings::spec_fields(&body) {
+            Target::Spec(_) => match listings::spec_fields(&body, self.budgets.page_bytes) {
                 Ok(f) => l.fields = f,
                 Err(e) => l.error = Some(e),
             },

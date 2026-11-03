@@ -161,7 +161,7 @@ mod tests {
     fn it_parses_as_yaml_documents_scoped_to_the_namespaces() {
         let y = all();
         let mut n = 0;
-        for doc in serde_saphyr::read::<_, serde_json::Value>(&mut y.as_bytes()) {
+        for doc in crate::yaml::docs::<serde_json::Value>(&y, 1 << 20) {
             let v = doc.unwrap();
             n += 1;
             let kind = v["kind"].as_str().unwrap();

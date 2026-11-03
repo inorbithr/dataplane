@@ -251,10 +251,10 @@ const METHODS: &[&str] = &[
 ///
 /// # Errors
 /// It is neither, or names no specification version.
-pub fn spec_fields(body: &[u8]) -> Result<BTreeMap<String, Value>, String> {
+pub fn spec_fields(body: &[u8], max_bytes: usize) -> Result<BTreeMap<String, Value>, String> {
     let v: Value = serde_json::from_slice(body)
-        .or_else(|_| serde_saphyr::from_slice(body))
-        .map_err(|_| "not JSON or YAML".to_owned())?;
+        .or_else(|_| crate::yaml::from_slice(body, max_bytes))
+        .map_err(|e| format!("not JSON or YAML: {e}"))?;
     let format = ["openapi", "swagger", "asyncapi"]
         .iter()
         .find_map(|k| {
@@ -348,17 +348,17 @@ mod tests {
     #[test]
     fn a_spec_is_reduced_to_counts() {
         let yaml = b"openapi: 3.0.1\ninfo:\n  title: Visual search\n  version: '1.2'\nservers:\n  - url: https://api.example.test\npaths:\n  /a:\n    get: {}\n    post: {}\n    parameters: []\n  /b:\n    delete: {}\n";
-        let f = spec_fields(yaml).unwrap();
+        let f = spec_fields(yaml, 1 << 20).unwrap();
         assert_eq!(f["format"], json!("openapi 3.0.1"));
         assert_eq!(f["title"], json!("Visual search"));
         assert_eq!(f["version"], json!("1.2"));
         assert_eq!(f["servers"], json!(1));
         assert_eq!(f["operations"], json!(3));
         let swagger = br#"{"swagger":"2.0","info":{"title":"T","version":"1"},"host":"x","paths":{"/a":{"get":{}}}}"#;
-        let f = spec_fields(swagger).unwrap();
+        let f = spec_fields(swagger, 1 << 20).unwrap();
         assert_eq!(f["format"], json!("swagger 2.0"));
         assert_eq!(f["servers"], json!(1));
-        assert!(spec_fields(b"<html></html>").is_err());
+        assert!(spec_fields(b"<html></html>", 1 << 20).is_err());
     }
 
     #[test]

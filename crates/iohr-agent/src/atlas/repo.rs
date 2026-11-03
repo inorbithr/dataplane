@@ -22,7 +22,9 @@ use super::record::{Sink, line_of};
 use crate::error::{Error, Result};
 
 /// The largest file read.
-const MAX_FILE: u64 = 8 * 1024 * 1024;
+const MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
+/// [`MAX_FILE_BYTES`] as a file length; it is also the YAML reader's byte cap.
+const MAX_FILE: u64 = MAX_FILE_BYTES as u64;
 /// How deep the walk goes.
 const MAX_DEPTH: usize = 12;
 /// Directories never entered.
@@ -386,7 +388,7 @@ fn yaml_docs(text: &str) -> Vec<(Value, (usize, usize))> {
             .get(n + 1)
             .map_or(total, |(next, _)| next - 2)
             .max(*first);
-        for doc in serde_saphyr::read::<_, Value>(&mut body.as_bytes()) {
+        for doc in crate::yaml::docs::<Value>(body, MAX_FILE_BYTES) {
             match doc {
                 Ok(v) if v.is_object() => out.push((v, (*first, last))),
                 Ok(_) => {}

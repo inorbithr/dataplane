@@ -32,6 +32,8 @@ use crate::tls::TlsContext;
 
 /// The largest API answer accepted (a namespace's pods, with their statuses).
 const MAX_ANSWER: usize = 32 * 1024 * 1024;
+/// The largest kubeconfig read (real ones are a few KB; this is the YAML reader's cap).
+const MAX_KUBECONFIG: usize = 8 * 1024 * 1024;
 /// How long one API call may take.
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// The method every reading here carries.
@@ -154,7 +156,7 @@ impl KubeContext {
     /// plugin (the agent runs no other program).
     pub fn load(path: &Path, context: Option<&str>) -> Result<Self> {
         let text = std::fs::read_to_string(path).map_err(|e| Error::io(path, e))?;
-        let cfg: KubeConfigFile = serde_saphyr::from_str(&text)
+        let cfg: KubeConfigFile = crate::yaml::from_str(&text, MAX_KUBECONFIG)
             .map_err(|e| Error::Atlas(format!("{}: not a kubeconfig: {e}", path.display())))?;
         let base = path.parent().unwrap_or_else(|| Path::new("."));
         Self::from_file(&cfg, context, base)
@@ -723,7 +725,7 @@ current-context: k3d-tbd
 
     #[test]
     fn kubeconfig_picks_the_context_and_its_auth() {
-        let cfg: KubeConfigFile = serde_saphyr::from_str(KUBECONFIG).unwrap();
+        let cfg: KubeConfigFile = crate::yaml::from_str(KUBECONFIG, MAX_KUBECONFIG).unwrap();
         let c = KubeContext::from_file(&cfg, None, Path::new("/tmp")).unwrap();
         assert_eq!(c.name, "k3d-tbd");
         assert_eq!(c.user, "admin@k3d-tbd");
@@ -741,15 +743,27 @@ current-context: k3d-tbd
     }
 
     #[test]
+    fn an_empty_or_comment_only_kubeconfig_is_refused_in_words() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body) in [("empty", ""), ("comment", "# nothing here\n")] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            let e = KubeContext::load(&path, None).unwrap_err().to_string();
+            assert!(e.contains(&path.display().to_string()), "{e}");
+            assert!(e.contains("not a kubeconfig"), "{e}");
+        }
+    }
+
+    #[test]
     fn exec_plugins_and_insecure_clusters_are_refused() {
-        let cfg: KubeConfigFile = serde_saphyr::from_str(KUBECONFIG).unwrap();
+        let cfg: KubeConfigFile = crate::yaml::from_str(KUBECONFIG, MAX_KUBECONFIG).unwrap();
         let e = KubeContext::from_file(&cfg, Some("plugin"), Path::new("/tmp")).unwrap_err();
         assert!(e.to_string().contains("exec plugin"), "{e}");
         let insecure = KUBECONFIG.replace(
             "certificate-authority-data: Q0EtUEVN",
             "insecure-skip-tls-verify: true",
         );
-        let cfg: KubeConfigFile = serde_saphyr::from_str(&insecure).unwrap();
+        let cfg: KubeConfigFile = crate::yaml::from_str(&insecure, MAX_KUBECONFIG).unwrap();
         let e = KubeContext::from_file(&cfg, None, Path::new("/tmp")).unwrap_err();
         assert!(e.to_string().contains("skips TLS verification"), "{e}");
         let e = KubeContext::from_file(&cfg, Some("nope"), Path::new("/tmp")).unwrap_err();
