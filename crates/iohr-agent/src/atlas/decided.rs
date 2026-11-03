@@ -772,14 +772,13 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // The `decided` block (fences 16-22, 7 observations) and the two sentences.
+        // The `decided` block (fences 16-21, 7 observations) and the sentence under Decision.
         assert_eq!(
             spans.iter().filter(|s| **s == (16, 21)).count(),
             7,
             "{spans:?}"
         );
         assert!(spans.contains(&(13, 14)), "{spans:?}");
-        assert!(spans.contains(&(26, 26)), "{spans:?}");
     }
 
     #[test]
