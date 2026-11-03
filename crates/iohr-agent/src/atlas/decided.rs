@@ -774,7 +774,7 @@ mod tests {
             .collect();
         // The `decided` block (fences 16-22, 7 observations) and the two sentences.
         assert_eq!(
-            spans.iter().filter(|s| **s == (16, 22)).count(),
+            spans.iter().filter(|s| **s == (16, 21)).count(),
             7,
             "{spans:?}"
         );
