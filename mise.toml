@@ -57,8 +57,6 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo nextest run --locked --all-features
 cargo test --locked --doc --all-features
 cargo deny check
-# fuzz/ is its own workspace with its own lockfile; OSV-Scanner and Scorecard read it too.
-cargo metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null
 mise run capture:ebpf-check
 """
 

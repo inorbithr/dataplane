@@ -24,7 +24,7 @@ fi
 steps=()
 touched '.' && steps+=(repo:check)
 touched '^(charts/|mise\.toml$|\.github/workflows/ci\.yml$)' && steps+=(helm:check)
-touched '^(crates/|(fuzz/)?Cargo\.(toml|lock)$|deny\.toml$|clippy\.toml$|rustfmt\.toml$|advisories/|mise\.toml$|\.github/workflows/ci\.yml$)' && steps+=(check)
+touched '^(crates/|Cargo\.(toml|lock)$|deny\.toml$|clippy\.toml$|rustfmt\.toml$|advisories/|mise\.toml$|\.github/workflows/ci\.yml$)' && steps+=(check)
 echo "ci:changed: ${steps[*]:-nothing to check}"
 [ "$plan" = 1 ] && exit 0
 

@@ -97,6 +97,21 @@
           "jsonpath": "$.package[?(@.name.value==='iohr-capture-common')].version"
         },
         {
+          "type": "toml",
+          "path": "fuzz/Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value==='iohr-agent')].version"
+        },
+        {
+          "type": "toml",
+          "path": "fuzz/Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value==='iohr-evidence')].version"
+        },
+        {
+          "type": "toml",
+          "path": "fuzz/Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value==='iohr-redact')].version"
+        },
+        {
           "type": "yaml",
           "path": "charts/iohr-agent/Chart.yaml",
           "jsonpath": "$.version"
