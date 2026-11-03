@@ -2,12 +2,15 @@ name: fuzz
 
 # ClusterFuzzLite (https://google.github.io/clusterfuzzlite/): every pull request that
 # touches code runs the fuzz targets in fuzz/ for a few minutes on the changed code; a
-# weekly batch run fuzzes longer and grows the corpus. Not part of ci-ok.
+# weekly batch run fuzzes for 30 minutes to grow the corpus, then prunes it (ClusterFuzzLite
+# requires pruning alongside batch). The corpus lives only in Actions artifacts. Not part of ci-ok.
 on:
   pull_request:
     paths:
       - "crates/**"
       - "fuzz/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - ".clusterfuzzlite/**"
       - ".github/workflows/fuzz.yml"
   schedule:
@@ -23,10 +26,11 @@ jobs:
   fuzz:
     name: fuzz ${{ github.event_name == 'pull_request' && '(code change)' || '(batch)' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # build ~10 min; pull request fuzzing 5 min; batch 30 min plus a 10 min prune
+    timeout-minutes: ${{ github.event_name == 'pull_request' && 30 || 75 }}
     permissions:
       contents: read
-      actions: read
+      actions: read # the run_fuzzers action downloads the previous corpus and builds
     steps:
       - id: build
         uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
@@ -39,4 +43,11 @@ jobs:
           fuzz-seconds: ${{ github.event_name == 'pull_request' && 300 || 1800 }}
           mode: ${{ github.event_name == 'pull_request' && 'code-change' || 'batch' }}
           sanitizer: address
+          output-sarif: false
+      - if: github.event_name == 'schedule'
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 600
+          mode: prune
           output-sarif: false

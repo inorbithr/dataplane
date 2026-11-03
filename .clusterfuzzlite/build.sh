@@ -1,6 +1,8 @@
 #!/bin/bash -eu
 # Builds every fuzz target in fuzz/ and copies the binaries to $OUT for ClusterFuzzLite.
 cd "$SRC/dataplane/fuzz"
+# cargo fuzz has no --locked; fail here if fuzz/Cargo.lock is stale instead of resolving fresh versions.
+cargo metadata --locked --format-version 1 >/dev/null
 cargo fuzz build -O --debug-assertions
 for target in fuzz_targets/*.rs; do
   name=$(basename "$target" .rs)
