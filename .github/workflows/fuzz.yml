@@ -1,0 +1,42 @@
+name: fuzz
+
+# ClusterFuzzLite (https://google.github.io/clusterfuzzlite/): every pull request that
+# touches code runs the fuzz targets in fuzz/ for a few minutes on the changed code; a
+# weekly batch run fuzzes longer and grows the corpus. Not part of ci-ok.
+on:
+  pull_request:
+    paths:
+      - "crates/**"
+      - "fuzz/**"
+      - ".clusterfuzzlite/**"
+      - ".github/workflows/fuzz.yml"
+  schedule:
+    - cron: "23 3 * * 3"
+
+permissions: {}
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    name: fuzz ${{ github.event_name == 'pull_request' && '(code change)' || '(batch)' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - id: build
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: rust
+          sanitizer: address
+      - uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: ${{ github.event_name == 'pull_request' && 300 || 1800 }}
+          mode: ${{ github.event_name == 'pull_request' && 'code-change' || 'batch' }}
+          sanitizer: address
+          output-sarif: false
