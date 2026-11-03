@@ -458,6 +458,7 @@ pub fn observe_document(
                 }
             };
             n += 1;
+            sink.at_lines(artifact, block.first, block.last);
             let decision = format!("decision/{key}#{n}");
             let subject = sink.entity(&fact.subject);
             let document = sink.entity(&doc);
@@ -500,11 +501,13 @@ pub fn observe_document(
                 &[artifact],
             )?;
             found.decided += 1;
+            sink.clear_lines();
         }
     }
 
     for (s, first, last) in constraint_sentences(body, body_line) {
         let target = format!("statement/{key}@{first}-{last}");
+        sink.at_lines(artifact, first, last);
         ctx.observe(sink, &target, "statement.text", Value::Text(s), &[artifact])?;
         ctx.observe(
             sink,
@@ -516,6 +519,7 @@ pub fn observe_document(
         let t = sink.entity(&target);
         ctx.observe(sink, &doc, "doc.states", Value::Entity(t), &[artifact])?;
         found.constraints += 1;
+        sink.clear_lines();
     }
     Ok(())
 }
@@ -741,6 +745,40 @@ mod tests {
             ),
             "{obs:?}"
         );
+    }
+
+    #[test]
+    fn a_decision_and_a_sentence_carry_their_lines() {
+        let mut sink = Sink::default();
+        let c = ctx(&mut sink);
+        let a = c
+            .artifact(&mut sink, "core@x:docs/adrs/0001-a.md", ADR.as_bytes())
+            .unwrap();
+        observe_document(
+            &c,
+            &mut sink,
+            Path::new("docs/adrs/0001-a.md"),
+            "adr",
+            ADR.as_bytes(),
+            a,
+            &mut Found::default(),
+        )
+        .unwrap();
+        let spans: Vec<(u32, u32)> = sink
+            .records()
+            .iter()
+            .filter_map(|r| match r {
+                Record::Span { start, end, .. } => Some((*start, *end)),
+                _ => None,
+            })
+            .collect();
+        // The `decided` block (fences 16-21, 7 observations) and the sentence under Decision.
+        assert_eq!(
+            spans.iter().filter(|s| **s == (16, 21)).count(),
+            7,
+            "{spans:?}"
+        );
+        assert!(spans.contains(&(13, 14)), "{spans:?}");
     }
 
     #[test]

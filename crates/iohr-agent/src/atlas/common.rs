@@ -235,6 +235,17 @@ impl Ctx {
         }
         sink.push(Record::Observation(o));
         sink.push(Record::Evidence(item));
+        if let Some((artifact, start, end)) = sink
+            .current_lines()
+            .filter(|(a, ..)| derived_from.contains(&EvidenceRef::Artifact(*a)))
+        {
+            sink.push(Record::Span {
+                observation: id,
+                artifact,
+                start,
+                end,
+            });
+        }
         Ok(id)
     }
 }
