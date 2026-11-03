@@ -235,6 +235,13 @@ impl Ctx {
         }
         sink.push(Record::Observation(o));
         sink.push(Record::Evidence(item));
+        if let Some((start, end)) = sink.current_lines() {
+            sink.push(Record::Span {
+                observation: id,
+                start,
+                end,
+            });
+        }
         Ok(id)
     }
 }

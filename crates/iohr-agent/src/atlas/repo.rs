@@ -19,7 +19,7 @@ use serde_json::Value;
 
 use super::common::{Ctx, ObservedNow, method};
 use super::k8s;
-use super::record::Sink;
+use super::record::{Sink, line_of};
 use crate::error::{Error, Result};
 
 /// The largest file read.
@@ -209,6 +209,8 @@ struct Object {
     namespace: String,
     value: Value,
     artifact: ArtifactObservationId,
+    /// The lines of its document in the file.
+    lines: (usize, usize),
 }
 
 /// Reads the checkout and writes what it finds to `sink`.
@@ -278,7 +280,7 @@ pub fn observe(repo: &Repo, sink: &mut Sink, clock: &ObservedNow) -> Result<Foun
             continue;
         }
         let dir = rel.parent().unwrap_or_else(|| Path::new(""));
-        for doc in parse_yaml(text) {
+        for (doc, lines) in yaml_docs(text) {
             let Some(kind) = k8s::kind(&doc) else {
                 continue;
             };
@@ -305,6 +307,7 @@ pub fn observe(repo: &Repo, sink: &mut Sink, clock: &ObservedNow) -> Result<Foun
                 namespace,
                 value: doc,
                 artifact,
+                lines,
             });
         }
     }
@@ -356,14 +359,42 @@ fn observe_decided(
 /// Every document in `text` that is a map; a document that does not parse is skipped
 /// (a Helm template, say), because a reader reports what it read, not what it guessed.
 fn parse_yaml(text: &str) -> Vec<Value> {
+    yaml_docs(text).into_iter().map(|(v, _)| v).collect()
+}
+
+/// [`parse_yaml`] with each document's 1-based, inclusive lines in `text`: the lines
+/// between its `---` separators (a leading separator belongs to no document).
+fn yaml_docs(text: &str) -> Vec<(Value, (usize, usize))> {
+    let mut chunks: Vec<(usize, String)> = vec![(1, String::new())];
+    for (i, line) in text.lines().enumerate() {
+        if line == "---" || line.starts_with("--- ") {
+            chunks.push((i + 2, String::new()));
+            if let Some(rest) = line.strip_prefix("--- ").filter(|r| !r.trim().is_empty())
+                && let Some((_, buf)) = chunks.last_mut()
+            {
+                buf.push_str(rest);
+                buf.push('\n');
+            }
+        } else if let Some((_, buf)) = chunks.last_mut() {
+            buf.push_str(line);
+            buf.push('\n');
+        }
+    }
+    let total = text.lines().count();
     let mut out = Vec::new();
-    for doc in serde_yaml_ng::Deserializer::from_str(text) {
-        match Value::deserialize(doc) {
-            Ok(v) if v.is_object() => out.push(v),
-            Ok(_) => {}
-            Err(e) => {
-                tracing::debug!(error = %e, "skipped a YAML document that does not parse");
-                break;
+    for (n, (first, body)) in chunks.iter().enumerate() {
+        let last = chunks
+            .get(n + 1)
+            .map_or(total, |(next, _)| next - 2)
+            .max(*first);
+        for doc in serde_yaml_ng::Deserializer::from_str(body) {
+            match Value::deserialize(doc) {
+                Ok(v) if v.is_object() => out.push((v, (*first, last))),
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!(error = %e, "skipped a YAML document that does not parse");
+                    break;
+                }
             }
         }
     }
@@ -417,6 +448,9 @@ fn observe_cargo(repo: &Repo, ctx: &Ctx, sink: &mut Sink) -> Result<usize> {
         name: String,
         rel: PathBuf,
         deps: Vec<String>,
+        /// The line of `name = ...` and the line of each dependency, by crate.
+        name_line: Option<(usize, usize)>,
+        dep_lines: BTreeMap<String, (usize, usize)>,
         artifact: ArtifactObservationId,
         workspace_members: bool,
     }
@@ -446,6 +480,8 @@ fn observe_cargo(repo: &Repo, ctx: &Ctx, sink: &mut Sink) -> Result<usize> {
                     name: String::new(),
                     rel,
                     deps: Vec::new(),
+                    name_line: line_of(text, |l| l.trim_start().starts_with("[workspace")),
+                    dep_lines: BTreeMap::new(),
                     artifact,
                     workspace_members,
                 });
@@ -453,6 +489,7 @@ fn observe_cargo(repo: &Repo, ctx: &Ctx, sink: &mut Sink) -> Result<usize> {
             continue;
         };
         let mut deps = Vec::new();
+        let mut dep_lines = BTreeMap::new();
         for table in ["dependencies", "dev-dependencies", "build-dependencies"] {
             let Some(t) = doc.get(table).and_then(toml::Value::as_table) else {
                 continue;
@@ -463,6 +500,9 @@ fn observe_cargo(repo: &Repo, ctx: &Ctx, sink: &mut Sink) -> Result<usize> {
                     .get("package")
                     .and_then(toml::Value::as_str)
                     .unwrap_or(key);
+                if let Some(l) = line_of(text, |l| declares_key(l, key)) {
+                    dep_lines.entry(real.to_owned()).or_insert(l);
+                }
                 deps.push(real.to_owned());
             }
         }
@@ -470,6 +510,8 @@ fn observe_cargo(repo: &Repo, ctx: &Ctx, sink: &mut Sink) -> Result<usize> {
             name: name.to_owned(),
             rel,
             deps,
+            name_line: line_of(text, |l| declares_key(l, "name") && l.contains(name)),
+            dep_lines,
             artifact,
             workspace_members,
         });
@@ -484,6 +526,7 @@ fn observe_cargo(repo: &Repo, ctx: &Ctx, sink: &mut Sink) -> Result<usize> {
             continue;
         }
         let key = format!("crate/{}", m.name);
+        set_lines(sink, m.name_line);
         ctx.observe(
             sink,
             &key,
@@ -495,6 +538,7 @@ fn observe_cargo(repo: &Repo, ctx: &Ctx, sink: &mut Sink) -> Result<usize> {
             // Only edges inside the checkout: a registry crate is not a component here.
             if let Some(target) = names.get(d.as_str()) {
                 let dep = sink.entity(&format!("crate/{}", target.name));
+                set_lines(sink, m.dep_lines.get(d.as_str()).copied());
                 ctx.observe(
                     sink,
                     &key,
@@ -507,6 +551,7 @@ fn observe_cargo(repo: &Repo, ctx: &Ctx, sink: &mut Sink) -> Result<usize> {
     }
     for m in manifests.iter().filter(|m| m.workspace_members) {
         let key = format!("workspace/{}", repo.name);
+        set_lines(sink, m.name_line);
         ctx.observe(
             sink,
             &key,
@@ -515,7 +560,35 @@ fn observe_cargo(repo: &Repo, ctx: &Ctx, sink: &mut Sink) -> Result<usize> {
             &[m.artifact],
         )?;
     }
+    sink.clear_lines();
     Ok(manifests.len())
+}
+
+/// Records the next observations with `lines`, or with none.
+fn set_lines(sink: &mut Sink, lines: Option<(usize, usize)>) {
+    match lines {
+        Some((a, b)) => sink.at_lines(a, b),
+        None => sink.clear_lines(),
+    }
+}
+
+/// Whether a TOML line declares `key` (`key = ...`, `key.x = ...`, `[dependencies.key]`),
+/// quoted or not.
+fn declares_key(line: &str, key: &str) -> bool {
+    let t = line.trim_start();
+    let t = t.strip_prefix('[').unwrap_or(t);
+    let t = t.rsplit_once('.').map_or(t, |(head, tail)| {
+        if tail.trim_start_matches('"').starts_with(key) && head.contains("dependencies") {
+            tail
+        } else {
+            t
+        }
+    });
+    let t = t.trim_start_matches('"');
+    t.strip_prefix(key).is_some_and(|rest| {
+        let rest = rest.trim_start_matches('"');
+        rest.starts_with([' ', '=', '.', ']'])
+    })
 }
 
 #[allow(clippy::too_many_lines)] // one pass over the objects, in reading order
@@ -530,6 +603,7 @@ fn observe_k8s(k8s_ctx: &Ctx, netpol_ctx: &Ctx, objects: &[Object], sink: &mut S
         })
         .collect();
     for o in &workloads {
+        sink.at_lines(o.lines.0, o.lines.1);
         let kind = k8s::kind(&o.value)
             .unwrap_or("Deployment")
             .to_ascii_lowercase();
@@ -580,6 +654,7 @@ fn observe_k8s(k8s_ctx: &Ctx, netpol_ctx: &Ctx, objects: &[Object], sink: &mut S
         .iter()
         .filter(|o| k8s::kind(&o.value) == Some("Service"))
     {
+        sink.at_lines(o.lines.0, o.lines.1);
         let Some(name) = k8s::name(&o.value) else {
             continue;
         };
@@ -630,6 +705,7 @@ fn observe_k8s(k8s_ctx: &Ctx, netpol_ctx: &Ctx, objects: &[Object], sink: &mut S
         .iter()
         .filter(|o| k8s::kind(&o.value) == Some("NetworkPolicy"))
     {
+        sink.at_lines(o.lines.0, o.lines.1);
         let Some(name) = k8s::name(&o.value) else {
             continue;
         };
@@ -682,6 +758,7 @@ fn observe_k8s(k8s_ctx: &Ctx, netpol_ctx: &Ctx, objects: &[Object], sink: &mut S
             )?;
         }
     }
+    sink.clear_lines();
     Ok(())
 }
 
@@ -980,5 +1057,70 @@ mod tests {
         let docs = parse_yaml("kind: {{ .Values.kind }}\n");
         assert_eq!(docs, Vec::<Value>::new());
         assert_eq!(parse_yaml("just a scalar\n"), Vec::<Value>::new());
+    }
+
+    #[test]
+    fn observations_carry_the_lines_they_were_read_from() {
+        use super::super::record::Record;
+        let dir = tempfile::tempdir().unwrap();
+        let w = |rel: &str, text: &str| {
+            let p = dir.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        w(
+            "a/Cargo.toml",
+            "[package]\nname = \"a\"\n\n[dependencies]\nserde = \"1\"\nb = { path = \"../b\" }\n",
+        );
+        w("b/Cargo.toml", "[package]\nversion = \"1\"\nname = \"b\"\n");
+        w(
+            "k/app.yaml",
+            "# c\napiVersion: v1\nkind: Service\nmetadata:\n  name: s\n---\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: d\nspec:\n  template:\n    spec:\n      containers:\n        - image: x:1\n",
+        );
+        let repo = Repo::open(dir.path()).unwrap();
+        let mut sink = Sink::default();
+        observe(&repo, &mut sink, &ObservedNow::now()).unwrap();
+        let keys: BTreeMap<_, _> = sink
+            .records()
+            .iter()
+            .filter_map(|r| match r {
+                Record::Entity { id, key } => Some((*id, key.clone())),
+                _ => None,
+            })
+            .collect();
+        let spans: BTreeMap<_, _> = sink
+            .records()
+            .iter()
+            .filter_map(|r| match r {
+                Record::Span {
+                    observation,
+                    start,
+                    end,
+                } => Some((*observation, (*start, *end))),
+                _ => None,
+            })
+            .collect();
+        let at = |subject: &str, predicate: &str| {
+            sink.records().iter().find_map(|r| match r {
+                Record::Observation(o) => {
+                    let s = o.statement();
+                    (keys[&s.subject] == subject && s.predicate.name.as_str() == predicate)
+                        .then(|| spans.get(&o.id()).copied())
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(at("crate/a", "defined_in"), Some(Some((2, 2))));
+        assert_eq!(at("crate/a", "depends_on"), Some(Some((6, 6))));
+        assert_eq!(at("crate/b", "defined_in"), Some(Some((3, 3))));
+        assert_eq!(
+            at("deployment/default/d", "runs_image"),
+            Some(Some((7, 15)))
+        );
+        assert_eq!(
+            at("service/default/s", "selects_pods"),
+            None,
+            "a Service with no selector says nothing"
+        );
     }
 }
