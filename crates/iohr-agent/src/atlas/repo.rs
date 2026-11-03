@@ -14,7 +14,6 @@ use iohr_evidence::ids::ArtifactObservationId;
 use iohr_evidence::method::MethodCategory;
 use iohr_evidence::observer::ObserverClass;
 use iohr_evidence::vocabulary::Value as EvValue;
-use serde::Deserialize as _;
 use serde_json::Value;
 
 use super::common::{Ctx, ObservedNow, method};
@@ -387,8 +386,8 @@ fn yaml_docs(text: &str) -> Vec<(Value, (usize, usize))> {
             .get(n + 1)
             .map_or(total, |(next, _)| next - 2)
             .max(*first);
-        for doc in serde_yaml_ng::Deserializer::from_str(body) {
-            match Value::deserialize(doc) {
+        for doc in serde_saphyr::read::<_, Value>(&mut body.as_bytes()) {
+            match doc {
                 Ok(v) if v.is_object() => out.push((v, (*first, last))),
                 Ok(_) => {}
                 Err(e) => {

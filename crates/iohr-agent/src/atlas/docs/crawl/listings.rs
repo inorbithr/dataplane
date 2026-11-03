@@ -253,7 +253,7 @@ const METHODS: &[&str] = &[
 /// It is neither, or names no specification version.
 pub fn spec_fields(body: &[u8]) -> Result<BTreeMap<String, Value>, String> {
     let v: Value = serde_json::from_slice(body)
-        .or_else(|_| serde_yaml_ng::from_slice(body))
+        .or_else(|_| serde_saphyr::from_slice(body))
         .map_err(|_| "not JSON or YAML".to_owned())?;
     let format = ["openapi", "swagger", "asyncapi"]
         .iter()
