@@ -287,12 +287,12 @@ mod tests {
         format!("eyJhbGciOiJub25lIn0.{}.sig", B64.encode(claims.to_string()))
     }
 
-    fn good() -> serde_json::Value {
+    fn good(nonce: &str) -> serde_json::Value {
         serde_json::json!({
             "iss": "https://login.example.com",
             "aud": "iohr-agent-console",
             "exp": time::OffsetDateTime::now_utc().unix_timestamp() + 300,
-            "nonce": "n1",
+            "nonce": nonce,
             "sub": "u-42",
             "name": "Ana Example",
             "groups": ["engineering", "sre-leads"],
@@ -301,11 +301,12 @@ mod tests {
 
     #[test]
     fn groups_map_to_the_highest_role() {
+        let n = random();
         let p = person_from_id_token(
-            &token(&good()),
+            &token(&good(&n)),
             "https://login.example.com",
             &policy(),
-            "n1",
+            &n,
         )
         .unwrap();
         assert_eq!(p.role, Role::Admin);
@@ -317,19 +318,20 @@ mod tests {
     fn a_token_that_does_not_hold_is_refused() {
         let o = policy();
         let iss = "https://login.example.com";
-        let mut c = good();
+        let n = random();
+        let mut c = good(&n);
         c["aud"] = "someone-else".into();
-        assert!(person_from_id_token(&token(&c), iss, &o, "n1").is_err());
-        let mut c = good();
+        assert!(person_from_id_token(&token(&c), iss, &o, &n).is_err());
+        let mut c = good(&n);
         c["exp"] = 1.into();
-        assert!(person_from_id_token(&token(&c), iss, &o, "n1").is_err());
-        assert!(person_from_id_token(&token(&good()), iss, &o, "other-nonce").is_err());
-        let mut c = good();
+        assert!(person_from_id_token(&token(&c), iss, &o, &n).is_err());
+        assert!(person_from_id_token(&token(&good(&n)), iss, &o, &random()).is_err());
+        let mut c = good(&n);
         c["iss"] = "https://evil.example".into();
-        assert!(person_from_id_token(&token(&c), iss, &o, "n1").is_err());
-        let mut c = good();
+        assert!(person_from_id_token(&token(&c), iss, &o, &n).is_err());
+        let mut c = good(&n);
         c["groups"] = serde_json::json!(["engineering"]);
-        let e = person_from_id_token(&token(&c), iss, &o, "n1").unwrap_err();
+        let e = person_from_id_token(&token(&c), iss, &o, &n).unwrap_err();
         assert!(e.contains("no role"), "{e}");
     }
 
