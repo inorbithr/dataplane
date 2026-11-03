@@ -16,10 +16,20 @@ for t in $TARGETS; do
     aarch64-unknown-linux-musl) arch=arm64 ;;
     *) echo "unsupported target $t" >&2; exit 1 ;;
   esac
-  # ring's C parts are self-contained; the host C compiler builds them for musl.
+  # The bundled sqlite (libsqlite3-sys) must be compiled against musl headers, or the
+  # link fails on glibc-only symbols (__memcpy_chk, open64, stat64). Prefer a musl
+  # cross gcc, then musl-gcc (musl-tools, native arch only); only ring-only builds
+  # could tolerate the host gcc, so refuse it instead of failing at link time.
   cc_var="CC_${t//-/_}"
-  if [ -z "${!cc_var:-}" ] && ! command -v "${t%%-*}-linux-musl-gcc" >/dev/null; then
-    export "$cc_var"="${CC:-gcc}"
+  if [ -z "${!cc_var:-}" ]; then
+    if command -v "${t%%-*}-linux-musl-gcc" >/dev/null; then
+      :
+    elif [ "${t%%-*}" = "$host" ] && command -v musl-gcc >/dev/null; then
+      export "$cc_var"=musl-gcc
+    else
+      echo "no musl C compiler for $t: install musl-tools or set $cc_var" >&2
+      exit 1
+    fi
   fi
   cargo build --release --locked --target "$t" -p iohr-agent -p iohr-capture
   mkdir -p "dist/bin/linux-$arch"
