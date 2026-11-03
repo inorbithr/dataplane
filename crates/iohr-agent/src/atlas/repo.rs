@@ -500,7 +500,7 @@ fn observe_cargo(repo: &Repo, ctx: &Ctx, sink: &mut Sink) -> Result<usize> {
                     .get("package")
                     .and_then(toml::Value::as_str)
                     .unwrap_or(key);
-                if let Some(l) = line_of(text, |l| declares_key(l, key)) {
+                if let Some(l) = key_line(text, is_dependency_table, key) {
                     dep_lines.entry(real.to_owned()).or_insert(l);
                 }
                 deps.push(real.to_owned());
@@ -510,7 +510,7 @@ fn observe_cargo(repo: &Repo, ctx: &Ctx, sink: &mut Sink) -> Result<usize> {
             name: name.to_owned(),
             rel,
             deps,
-            name_line: line_of(text, |l| declares_key(l, "name") && l.contains(name)),
+            name_line: key_line(text, |h| h == "package", "name"),
             dep_lines,
             artifact,
             workspace_members,
@@ -526,7 +526,7 @@ fn observe_cargo(repo: &Repo, ctx: &Ctx, sink: &mut Sink) -> Result<usize> {
             continue;
         }
         let key = format!("crate/{}", m.name);
-        set_lines(sink, m.name_line);
+        set_lines(sink, m.artifact, m.name_line);
         ctx.observe(
             sink,
             &key,
@@ -538,7 +538,7 @@ fn observe_cargo(repo: &Repo, ctx: &Ctx, sink: &mut Sink) -> Result<usize> {
             // Only edges inside the checkout: a registry crate is not a component here.
             if let Some(target) = names.get(d.as_str()) {
                 let dep = sink.entity(&format!("crate/{}", target.name));
-                set_lines(sink, m.dep_lines.get(d.as_str()).copied());
+                set_lines(sink, m.artifact, m.dep_lines.get(d.as_str()).copied());
                 ctx.observe(
                     sink,
                     &key,
@@ -551,7 +551,7 @@ fn observe_cargo(repo: &Repo, ctx: &Ctx, sink: &mut Sink) -> Result<usize> {
     }
     for m in manifests.iter().filter(|m| m.workspace_members) {
         let key = format!("workspace/{}", repo.name);
-        set_lines(sink, m.name_line);
+        set_lines(sink, m.artifact, m.name_line);
         ctx.observe(
             sink,
             &key,
@@ -564,31 +564,59 @@ fn observe_cargo(repo: &Repo, ctx: &Ctx, sink: &mut Sink) -> Result<usize> {
     Ok(manifests.len())
 }
 
-/// Records the next observations with `lines`, or with none.
-fn set_lines(sink: &mut Sink, lines: Option<(usize, usize)>) {
+/// Records the next observations with `lines` of `artifact`, or with none.
+fn set_lines(sink: &mut Sink, artifact: ArtifactObservationId, lines: Option<(usize, usize)>) {
     match lines {
-        Some((a, b)) => sink.at_lines(a, b),
+        Some((a, b)) => sink.at_lines(artifact, a, b),
         None => sink.clear_lines(),
     }
 }
 
-/// Whether a TOML line declares `key` (`key = ...`, `key.x = ...`, `[dependencies.key]`),
-/// quoted or not.
-fn declares_key(line: &str, key: &str) -> bool {
-    let t = line.trim_start();
-    let t = t.strip_prefix('[').unwrap_or(t);
-    let t = t.rsplit_once('.').map_or(t, |(head, tail)| {
-        if tail.trim_start_matches('"').starts_with(key) && head.contains("dependencies") {
-            tail
-        } else {
-            t
+/// Whether a TOML table header names a dependency table: `dependencies`,
+/// `dev-dependencies`, `build-dependencies`, `workspace.dependencies` or the same under
+/// `target.<cfg>.`.
+fn is_dependency_table(header: &str) -> bool {
+    let last = header.rsplit('.').next().unwrap_or(header).trim();
+    matches!(
+        last,
+        "dependencies" | "dev-dependencies" | "build-dependencies"
+    )
+}
+
+/// The 1-based line that declares `key` in a table `is_table` accepts: `key = ...` or
+/// `key.x = ...` under the header, or a `[<table>.key]` header itself; quoted or not. A
+/// same-named key in another table is not it.
+fn key_line(text: &str, is_table: fn(&str) -> bool, key: &str) -> Option<(usize, usize)> {
+    let unquote = |s: &str| s.trim().trim_matches(['"', '\'']).to_owned();
+    let mut inside = false;
+    for (i, line) in text.lines().enumerate() {
+        let t = line.trim();
+        if let Some(h) = t.strip_prefix('[') {
+            let h = h.trim_start_matches('[');
+            let h = h.split(']').next().unwrap_or("").trim();
+            if is_table(h) {
+                inside = true;
+            } else {
+                inside = false;
+                if let Some((head, tail)) = h.rsplit_once('.')
+                    && is_table(head)
+                    && unquote(tail) == key
+                {
+                    return Some((i + 1, i + 1));
+                }
+            }
+        } else if inside {
+            let t = t.trim_start_matches(['"', '\'']);
+            if let Some(rest) = t.strip_prefix(key)
+                && rest
+                    .trim_start_matches(['"', '\''])
+                    .starts_with([' ', '=', '.'])
+            {
+                return Some((i + 1, i + 1));
+            }
         }
-    });
-    let t = t.trim_start_matches('"');
-    t.strip_prefix(key).is_some_and(|rest| {
-        let rest = rest.trim_start_matches('"');
-        rest.starts_with([' ', '=', '.', ']'])
-    })
+    }
+    None
 }
 
 #[allow(clippy::too_many_lines)] // one pass over the objects, in reading order
@@ -603,7 +631,7 @@ fn observe_k8s(k8s_ctx: &Ctx, netpol_ctx: &Ctx, objects: &[Object], sink: &mut S
         })
         .collect();
     for o in &workloads {
-        sink.at_lines(o.lines.0, o.lines.1);
+        sink.at_lines(o.artifact, o.lines.0, o.lines.1);
         let kind = k8s::kind(&o.value)
             .unwrap_or("Deployment")
             .to_ascii_lowercase();
@@ -654,7 +682,7 @@ fn observe_k8s(k8s_ctx: &Ctx, netpol_ctx: &Ctx, objects: &[Object], sink: &mut S
         .iter()
         .filter(|o| k8s::kind(&o.value) == Some("Service"))
     {
-        sink.at_lines(o.lines.0, o.lines.1);
+        sink.at_lines(o.artifact, o.lines.0, o.lines.1);
         let Some(name) = k8s::name(&o.value) else {
             continue;
         };
@@ -705,7 +733,7 @@ fn observe_k8s(k8s_ctx: &Ctx, netpol_ctx: &Ctx, objects: &[Object], sink: &mut S
         .iter()
         .filter(|o| k8s::kind(&o.value) == Some("NetworkPolicy"))
     {
-        sink.at_lines(o.lines.0, o.lines.1);
+        sink.at_lines(o.artifact, o.lines.0, o.lines.1);
         let Some(name) = k8s::name(&o.value) else {
             continue;
         };
@@ -1096,6 +1124,7 @@ mod tests {
                     observation,
                     start,
                     end,
+                    ..
                 } => Some((*observation, (*start, *end))),
                 _ => None,
             })
@@ -1122,5 +1151,118 @@ mod tests {
             None,
             "a Service with no selector says nothing"
         );
+    }
+
+    /// The spans of a run, as (subject key, predicate, file location, start, end).
+    fn spans_of(sink: &Sink) -> Vec<(String, String, String, u32, u32)> {
+        use super::super::record::Record;
+        let places: BTreeMap<_, _> = sink
+            .records()
+            .iter()
+            .filter_map(|r| match r {
+                Record::Artifact(a) => Some((a.id(), a.artifact().location.clone())),
+                _ => None,
+            })
+            .collect();
+        let by_id: BTreeMap<_, _> = sink
+            .records()
+            .iter()
+            .filter_map(|r| match r {
+                Record::Observation(o) => Some((o.id(), o)),
+                _ => None,
+            })
+            .collect();
+        sink.records()
+            .iter()
+            .filter_map(|r| match r {
+                Record::Span {
+                    observation,
+                    artifact,
+                    start,
+                    end,
+                } => {
+                    let s = by_id[observation].statement();
+                    Some((
+                        sink.key_of(s.subject).unwrap().to_owned(),
+                        s.predicate.name.as_str().to_owned(),
+                        places[artifact].clone(),
+                        *start,
+                        *end,
+                    ))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn write(dir: &std::path::Path, rel: &str, text: &str) {
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    }
+
+    #[test]
+    fn a_dependency_cites_the_manifest_it_is_declared_in() {
+        let dir = tempfile::tempdir().unwrap();
+        // `depends_on` cites both manifests; the line is in a's, and `b` is also a feature
+        // name above the dependency table.
+        write(
+            dir.path(),
+            "a/Cargo.toml",
+            "[package]\nname = \"a\"\n\n[features]\nb = []\n\n[dependencies]\nb = { path = \"../b\" }\n",
+        );
+        write(dir.path(), "b/Cargo.toml", "[package]\nname = \"b\"\n");
+        let repo = Repo::open(dir.path()).unwrap();
+        let mut sink = Sink::default();
+        observe(&repo, &mut sink, &ObservedNow::now()).unwrap();
+        let spans = spans_of(&sink);
+        let dep: Vec<_> = spans.iter().filter(|s| s.1 == "depends_on").collect();
+        assert_eq!(dep.len(), 1, "{spans:?}");
+        assert!(dep[0].2.ends_with(":a/Cargo.toml"), "{spans:?}");
+        assert_eq!(
+            (dep[0].3, dep[0].4),
+            (8, 8),
+            "the table line, not the feature"
+        );
+        assert!(
+            !spans
+                .iter()
+                .any(|s| s.2.ends_with(":b/Cargo.toml") && s.1 == "depends_on"),
+            "b's manifest is not where a's dependency is declared: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn declares_key_is_scoped_to_the_dependency_tables() {
+        let toml = "[package]\nname = \"a\"\nb = 1\n\n[target.'cfg(unix)'.dependencies]\nc = \"1\"\n\n[dev-dependencies.d]\nversion = \"1\"\n\n[workspace.dependencies]\n\"e\".workspace = true\n";
+        let in_deps = |k| key_line(toml, is_dependency_table, k);
+        assert_eq!(in_deps("b"), None, "b is a package key");
+        assert_eq!(in_deps("c"), Some((6, 6)));
+        assert_eq!(in_deps("d"), Some((8, 8)));
+        assert_eq!(in_deps("e"), Some((12, 12)));
+        assert_eq!(key_line(toml, |h| h == "package", "name"), Some((2, 2)));
+    }
+
+    #[test]
+    fn a_service_is_not_cited_as_lines_of_the_deployment_it_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let deploy = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: d\nspec:\n  selector:\n    matchLabels:\n      app: d\n  template:\n    metadata:\n      labels:\n        app: d\n    spec:\n      containers:\n        - image: x:1\n";
+        let svc = "apiVersion: v1\nkind: Service\nmetadata:\n  name: s\nspec:\n  selector:\n    app: d\n  ports:\n    - port: 80\n";
+        write(dir.path(), "k/a-deploy.yaml", deploy);
+        write(dir.path(), "k/b-svc.yaml", svc);
+        let repo = Repo::open(dir.path()).unwrap();
+        let mut sink = Sink::default();
+        observe(&repo, &mut sink, &ObservedNow::now()).unwrap();
+        let spans = spans_of(&sink);
+        let svc_spans: Vec<_> = spans
+            .iter()
+            .filter(|s| s.0 == "service/default/s")
+            .collect();
+        assert!(!svc_spans.is_empty(), "{spans:?}");
+        for s in &svc_spans {
+            assert!(s.2.ends_with(":k/b-svc.yaml"), "{spans:?}");
+            assert_eq!((s.3, s.4), (1, 9), "{spans:?}");
+        }
+        assert!(svc_spans.iter().any(|s| s.1 == "targets"), "{spans:?}");
     }
 }

@@ -458,7 +458,7 @@ pub fn observe_document(
                 }
             };
             n += 1;
-            sink.at_lines(block.first, block.last);
+            sink.at_lines(artifact, block.first, block.last);
             let decision = format!("decision/{key}#{n}");
             let subject = sink.entity(&fact.subject);
             let document = sink.entity(&doc);
@@ -507,7 +507,7 @@ pub fn observe_document(
 
     for (s, first, last) in constraint_sentences(body, body_line) {
         let target = format!("statement/{key}@{first}-{last}");
-        sink.at_lines(first, last);
+        sink.at_lines(artifact, first, last);
         ctx.observe(sink, &target, "statement.text", Value::Text(s), &[artifact])?;
         ctx.observe(
             sink,

@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 
 use iohr_evidence::evidence::EvidenceItem;
-use iohr_evidence::ids::{EntityId, ObservationId};
+use iohr_evidence::ids::{ArtifactObservationId, EntityId, ObservationId};
 use iohr_evidence::observation::{ArtifactObservation, Observation};
 use iohr_evidence::observer::Observer;
 use iohr_evidence::snapshot::EnvironmentManifest;
@@ -41,13 +41,16 @@ pub enum Record {
     Evidence(EvidenceItem),
     /// What was running, per component, and where each part was learned.
     Manifest(EnvironmentManifest),
-    /// The lines of the artefact an observation was read from: 1-based, inclusive.
+    /// The lines of one artefact (file) an observation was read from: 1-based, inclusive.
+    /// An observation can cite several files, so the span names the one its lines are in.
     /// Written right after the observation's evidence, only when the reader knows them;
     /// an observation with no span rests on its whole file. A consumer that does not know
     /// this record refuses the line and reads the rest as before.
     Span {
         /// The observation these lines say.
         observation: ObservationId,
+        /// The artefact the lines are in; one the observation's evidence cites.
+        artifact: ArtifactObservationId,
         /// The first line.
         start: u32,
         /// The last line (not before `start`).
@@ -124,8 +127,8 @@ pub struct ClusterRef {
 pub struct Sink {
     records: Vec<Record>,
     entities: BTreeMap<String, EntityId>,
-    /// The lines every observation made now is read from (see [`Self::at_lines`]).
-    lines: Option<(u32, u32)>,
+    /// The lines of one file every observation made now is read from (see [`Self::at_lines`]).
+    lines: Option<(ArtifactObservationId, u32, u32)>,
 }
 
 impl Sink {
@@ -161,14 +164,15 @@ impl Sink {
         id
     }
 
-    /// Until [`Self::clear_lines`], every observation is recorded with a [`Record::Span`]
-    /// of these 1-based, inclusive lines. An empty or backwards range is ignored.
-    pub fn at_lines(&mut self, start: usize, end: usize) {
+    /// Until [`Self::clear_lines`], every observation that cites `artifact` is recorded with a
+    /// [`Record::Span`] of these 1-based, inclusive lines of that file. One that does not cite
+    /// it gets none. An empty or backwards range is ignored.
+    pub fn at_lines(&mut self, artifact: ArtifactObservationId, start: usize, end: usize) {
         let (Ok(start), Ok(end)) = (u32::try_from(start), u32::try_from(end)) else {
             self.lines = None;
             return;
         };
-        self.lines = (start >= 1 && end >= start).then_some((start, end));
+        self.lines = (start >= 1 && end >= start).then_some((artifact, start, end));
     }
 
     /// Observations are recorded without lines again.
@@ -176,9 +180,9 @@ impl Sink {
         self.lines = None;
     }
 
-    /// The lines set by [`Self::at_lines`], if any.
+    /// The file and lines set by [`Self::at_lines`], if any.
     #[must_use]
-    pub fn current_lines(&self) -> Option<(u32, u32)> {
+    pub fn current_lines(&self) -> Option<(ArtifactObservationId, u32, u32)> {
         self.lines
     }
 
