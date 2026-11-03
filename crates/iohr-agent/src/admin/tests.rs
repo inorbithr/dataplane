@@ -310,7 +310,7 @@ fn the_preview_shows_exactly_what_the_next_hello_would_carry() {
     let (_, html) = page::route(&ctx, "/policy", None, &view).unwrap();
     assert!(
         html.contains("Preview: the next hello, if you apply this"),
-        "{html}"
+        "the policy page lacks the next-hello preview"
     );
     assert!(
         !html.contains("api.example.com/healthz"),
@@ -323,7 +323,7 @@ fn the_preview_shows_exactly_what_the_next_hello_would_carry() {
     let (_, html) = page::route(&ctx, "/policy", None, &view).unwrap();
     assert!(
         html.contains("&quot;url&quot;: &quot;https://api.example.com/healthz&quot;"),
-        "{html}"
+        "the full-targets preview does not carry the target url"
     );
 }
 

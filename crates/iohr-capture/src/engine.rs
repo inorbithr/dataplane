@@ -1502,7 +1502,7 @@ mod tests {
             include_bytes!("../tests/fixtures/dns.bin"),
         ));
         let text = e.counts().to_string();
-        for secret in [
+        for (i, needle) in [
             "web.e2e.test",
             "items",
             "tls-e2e.example",
@@ -1510,8 +1510,14 @@ mod tests {
             "10.0.0.2",
             "8080",
             "40000",
-        ] {
-            assert!(!text.contains(secret), "{secret} in counts: {text}");
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                !text.contains(needle),
+                "captured value #{i} in counts: {text}"
+            );
         }
         assert!(e.tables().to_string().contains("tls-e2e.example"));
     }
