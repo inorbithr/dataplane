@@ -47,7 +47,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-native-certs = "0.8"
 schemars = { version = "1.2", features = ["url2"] }
 # The local console's trial storage (RFC 0100.1 §5): SQLite, compiled in, no system library.
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # atlas observe only: Kubernetes manifests, kubeconfigs and Envoy config are YAML.
@@ -68,8 +68,8 @@ uuid = { version = "1", features = ["v7", "serde"] }
 # iohr-ext-host only (RFC on PRD 0152, WASM extensions): the same wasmtime core's gate
 # evaluator pins (core crates/gate-eval), with the component model and WASI 0.2 added.
 # Cranelift and the runtime only: no cache, no profiling, no parallel compilation.
-wasmtime = { version = "49.0.5", default-features = false, features = ["cranelift", "runtime", "std", "component-model"] }
-wasmtime-wasi = { version = "49.0.5", default-features = false, features = ["p2"] }
+wasmtime = { version = "50.0.0", default-features = false, features = ["cranelift", "runtime", "std", "component-model"] }
+wasmtime-wasi = { version = "50.0.0", default-features = false, features = ["p2"] }
 wat = "1.262"
 zeroize = "1"
 
