@@ -126,7 +126,13 @@ Why this is scoped, since read-only is not automatically safe:
 One JSON object per line, tagged by `record`: `run` (first; agent version, the repository's
 name and commit, the kubeconfig context and namespaces), `observer`, `entity` (a key such
 as `deployment/tbd/labs` and an id derived from it, so runs agree on ids), `artifact`,
-`observation`, `evidence` (method and lineage of the record before it), and `manifest`.
+`observation`, `evidence` (method and lineage of the record before it), `manifest`, and
+`span`. A `span` follows the evidence of an observation whose lines the reader knows:
+`{"record":"span","observation":<id>,"artifact":<id>,"start":N,"end":M}`, 1-based and
+inclusive, in the file `artifact` names (an observation can cite several files; the span
+is written only for the cited file the lines are in, and only when the reader found the line).
+An observation with no span rests on its whole file. A consumer that does not know `span`
+refuses those lines, so roll the consumer (core's `atlas-ingest`) before the agent.
 
 ## What it may touch
 
