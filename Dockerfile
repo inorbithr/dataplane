@@ -3,7 +3,7 @@
 # are built beforehand per architecture (tools/dist-bin.sh, or the release workflow on a
 # native runner) into dist/bin/linux-<arch>/, so `docker buildx build --platform
 # linux/amd64,linux/arm64` only assembles. Dockerfile.source builds from source instead.
-FROM gcr.io/distroless/static-debian13:nonroot@sha256:18f4cc26c9ffa7f20a359298be7deadac5c607c8e03a02b8119f1a5fc2f82c99
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:25ac8f0c3b2334a9eb05452266bd4697864a8c8ef0ef71e5e6480d7f92868329
 ARG TARGETARCH
 ARG VERSION=dev
 LABEL org.opencontainers.image.title="iohr-agent" \
