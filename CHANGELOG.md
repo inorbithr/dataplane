@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.1.0-alpha.13](https://github.com/inorbithr/dataplane/compare/v0.1.0-alpha.12...v0.1.0-alpha.13) (2026-11-04)
+
+
+### Features
+
+* **atlas:** observations carry the file lines they were read from ([#86](https://github.com/inorbithr/dataplane/issues/86)) ([69bdbaa](https://github.com/inorbithr/dataplane/commit/69bdbaa38c71beeaf1c879fafa472ac7f81e0636))
+
+
+### Bug fixes
+
+* **agent:** tests stop using constant nonces and stop printing captured values ([#88](https://github.com/inorbithr/dataplane/issues/88)) ([0e74459](https://github.com/inorbithr/dataplane/commit/0e744590802948d1d781e20aec89df4344be80d4))
+* **deps:** refresh fuzz/Cargo.lock off unsafe-libyaml and keep release bumps in it ([#92](https://github.com/inorbithr/dataplane/issues/92)) ([76f1744](https://github.com/inorbithr/dataplane/commit/76f174438be9fdeaca9e99a3eb28e46026fd1360))
+
+
+### Dependencies
+
+* **deps:** bump distroless/static-debian13 from `e2e927e` to `18f4cc2` ([#73](https://github.com/inorbithr/dataplane/issues/73)) ([3173816](https://github.com/inorbithr/dataplane/commit/3173816f4640329dfa3c9f5f54758544094b00cd))
+* **deps:** bump the cargo-major group with 3 updates ([#85](https://github.com/inorbithr/dataplane/issues/85)) ([2f5a72c](https://github.com/inorbithr/dataplane/commit/2f5a72cfd97c8cdee6fd3d44c04bfc204c9ad85e))
+* **deps:** swap serde_yaml_ng for serde-saphyr to drop unsafe-libyaml ([#89](https://github.com/inorbithr/dataplane/issues/89)) ([449d9f7](https://github.com/inorbithr/dataplane/commit/449d9f77f9faa11573c0d85dfdfe3ecc5ea115c9))
+
 ## [0.1.0-alpha.12](https://github.com/inorbithr/dataplane/compare/v0.1.0-alpha.11...v0.1.0-alpha.12) (2026-11-01)
 
 
