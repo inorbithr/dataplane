@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.0-alpha.14](https://github.com/inorbithr/dataplane/compare/v0.1.0-alpha.13...v0.1.0-alpha.14) (2026-11-04)
+
+
+### Dependencies
+
+* **deps:** bump distroless/static-debian13 from `18f4cc2` to `25ac8f0` ([#91](https://github.com/inorbithr/dataplane/issues/91)) ([dc50bb3](https://github.com/inorbithr/dataplane/commit/dc50bb3a7ba4cbf4fbd56bc77d70c23c915613f3))
+
 ## [0.1.0-alpha.13](https://github.com/inorbithr/dataplane/compare/v0.1.0-alpha.12...v0.1.0-alpha.13) (2026-11-04)
 
 
