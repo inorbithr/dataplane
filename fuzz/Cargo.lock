@@ -1034,7 +1034,7 @@ dependencies = [
 
 [[package]]
 name = "iohr-agent"
-version = "0.1.0-alpha.13"
+version = "0.1.0-alpha.14"
 dependencies = [
  "base64",
  "bytes",
@@ -1080,7 +1080,7 @@ dependencies = [
 
 [[package]]
 name = "iohr-evidence"
-version = "0.1.0-alpha.13"
+version = "0.1.0-alpha.14"
 dependencies = [
  "chrono",
  "serde",
@@ -1100,7 +1100,7 @@ dependencies = [
 
 [[package]]
 name = "iohr-redact"
-version = "0.1.0-alpha.13"
+version = "0.1.0-alpha.14"
 dependencies = [
  "serde_json",
 ]
