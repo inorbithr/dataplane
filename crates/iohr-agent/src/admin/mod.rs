@@ -210,12 +210,7 @@ pub fn server_tls(admin: &AdminConfig) -> Result<Option<tokio_rustls::TlsAccepto
 /// # Errors
 /// When the random source or the file fails.
 pub fn write_token(state_dir: &Path) -> Result<String> {
-    let mut raw = [0u8; 32];
-    getrandom::fill(&mut raw).map_err(|e| Error::Config(format!("random: {e}")))?;
-    let token = raw.iter().fold(String::with_capacity(64), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
-    });
+    let token = crate::random::hex(32);
     std::fs::create_dir_all(state_dir).map_err(|e| Error::io(state_dir, e))?;
     let path = state_dir.join(TOKEN_FILE);
     let _ = std::fs::remove_file(&path);
@@ -523,12 +518,7 @@ impl Server {
     }
 
     fn new_session(&self, person: auth::Person) -> String {
-        let mut raw = [0u8; 32];
-        let _ = getrandom::fill(&mut raw);
-        let id = raw.iter().fold(String::with_capacity(64), |mut s, b| {
-            let _ = write!(s, "{b:02x}");
-            s
-        });
+        let id = crate::random::hex(32);
         let mut s = match self.sessions.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
@@ -1083,9 +1073,9 @@ async fn oidc_start<S: AsyncWrite + Unpin>(
         }
     };
     let pending = auth::Pending {
-        state: auth::random(),
-        verifier: auth::random(),
-        nonce: auth::random(),
+        state: crate::random::urlsafe(32),
+        verifier: crate::random::urlsafe(32),
+        nonce: crate::random::urlsafe(32),
         next: next_of(req.query_param("next")),
         created: Instant::now(),
     };

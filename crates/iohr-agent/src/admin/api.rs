@@ -977,7 +977,7 @@ async fn apply(
             "as found before the first change from the console",
         );
     }
-    if let Err(e) = configs::write_atomic(&f.path, text) {
+    if let Err(e) = crate::atomic::write_keeping_mode(&f.path, text.as_bytes()) {
         return out(error(500, "internal", &format!("{name}: {e}")));
     }
     // Reload: a new generation with the new files, in this process.
@@ -998,7 +998,7 @@ async fn apply(
     match reloaded {
         Err(e) => {
             // Back to what was there: the agent never left it.
-            let _ = configs::write_atomic(&f.path, &before);
+            let _ = crate::atomic::write_keeping_mode(&f.path, before.as_bytes());
             noted(
                 (
                     422,

@@ -30,20 +30,6 @@ pub fn now_s() -> f64 {
         .map_or(0.0, |d| d.as_secs_f64())
 }
 
-/// A random URL-safe string of `n` bytes of entropy.
-#[must_use]
-pub fn random_urlsafe(n: usize) -> String {
-    let mut buf = vec![0_u8; n];
-    // No randomness means no safe verifier, state or local secret: stop rather than use zeros.
-    if getrandom::fill(&mut buf).is_err() {
-        tracing::error!("the operating system has no randomness; stopping");
-        std::process::abort();
-    }
-    let s = URL_SAFE_NO_PAD.encode(&buf);
-    buf.zeroize();
-    s
-}
-
 /// The chain as stored.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct TokenSet {
@@ -371,9 +357,9 @@ impl Tokens {
             {
                 return l.url.clone();
             }
-            let verifier = random_urlsafe(64);
+            let verifier = crate::random::urlsafe(64);
             let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-            let state = random_urlsafe(24);
+            let state = crate::random::urlsafe(24);
             let Ok(mut url) = url::Url::parse(&format!("{}/oauth2/auth", self.cfg.issuer)) else {
                 tracing::warn!("login: the issuer is not a URL");
                 return String::new();

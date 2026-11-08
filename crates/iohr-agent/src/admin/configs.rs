@@ -293,26 +293,6 @@ pub(super) fn read(path: &Path) -> std::io::Result<String> {
     }
 }
 
-/// Writes `text` to `path` atomically, keeping the file's permissions.
-pub(super) fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp = dir.join(format!(
-        ".{}.iohr-new",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("file")
-    ));
-    let mode = std::fs::metadata(path).ok().map(|m| m.permissions());
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(text.as_bytes())?;
-        f.sync_all()?;
-    }
-    if let Some(m) = mode {
-        std::fs::set_permissions(&tmp, m)?;
-    }
-    std::fs::rename(&tmp, path)
-}
-
 /// A line diff: each line with ` `, `-` or `+`, the shortest edit by LCS; files over 2000
 /// lines are shown as all removed then all added.
 #[allow(clippy::many_single_char_names)] // the textbook LCS names
@@ -454,7 +434,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o640)).unwrap();
         }
-        write_atomic(&p, "new").unwrap();
+        crate::atomic::write_keeping_mode(&p, b"new").unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "new");
         #[cfg(unix)]
         {
@@ -464,6 +444,11 @@ mod tests {
                 0o640
             );
         }
-        assert!(!d.path().join(".checks.toml.iohr-new").exists());
+        let left: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n != "checks.toml")
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 }

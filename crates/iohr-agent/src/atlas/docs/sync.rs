@@ -8,7 +8,6 @@
 //! store.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use chrono::TimeDelta;
@@ -147,19 +146,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent() {
         make_private_dir(dir)?;
     }
-    let tmp = path.with_extension("tmp");
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(&tmp).map_err(|e| Error::io(&tmp, e))?;
-    f.write_all(bytes).map_err(|e| Error::io(&tmp, e))?;
-    f.sync_all().map_err(|e| Error::io(&tmp, e))?;
-    drop(f);
-    std::fs::rename(&tmp, path).map_err(|e| Error::io(path, e))
+    crate::atomic::write(path, bytes).map_err(|e| Error::io(path, e))
 }
 
 fn remove_if_present(path: &Path) -> Result<()> {

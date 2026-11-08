@@ -26,7 +26,7 @@ mod tests;
 pub mod tokens;
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,7 +39,7 @@ pub use server::{Door, serve_on};
 
 use crate::error::{Error, Result};
 use store::Store;
-use tokens::{Tokens, random_urlsafe};
+use tokens::Tokens;
 
 /// Sent upstream; the platform's edge refuses the default client string.
 pub const USER_AGENT: &str = "iohr-mcp-door/1";
@@ -276,29 +276,6 @@ pub(crate) fn out(line: &str) {
     let _ = writeln!(std::io::stdout().lock(), "{line}");
 }
 
-/// Writes a state file atomically, owner-only.
-///
-/// # Errors
-/// The folder or file could not be written.
-pub fn write_state(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("tmp");
-    let mut o = std::fs::OpenOptions::new();
-    o.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        o.mode(0o600);
-    }
-    let mut f = o.open(&tmp)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    std::fs::rename(&tmp, path)
-}
-
 /// Tells the person something, best effort.
 #[derive(Debug)]
 pub struct Notifier {
@@ -339,7 +316,7 @@ async fn local_secret(
     if !create {
         return Ok(None);
     }
-    let s = Zeroizing::new(random_urlsafe(32));
+    let s = Zeroizing::new(crate::random::urlsafe(32));
     store.set(item, &s).await?;
     Ok(Some(s))
 }

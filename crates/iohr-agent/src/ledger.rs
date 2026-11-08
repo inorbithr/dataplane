@@ -514,18 +514,8 @@ fn read_anchor(dir: &Path) -> Option<Anchor> {
 
 fn write_anchor(dir: &Path, a: &Anchor) -> Result<()> {
     let path = dir.join("anchor.json");
-    let tmp = dir.join("anchor.json.tmp");
-    let mut o = OpenOptions::new();
-    o.create(true).write(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        o.mode(0o600);
-    }
-    let mut f = o.open(&tmp).map_err(|e| Error::io(&tmp, e))?;
-    f.write_all(&serde_json::to_vec(a).unwrap_or_default())
-        .map_err(|e| Error::io(&tmp, e))?;
-    std::fs::rename(&tmp, &path).map_err(|e| Error::io(&path, e))
+    crate::atomic::write(&path, &serde_json::to_vec(a).unwrap_or_default())
+        .map_err(|e| Error::io(&path, e))
 }
 
 /// What `ledger verify` found.

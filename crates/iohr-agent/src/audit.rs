@@ -67,13 +67,7 @@ impl Entry {
     }
 }
 
-fn hex(b: &[u8]) -> String {
-    b.iter().fold(String::with_capacity(64), |mut s, x| {
-        use std::fmt::Write as _;
-        let _ = write!(s, "{x:02x}");
-        s
-    })
-}
+use crate::random::to_hex as hex;
 
 /// What a caller records.
 #[derive(Debug, Clone, Default)]
