@@ -52,6 +52,10 @@ pub struct SetPolicy {
     /// plus the timeout.
     #[serde(default)]
     pub max_age_secs: Option<u64>,
+    /// More names passed on from the agent's environment besides the base set
+    /// ([`crate::child_env::BASE`]); everything else is cleared.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<String>,
 }
 
 fn default_results() -> PathBuf {
@@ -103,6 +107,16 @@ impl SetPolicy {
         }
         if self.max_age_secs.is_some_and(|m| m < self.every_secs) {
             return Err("max_age_secs must be at least every_secs".into());
+        }
+        if self.env.len() > 32
+            || self.env.iter().any(|n| {
+                n.is_empty()
+                    || n.len() > 64
+                    || !n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                    || crate::child_env::reserved(n)
+            })
+        {
+            return Err("env must list at most 32 variable names, none of the agent's own".into());
         }
         Ok(())
     }
@@ -281,6 +295,12 @@ async fn run_once(set: &SetPolicy) -> Ended {
     use tokio::process::Command;
     let started = std::time::SystemTime::now();
     let mut cmd = Command::new(&set.command[0]);
+    let pass: Vec<&str> = crate::child_env::BASE
+        .iter()
+        .copied()
+        .chain(set.env.iter().map(String::as_str))
+        .collect();
+    crate::child_env::isolate_tokio(&mut cmd, &pass, std::iter::empty::<(&str, &str)>());
     cmd.args(&set.command[1..])
         .current_dir(&set.dir)
         .stdin(std::process::Stdio::null())
@@ -383,6 +403,7 @@ mod tests {
             every_secs: 60,
             timeout_secs: 10,
             max_age_secs: None,
+            env: Vec::new(),
         }
     }
 
@@ -509,6 +530,53 @@ mod tests {
         let mut p = ExamplesPolicy::default();
         p.0.insert("bad key".into(), good);
         assert!(p.validate().is_err());
+    }
+
+    /// Run in a child the test below starts with the agent's credentials set.
+    #[tokio::test]
+    async fn probe_examples_child_env() {
+        let Some(dir) = std::env::var_os("IOHR_EXAMPLES_ENV_PROBE") else {
+            return;
+        };
+        let mut s = set(Path::new(&dir), &["sh", "-c", "env > seen.txt"]);
+        s.env = vec!["IOHR_EXAMPLES_EXTRA".into()];
+        let _ = run_once(&s).await;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_examples_command_never_sees_the_agent_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["examples::tests::probe_examples_child_env", "--exact"])
+            .env("IOHR_EXAMPLES_ENV_PROBE", dir.path())
+            .env("IOHR_AGENT_ENROLLMENT_TOKEN", "sentinel-enrol")
+            .env("VAULT_TOKEN", "sentinel-vault")
+            .env("IOHR_EXAMPLES_EXTRA", "listed")
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let seen = std::fs::read_to_string(dir.path().join("seen.txt")).unwrap();
+        assert!(seen.contains("PATH="), "{seen}");
+        assert!(seen.contains("IOHR_EXAMPLES_EXTRA=listed"), "{seen}");
+        assert!(!seen.contains("sentinel"), "{seen}");
+        assert!(
+            !seen.contains("VAULT_TOKEN") && !seen.contains("IOHR_AGENT_"),
+            "{seen}"
+        );
+    }
+
+    #[test]
+    fn a_set_may_not_pass_the_agent_own_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = set(dir.path(), &["true"]);
+        s.env = vec!["GOPATH".into()];
+        assert!(s.validate().is_ok());
+        for bad in ["VAULT_TOKEN", "IOHR_AGENT_ENROLLMENT_TOKEN", "A=B", ""] {
+            s.env = vec![bad.into()];
+            assert!(s.validate().is_err(), "{bad}");
+        }
     }
 
     #[tokio::test]

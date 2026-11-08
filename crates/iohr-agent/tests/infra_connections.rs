@@ -582,6 +582,21 @@ async fn helm_oci_charts_come_only_from_listed_registries() {
 }
 
 #[tokio::test]
+async fn helm_release_values_are_read_only_where_the_connection_allows_them() {
+    let e = env(Kind::Helm, "echo values; exit 0");
+    for argv in ["get values web -n shop", "get values web -n shop --all"] {
+        let r = e.runner.run("a", &s(argv), None).await;
+        assert!(matches!(r, Err(InfraError::Refused(_))), "{argv}: {r:?}");
+    }
+    let e = env_with(Kind::Helm, "echo values; exit 0", |c| c.helm_values = true);
+    let r = e
+        .runner
+        .run("a", &s("get values web -n shop --all"), None)
+        .await;
+    assert!(!matches!(r, Err(InfraError::Refused(_))), "{r:?}");
+}
+
+#[tokio::test]
 async fn a_secret_manifest_is_never_planned_in_any_spelling_and_the_audit_names_it() {
     let e = env(Kind::Kubectl, KUBECTL);
     let list = r#"{"apiVersion":"v1","kind":"List","items":[{"kind":"Secret","metadata":{"namespace":"shop"},"data":{"a":"Yg=="}}]}"#;

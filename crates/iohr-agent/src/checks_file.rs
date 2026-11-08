@@ -1445,17 +1445,18 @@ fn policy_refusal(c: &DeclaredCheck, policy: &Policy) -> Refusal {
         }
         return Refusal::Allowed;
     }
-    if let Some(r) = c.auth()
-        && !policy.secret_allowed(r)
-    {
-        return Refusal::Refused(format!(
-            "the secret reference {r} is not in [secrets] allow"
-        ));
-    }
     let e = match c.spec.endpoint() {
         Ok(e) => e,
         Err(e) => return Refusal::Refused(e),
     };
+    if let Some(r) = c.auth()
+        && !policy.secret_allowed(r, &e.host)
+    {
+        return Refusal::Refused(format!(
+            "the secret reference {r} is not in [secrets] allow for {}",
+            e.host
+        ));
+    }
     let bare = e.host.trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = bare.parse::<IpAddr>() {
         return match policy.check_ip(ip) {

@@ -169,6 +169,7 @@ timeout_secs = 1800
 | `every_secs` | `3600` | 60 to 86400. Seconds between runs; a set never overlaps itself. |
 | `timeout_secs` | `1800` | 10 to 7200. The run is killed past this. |
 | `max_age_secs` | `2 x every_secs + timeout_secs` | At least `every_secs`. A newest run older than this reads `run/stale`. |
+| `env` | `[]` | More variable names passed on from the agent's environment. The command starts from an empty environment plus `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`, `TMPDIR` and `TERM`; names starting `IOHR_AGENT_` or `VAULT_` are refused. |
 
 The set key is a lowercase slug. Nothing from the command's output leaves the machine.
 
@@ -185,6 +186,23 @@ The set key is a lowercase slug. Nothing from the command's output leaves the ma
 | Key | Default | Meaning |
 |---|---|---|
 | `allow` | `[]` | Secret references a job may name: exact, or a prefix ending in `*`. Empty means no job may use a secret. |
+| `hosts` | `{}` | Optional table binding a reference (exact or prefix ending in `*`) to the only hosts its value may be sent to. |
+
+A reference under `[secrets.hosts]` is sent only to the hosts listed for it; the longest
+matching key wins. Hosts are exact names, IP addresses, or `*.suffix`. A reference with no
+matching key may go to any host the rest of the policy allows, as before, so an existing
+policy keeps working unchanged:
+
+```toml
+[secrets]
+allow = ["k8s:observability/*", "env:STATUS_TOKEN"]
+
+[secrets.hosts]
+"k8s:observability/*" = ["grafana.observability.svc.cluster.local"]
+"env:STATUS_TOKEN" = ["*.status.example.com"]
+```
+
+An empty host list is refused when the policy loads.
 
 References are resolved on the agent at the moment of the call and dropped after:
 
@@ -304,7 +322,7 @@ max_bytes = 1048576                       # the largest answer read, 1 KiB to 8 
 [[actions.sensors]]
 name = "api-error-rate"
 template = "error-rate"                   # the connection's saved query template
-base_url = "http://grafana.observability.svc.cluster.local:3000"
+base_url = "https://grafana.observability.svc.cluster.local:3000"
 auth = "k8s:observability/grafana-inorbit-sa#token"
 datasource_uid = "victoriametrics"
 expr = "sum(rate(http_requests_total{code=~\"5..\"}[5m]))"
@@ -324,12 +342,13 @@ connected:
   this job and the account this agent enrolled in (always; `account_id`, when set, must be
   the same), was issued no more than 60 s ahead of this clock,
   lives at most 600 s and has not expired; a job id runs once;
-- the method is `GET`, the base URL is `http(s)://host[:port]` (no trailing dot) with its host in `hosts`
+- the method is `GET`, the base URL is `https://host[:port]` (plain `http` only to a loopback address, so the token never travels in clear; no trailing dot) with its host in `hosts`
   (and allowed by `[networks]`), and the path is one of the connector's fixed routes:
   `/api/search`, `/api/dashboards/uid/<uid>`, `/api/datasources`, and
   `/api/datasources/proxy/uid/<uid>/api/v1/query_range` with a range of at most 7 days,
   a step of at least 15 s and at most 1000 points, the datasource in `datasources` (an empty list allows no query);
-- the token is a secret reference in `[secrets] allow`.
+- the token is a secret reference in `[secrets] allow`, and `[secrets.hosts]`, when it binds that
+  reference, lists the host.
 
 The address is resolved once and pinned (no second lookup), no proxy is used, redirects
 are never followed (a 3xx is a failed job of class `status`), the answer is read up to
