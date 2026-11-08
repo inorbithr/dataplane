@@ -199,9 +199,8 @@ async fn connection(mut sock: TcpStream, door: &Door, hosts: &[String]) {
     // Every request, `/status` too, must come from this machine's own clients: no
     // Origin and the door's Host (a page on a rebinding name fails here). A POST also
     // needs the local secret.
-    let gate = |req: &Request| {
-        local(req, hosts) && (req.method != "POST" || authorised(req, door, hosts))
-    };
+    let gate =
+        |req: &Request| local(req, hosts) && (req.method != "POST" || authorised(req, door, hosts));
     let reply = match read_request(&mut sock, &gate).await {
         Err(code) => plain(code, &serde_json::json!({"error": "bad request"})),
         Ok(req) => route(&req, door, hosts).await,
