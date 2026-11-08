@@ -68,6 +68,16 @@ struct Ran {
 /// Crawls a site `routes` describes (it is given the site's origin, whose port is known
 /// only once the server is up) and keeps every progress line.
 async fn run(routes: impl FnOnce(&str) -> Routes, per_minute: u32, pages: usize) -> Ran {
+    run_keeping(routes, per_minute, pages, None).await
+}
+
+/// [`run`], keeping the pages under `keep` when it is given.
+async fn run_keeping(
+    routes: impl FnOnce(&str) -> Routes,
+    per_minute: u32,
+    pages: usize,
+    keep: Option<std::path::PathBuf>,
+) -> Ran {
     let log: Log = Arc::default();
     let server = MockServer::start().await;
     let origin = format!("http://localhost:{}", server.address().port());
@@ -87,6 +97,7 @@ async fn run(routes: impl FnOnce(&str) -> Routes, per_minute: u32, pages: usize)
         render: Render::Off,
         state: None,
         per_minute,
+        keep_pages: keep,
     };
     let policy =
         Policy::from_toml("environment = \"staging\"\n[networks]\nallow = [\"127.0.0.1/32\"]\n")
@@ -554,4 +565,36 @@ fn a_rate_out_of_range_is_refused() {
         assert!(c.stderr.contains("--rate"), "{}", c.stderr);
     }
     assert!(log.lock().unwrap().is_empty(), "nothing was requested");
+}
+
+#[tokio::test]
+async fn kept_pages_are_the_html_read_under_a_name_from_the_url() {
+    let dir = tempfile::tempdir().unwrap();
+    let ran = run_keeping(
+        |_| linked_site(2, robots("")),
+        60_000,
+        10,
+        Some(dir.path().to_path_buf()),
+    )
+    .await;
+    let html_pages: Vec<&str> = ran
+        .result
+        .pages
+        .iter()
+        .filter(|p| p.status == 200)
+        .map(|p| p.url.as_str())
+        .collect();
+    assert_eq!(html_pages.len(), 3, "the start page and two linked pages");
+    for url in html_pages {
+        let file = dir.path().join("pages").join(format!(
+            "{}.html",
+            iohr_agent::atlas::docs::crawl::kept_name(url)
+        ));
+        let body = std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("{url}: {e}"));
+        assert!(body.contains("Enough words here"), "{url}");
+    }
+    assert_eq!(
+        iohr_agent::atlas::docs::crawl::kept_name("https://a.test/").len(),
+        16
+    );
 }

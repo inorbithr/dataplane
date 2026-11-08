@@ -164,6 +164,28 @@ pub struct CrawlConfig {
     /// 600 a minute, by default). A longer robots.txt `Crawl-delay` lowers it for its host.
     /// Not bounded here: only tests against a local fixture go past [`MAX_RATE`].
     pub per_minute: u32,
+    /// A folder to keep the pages in: every HTML page that was read is written to
+    /// `<folder>/pages/<name>.html`, where `<name>` is the first 16 hex digits of the SHA-256
+    /// of the page's URL as the result lists it ([`kept_name`]). A page the browser fallback
+    /// rendered is kept as the browser's DOM, the page as a person sees it; any other as the
+    /// server sent it, which for a page built by script can be an empty shell. Nothing is
+    /// kept when this is `None`.
+    pub keep_pages: Option<PathBuf>,
+}
+
+/// The file name (without `.html`) under which a page's HTML is kept: the first 16 hex
+/// digits of the SHA-256 of its URL.
+#[must_use]
+pub fn kept_name(url: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    Sha256::digest(url.as_bytes())
+        .iter()
+        .take(8)
+        .fold(String::with_capacity(16), |mut s, b| {
+            use std::fmt::Write as _;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 /// One page request.
@@ -416,6 +438,7 @@ struct Crawler<'a> {
     budgets: Budgets,
     per_minute: u32,
     browser: Option<PathBuf>,
+    keep_pages: Option<PathBuf>,
     scope: String,
     clients: HashMap<String, Arc<ApiClient>>,
     robots: HashMap<String, Robots>,
@@ -485,6 +508,7 @@ pub async fn crawl_reporting(
         budgets,
         per_minute: cfg.per_minute.max(1),
         browser,
+        keep_pages: cfg.keep_pages.clone(),
         scope: registrable(host),
         clients: HashMap::new(),
         robots: HashMap::new(),
@@ -953,6 +977,7 @@ impl Crawler<'_> {
 
     async fn read_html(&mut self, u: &Url, text: &str, q: &Queued, rec: &mut PageRecord) {
         let mut o = html::outline(text, u);
+        let mut kept: Option<String> = None;
         if o.text_chars < EMPTY_TEXT
             && o.links.is_empty()
             && let Some(browser) = self.browser.clone()
@@ -975,9 +1000,12 @@ impl Crawler<'_> {
                     self.result.used.bytes += dom.len() as u64;
                     o = html::outline(&dom, u);
                     rec.rendered = true;
+                    kept = Some(dom);
                 }
             }
         }
+        self.keep_page(&rec.url, kept.as_deref().unwrap_or(text))
+            .await;
         rec.title = o.title;
         rec.canonical = o
             .canonical
@@ -1006,6 +1034,18 @@ impl Crawler<'_> {
             } else {
                 self.note_link(&link, u.as_str(), !follow);
             }
+        }
+    }
+
+    /// Writes one page's HTML where `keep_pages` says. A page that cannot be written is
+    /// left out: the crawl's own record stands, and the caller falls back to reading it.
+    async fn keep_page(&self, url: &str, html: &str) {
+        let Some(dir) = &self.keep_pages else {
+            return;
+        };
+        let dir = dir.join("pages");
+        if tokio::fs::create_dir_all(&dir).await.is_ok() {
+            let _ = tokio::fs::write(dir.join(format!("{}.html", kept_name(url))), html).await;
         }
     }
 

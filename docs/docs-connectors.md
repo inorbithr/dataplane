@@ -299,6 +299,15 @@ The text summary still follows on standard error at the end. An agent without `-
 `--progress` (before this change) refuses them as unknown flags; a caller probes
 `atlas crawl --help` for them.
 
+**Keep the pages.** With `--keep-pages` (needs `--out`) the crawl writes the HTML it read
+for each page to `pages/<name>.html` beside the `--out` file, so a caller that wants the
+text (`iohr init --crawl` builds its local knowledge base from it) does not fetch every page a
+second time. `<name>` is the first 16 hex characters of the SHA-256 of the page's URL as the
+record gives it; a redirect is its own record with `redirected_to`, and the target has its
+own file. A page the render fallback read is kept as the rendered DOM. The files stay on
+this machine, are not part of `crawl.json`, and a caller probes `atlas crawl --help` for
+`--keep-pages`.
+
 **Render fallback.** A page whose static HTML has no readable text (under 40
 non-space characters) and no links is loaded once in a local Chrome or Chromium
 (`--headless --dump-dom`), and the printed DOM is read instead. No browser library is

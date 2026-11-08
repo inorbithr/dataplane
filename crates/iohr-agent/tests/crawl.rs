@@ -186,6 +186,7 @@ fn config(site: &Site, dir: &std::path::Path, budgets: Budgets) -> CrawlConfig {
         render: Render::Auto(Some(fake_browser(dir))),
         state: Some(dir.join("state.json")),
         per_minute: 60_000,
+        keep_pages: None,
     }
 }
 
