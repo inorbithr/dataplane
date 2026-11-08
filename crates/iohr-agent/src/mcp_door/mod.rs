@@ -180,8 +180,15 @@ impl DoorArgs {
     /// The effective configuration.
     ///
     /// # Errors
-    /// No home directory to default the state folder from.
+    /// A listen address off the loopback, or no home directory to default the state
+    /// folder from.
     pub fn config(&self) -> Result<DoorConfig> {
+        if !self.listen.ip().is_loopback() {
+            return Err(Error::Config(format!(
+                "--listen {} is not a loopback address; the door serves this machine only",
+                self.listen
+            )));
+        }
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let state_dir = match (&self.state_dir, &home) {
             (Some(d), _) => d.clone(),

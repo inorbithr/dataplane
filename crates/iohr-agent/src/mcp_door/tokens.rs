@@ -423,7 +423,7 @@ impl Tokens {
     }
 
     /// Answers one request on the redirect port; true when the sign-in is over.
-    async fn one_callback(
+    pub(super) async fn one_callback(
         &self,
         sock: &mut tokio::net::TcpStream,
         verifier: &str,
@@ -453,10 +453,13 @@ impl Tokens {
                 .map(|u| u.query_pairs().into_owned().collect())
                 .unwrap_or_default();
         let (mut ok, mut msg) = (false, "Sign-in failed.");
-        let errored = q.contains_key("error");
-        if q.get("state").is_some_and(|s| s == state)
-            && let Some(code) = q.get("code")
-        {
+        // Only the redirect for this sign-in, carrying its state, may end it: any other
+        // local request on the port is answered and the wait goes on.
+        let state_ok = q
+            .get("state")
+            .is_some_and(|s| crate::admin::constant_time_eq(s.as_bytes(), state.as_bytes()));
+        let errored = state_ok && q.contains_key("error");
+        if state_ok && let Some(code) = q.get("code") {
             let redirect = self.cfg.redirect();
             let form = [
                 ("grant_type", "authorization_code"),

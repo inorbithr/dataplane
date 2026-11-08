@@ -317,6 +317,51 @@ async fn status_has_no_secret_and_no_token() {
 }
 
 #[tokio::test]
+async fn status_answers_only_the_doors_own_host_and_no_page() {
+    let r = rig().await;
+    let get = |host: String, origin: Option<&'static str>| {
+        let mut q = r
+            .http
+            .get(format!("http://{}/status", r.door))
+            .header("host", host);
+        if let Some(o) = origin {
+            q = q.header("origin", o);
+        }
+        q.send()
+    };
+    let port = r.door.port();
+    let own = get(format!("localhost:{port}"), None).await.unwrap();
+    assert_eq!(own.status().as_u16(), 200);
+    let rebound = get(format!("door.example.com:{port}"), None).await.unwrap();
+    assert_eq!(rebound.status().as_u16(), 403);
+    let page = get(format!("127.0.0.1:{port}"), Some("http://example.com"))
+        .await
+        .unwrap();
+    assert_eq!(page.status().as_u16(), 403);
+}
+
+#[test]
+fn the_door_listens_on_loopback_only() {
+    #[derive(clap::Parser)]
+    struct Cli {
+        #[command(flatten)]
+        door: super::DoorArgs,
+    }
+    let parse = |listen: &str| {
+        <Cli as clap::Parser>::try_parse_from(["door", "--listen", listen, "--state-dir", "/x"])
+            .unwrap()
+            .door
+            .config()
+    };
+    assert!(parse("127.0.0.1:47821").is_ok());
+    assert!(parse("[::1]:47821").is_ok());
+    for wide in ["0.0.0.0:47821", "[::]:47821", "192.0.2.10:47821"] {
+        let e = parse(wide).unwrap_err().to_string();
+        assert!(e.contains("loopback"), "{wide}: {e}");
+    }
+}
+
+#[tokio::test]
 async fn a_dns_miss_falls_back_to_the_last_good_address() {
     let dir = tempfile::tempdir().unwrap();
     let up = Arc::new(Mutex::new(true));
@@ -381,9 +426,8 @@ async fn fake_metadata(
     addr
 }
 
-async fn login_scope(meta: SocketAddr) -> Vec<String> {
+async fn login_tokens(meta: SocketAddr, dir: &tempfile::TempDir) -> Arc<Tokens> {
     crate::tls::install_crypto_provider();
-    let dir = tempfile::tempdir().unwrap();
     let cfg = Arc::new(DoorConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
         upstream: format!("http://{meta}/mcp"),
@@ -400,7 +444,7 @@ async fn login_scope(meta: SocketAddr) -> Vec<String> {
         secret_item: "s".into(),
     });
     let http = http_client(&cfg).unwrap();
-    let tokens = Arc::new(
+    Arc::new(
         Tokens::load(
             cfg,
             Arc::new(Store::memory()),
@@ -408,7 +452,12 @@ async fn login_scope(meta: SocketAddr) -> Vec<String> {
             Arc::new(Notifier::new(None)),
         )
         .await,
-    );
+    )
+}
+
+async fn login_scope(meta: SocketAddr) -> Vec<String> {
+    let dir = tempfile::tempdir().unwrap();
+    let tokens = login_tokens(meta, &dir).await;
     let url = url::Url::parse(&tokens.start_login().await).unwrap();
     let scope = url
         .query_pairs()
@@ -416,6 +465,52 @@ async fn login_scope(meta: SocketAddr) -> Vec<String> {
         .map(|(_, v)| v.into_owned())
         .unwrap();
     scope.split(' ').map(String::from).collect()
+}
+
+/// Sends one request line to the sign-in callback and returns (over, status line).
+async fn callback(tokens: &Tokens, target: &str, state: &str) -> (bool, String) {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let req = format!("GET {target} HTTP/1.1\r\nHost: {addr}\r\n\r\n");
+    let client = tokio::spawn(async move {
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        c.write_all(req.as_bytes()).await.unwrap();
+        let mut out = String::new();
+        c.read_to_string(&mut out).await.unwrap();
+        out.lines().next().unwrap_or_default().to_owned()
+    });
+    let (mut sock, _) = l.accept().await.unwrap();
+    let over = tokens.one_callback(&mut sock, "verifier", state).await;
+    drop(sock);
+    (over, client.await.unwrap())
+}
+
+#[tokio::test]
+async fn only_the_matching_state_may_end_a_sign_in() {
+    let meta = fake_metadata(&["mcp:read"], &["mcp:read"]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let tokens = login_tokens(meta, &dir).await;
+    let state = "the-state-of-this-sign-in";
+    // A local page that sends an error without the state, or with another state, is
+    // answered but does not end the wait.
+    for target in [
+        "/callback?error=access_denied",
+        "/callback?error=access_denied&state=another",
+        "/callback?error=access_denied&state=the-state-of-this-sign-iX",
+        "/callback?code=c&state=another",
+    ] {
+        let (over, status) = callback(&tokens, target, state).await;
+        assert!(!over, "{target} ended the sign-in");
+        assert!(status.contains(" 400 "), "{target}: {status}");
+    }
+    // The provider's own error redirect, with the state, ends it.
+    let (over, _) = callback(
+        &tokens,
+        &format!("/callback?error=access_denied&state={state}"),
+        state,
+    )
+    .await;
+    assert!(over);
 }
 
 #[tokio::test]
