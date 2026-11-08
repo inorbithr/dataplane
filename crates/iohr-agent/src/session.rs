@@ -397,6 +397,12 @@ async fn once(agent: &Arc<Agent>, shutdown: &mut watch::Receiver<bool>) -> Resul
                 let Some(msg) = msg else { return Ok(SessionEnd::Closed) };
                 match msg.map_err(|e| Error::Session(e.to_string()))? {
                     Message::Text(t) => match serde_json::from_str::<ServerFrame>(t.as_str()) {
+                        Ok(ServerFrame::Job(job)) if running.contains_key(&job.job_id) => {
+                            // The running one keeps its handle, so a cancel still reaches it;
+                            // its result answers for both.
+                            agent.state.job_received();
+                            tracing::warn!(job_id = %job.job_id, "a job with this id is already running; the repeat is ignored");
+                        }
                         Ok(ServerFrame::Job(job)) => {
                             agent.state.job_received();
                             match agent.executor.admit(&job) {

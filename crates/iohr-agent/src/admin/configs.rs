@@ -293,20 +293,42 @@ pub(super) fn read(path: &Path) -> std::io::Result<String> {
     }
 }
 
-/// A line diff: each line with ` `, `-` or `+`, the shortest edit by LCS; files over 2000
-/// lines are shown as all removed then all added.
+/// The most cells the LCS table may have: past it the changed middle is shown as all
+/// removed then all added, so a page view never costs more than this much work.
+const DIFF_CELLS: usize = 250_000;
+
+/// A line diff: each line with ` `, `-` or `+`. Lines the two texts share at the start and
+/// the end are kept as they are; the middle is the shortest edit by LCS, or all removed then
+/// all added when it is larger than [`DIFF_CELLS`].
 #[allow(clippy::many_single_char_names)] // the textbook LCS names
 pub(super) fn diff(old: &str, new: &str) -> Vec<(char, String)> {
     let a: Vec<&str> = old.lines().collect();
     let b: Vec<&str> = new.lines().collect();
-    if a.len() > 2000 || b.len() > 2000 {
+    let head = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let tail = a[head..]
+        .iter()
+        .rev()
+        .zip(b[head..].iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    let same = |l: &&str| (' ', (*l).to_owned());
+    let mut out: Vec<(char, String)> = a[..head].iter().map(same).collect();
+    let (a_mid, b_mid) = (&a[head..a.len() - tail], &b[head..b.len() - tail]);
+    out.extend(middle(a_mid, b_mid));
+    out.extend(a[a.len() - tail..].iter().map(same));
+    out
+}
+
+#[allow(clippy::many_single_char_names)] // the textbook LCS names
+fn middle(a: &[&str], b: &[&str]) -> Vec<(char, String)> {
+    let (n, m) = (a.len(), b.len());
+    if n.saturating_mul(m) > DIFF_CELLS {
         return a
             .iter()
             .map(|l| ('-', (*l).to_owned()))
             .chain(b.iter().map(|l| ('+', (*l).to_owned())))
             .collect();
     }
-    let (n, m) = (a.len(), b.len());
     let mut lcs = vec![vec![0u16; m + 1]; n + 1];
     for i in (0..n).rev() {
         for j in (0..m).rev() {
@@ -422,6 +444,32 @@ mod tests {
         let j = diff_json("a\n", "a\nb\n");
         assert_eq!(j["added"], 1);
         assert_eq!(j["removed"], 0);
+    }
+
+    #[test]
+    fn a_large_diff_keeps_the_shared_lines_and_stays_cheap() {
+        let lines = |tag: &str, n: usize| -> String {
+            (0..n).map(|i| format!("{tag}{i}\n")).collect::<String>()
+        };
+        // 3000 changed lines on each side: past the LCS budget, so the middle is shown
+        // as removed then added, between the untouched first and last lines.
+        let old = format!("top\n{}end\n", lines("a", 3000));
+        let new = format!("top\n{}end\n", lines("b", 3000));
+        let d = diff(&old, &new);
+        assert_eq!(d.len(), 6002);
+        assert_eq!(d[0], (' ', "top".to_owned()));
+        assert_eq!(d[1].0, '-');
+        assert_eq!(d[3001].0, '+');
+        assert_eq!(d[6001], (' ', "end".to_owned()));
+        // A small edit inside a long file is still exact.
+        let big = lines("l", 5000);
+        let edited = big.replacen("l2500\n", "changed\n", 1);
+        let ops: String = diff(&big, &edited)
+            .iter()
+            .filter(|(o, _)| *o != ' ')
+            .map(|(o, _)| *o)
+            .collect();
+        assert_eq!(ops, "-+");
     }
 
     #[test]
