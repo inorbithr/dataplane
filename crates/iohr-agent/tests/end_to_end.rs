@@ -256,6 +256,29 @@ async fn policy_refusals_reach_the_platform() {
 }
 
 #[tokio::test]
+async fn a_secret_bound_to_other_hosts_is_refused() {
+    let mut h = harness_with(
+        KeyAlg::Es256,
+        "[secrets.hosts]\n\"file:*\" = [\"db.internal\"]\n",
+    )
+    .await;
+    let (_agent, stop, task) = start(&h).await;
+    next(&mut h.frames, "hello").await;
+    let web = http_target().await;
+    let secret_ref = format!(
+        "file:{}",
+        h.cfg.policy.with_file_name("check-token").display()
+    );
+    h.cmds.send(job("r-bound", "check", json!({"surface": "http", "target": {"url": format!("http://{web}/private")}, "auth": {"scheme": "Bearer", "secret": secret_ref}}))).ok();
+    let r = results(&mut h.frames, 1).await;
+    assert_eq!(r["r-bound"]["status"], "refused", "{}", r["r-bound"]);
+    let reason = r["r-bound"]["refusal"]["reason"].as_str().unwrap();
+    assert!(reason.contains("[secrets] allow for 127.0.0.1"), "{reason}");
+    stop.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn reconnects_and_stops_work_when_disconnected() {
     let mut h = harness(KeyAlg::Es256).await;
     let (agent, stop, task) = start(&h).await;

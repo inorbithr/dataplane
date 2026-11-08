@@ -1,5 +1,5 @@
 {{- if .Values.networkPolicy.enabled }}
-# Nothing may connect to the agent; it may reach DNS and the listed CIDRs only.
+# Nothing may connect to the agent; it may reach the cluster DNS pods and the listed CIDRs only.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -13,7 +13,14 @@ spec:
   policyTypes: ["Ingress", "Egress"]
   ingress: []
   egress:
-    - ports:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.dns.namespace }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.dns.podLabels | nindent 14 }}
+      ports:
         - { protocol: UDP, port: 53 }
         - { protocol: TCP, port: 53 }
     {{- range .Values.networkPolicy.egressCIDRs }}

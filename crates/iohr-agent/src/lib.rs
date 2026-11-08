@@ -13,6 +13,7 @@ pub mod audit;
 pub mod capture;
 pub mod checks;
 pub mod checks_file;
+pub mod child_env;
 pub mod cli;
 pub mod config;
 pub mod enroll;
