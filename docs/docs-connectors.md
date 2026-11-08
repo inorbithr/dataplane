@@ -62,8 +62,9 @@ cannot be.
 
 One client serves every provider. It spaces requests to the provider's published limit
 (`requests_per_minute` lowers it). It retries 429 and 5xx answers and network failures up
-to five times, with jittered exponential backoff from 0.5 s to 60 s, and honours
-`Retry-After` (a longer wait ends the run as incomplete). It does not follow redirects,
+to five times (a 429 or a 503 also halves the client's pace, for good), with jittered
+exponential backoff from 0.5 s to 60 s, and honours `Retry-After` (a longer wait ends the
+run as incomplete). It does not follow redirects,
 never leaves the source's origin, caps an answer at 16 MiB and times a request out after
 30 s.
 
@@ -272,10 +273,11 @@ Media links (images, video, audio, fonts, archives) are counted and never fetche
 marked `rel="nofollow"` is recorded and not followed. Query strings used for tracking (`utm_*`, `gclid`,
 `fbclid`) and fragments are dropped before a URL is compared.
 
-**Politeness.** One request at a time per host, at most `--rate` a second: 10 by default,
-1 to 50 (the ceiling: one agent asking one host for one page at a time is already more than
-a site's own search crawlers are usually let take). robots.txt `Crawl-delay` wins whenever it
-is slower, per host, and never speeds a crawl up. A 429 or 503 backs off and retries.
+**Politeness.** One request at a time per host, at most `--rate` a second: 10 by default
+(the owner's choice, 2026-11-08), 1 to 50 (the ceiling of 50 is a judgement, not a measured
+limit). robots.txt `Crawl-delay` wins whenever it is slower, per host, and never speeds a
+crawl up. A 429 or 503 backs off, retries and halves that host's pace for the rest of the
+crawl (it is never raised again, and never goes under one request a minute).
 Before 2026-11-08 the pace was fixed at one a second.
 
 **Progress.** With `--progress` the crawl writes one JSON object per line to standard

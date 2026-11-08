@@ -43,11 +43,10 @@ use scope::{LinkClass, classify, in_scope, is_media, key, registrable};
 pub const DEFAULT_RATE: u32 = 10;
 /// The slowest `--rate`: one request a second.
 pub const MIN_RATE: u32 = 1;
-/// The fastest `--rate`. A crawl asks one host for one page at a time, so this is the
-/// most one agent can put on a site, and 50 a second is already more than a site's
-/// own search engine crawlers are usually let take; past it the crawl is
-/// indistinguishable from a flood and many WAFs would block it. A hard ceiling, not a
-/// target: robots.txt `Crawl-delay` still wins whenever it is slower.
+/// The fastest `--rate`. A judgement, not a measured limit: a crawl asks one host for one
+/// page at a time, and 50 a second is the most the agent will put on a site. A hard
+/// ceiling, not a target: robots.txt `Crawl-delay` still wins whenever it is slower, and a
+/// 429 or 503 halves the pace.
 pub const MAX_RATE: u32 = 50;
 
 /// The client's pace, in requests a minute, for `per_second` requests a second per host,
