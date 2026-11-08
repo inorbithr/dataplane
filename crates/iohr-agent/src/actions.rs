@@ -494,17 +494,53 @@ pub struct Plan {
 }
 
 /// Remembers job ids until their envelope expires, so none runs twice.
-#[derive(Debug, Default)]
+///
+/// The set lives in memory, so it starts empty after a restart. An envelope issued
+/// before this process started (less the clock skew allowed) is therefore refused: it
+/// may have run before the restart and its id is no longer remembered. The platform
+/// signs a fresh envelope for a job it still wants, so the cost is one retry per job in
+/// flight across a restart; keeping the set on disk instead would add a state file that
+/// has to survive crashes and stay private.
+#[derive(Debug)]
 pub struct Replay {
     seen: Mutex<HashMap<String, i64>>,
+    started_at: i64,
+}
+
+impl Default for Replay {
+    /// Starts now.
+    fn default() -> Self {
+        Self::since(time::OffsetDateTime::now_utc().unix_timestamp())
+    }
 }
 
 impl Replay {
-    /// Records `job_id` until `expires_at`, or says it was seen.
+    /// A set that refuses envelopes issued before `started_at` (unix seconds).
+    #[must_use]
+    pub fn since(started_at: i64) -> Self {
+        Self {
+            seen: Mutex::new(HashMap::new()),
+            started_at,
+        }
+    }
+
+    /// Records `job_id` until `expires_at`, or says it was seen or is older than this
+    /// set.
     ///
     /// # Errors
-    /// Seen already, or too many live entries.
-    pub fn once(&self, job_id: &str, expires_at: i64, now: i64) -> Result<(), String> {
+    /// Seen already, issued before this set started, or too many live entries.
+    pub fn once(
+        &self,
+        job_id: &str,
+        issued_at: i64,
+        expires_at: i64,
+        now: i64,
+    ) -> Result<(), String> {
+        if issued_at < self.started_at.saturating_sub(bounds::SKEW_SECS) {
+            return Err(format!(
+                "the job {job_id} was issued before the agent started (replay refused)"
+            ));
+        }
         let mut seen = match self.seen.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
@@ -671,7 +707,7 @@ pub fn admit(
     } else {
         a.max_bytes.min(actions.max_bytes)
     };
-    replay.once(&env.job_id, env.expires_at, now)?;
+    replay.once(&env.job_id, env.issued_at, env.expires_at, now)?;
     Ok(Plan {
         connector: a.connector,
         url,
@@ -1221,7 +1257,7 @@ hosts = ["grafana.observability.svc.cluster.local", "127.0.0.1"]
     }
 
     fn try_admit(p: &Policy, job: &str, spec: &Value) -> Result<Plan, String> {
-        admit(p, "acct-1", AGENT, job, spec, &Replay::default(), NOW)
+        admit(p, "acct-1", AGENT, job, spec, &Replay::since(NOW), NOW)
     }
 
     #[test]
@@ -1311,11 +1347,27 @@ hosts = ["grafana.observability.svc.cluster.local", "127.0.0.1"]
     #[test]
     fn a_job_runs_once() {
         let p = policy("");
-        let replay = Replay::default();
+        let replay = Replay::since(NOW);
         let spec = signed_with(&signer(), &envelope("job_1", action("/api/search", &[])));
         admit(&p, "acct-1", AGENT, "job_1", &spec, &replay, NOW).unwrap();
         let e = admit(&p, "acct-1", AGENT, "job_1", &spec, &replay, NOW).unwrap_err();
         assert!(e.contains("replay"), "{e}");
+    }
+
+    #[test]
+    fn a_job_issued_before_a_restart_is_refused() {
+        let p = policy("");
+        // The envelope was issued 5 s before NOW; this process started 2 minutes after
+        // that, so its replay set never saw the job and cannot vouch for it.
+        let restarted = Replay::since(NOW + 120);
+        let mut env = envelope("job_r", action("/api/search", &[]));
+        env["expires_at"] = json!(NOW + 500);
+        let spec = signed_with(&signer(), &env);
+        let e = admit(&p, "acct-1", AGENT, "job_r", &spec, &restarted, NOW + 125).unwrap_err();
+        assert!(e.contains("before the agent started"), "{e}");
+        // Within the allowed clock skew of the start it still runs.
+        let fresh = Replay::since(NOW + 30);
+        admit(&p, "acct-1", AGENT, "job_r", &spec, &fresh, NOW + 35).unwrap();
     }
 
     #[test]
@@ -1657,7 +1709,7 @@ crit = 5.0
             AGENT,
             "j",
             &signed_with(&signer(), &env),
-            &Replay::default(),
+            &Replay::since(NOW),
             NOW,
         )
         .unwrap_err();
