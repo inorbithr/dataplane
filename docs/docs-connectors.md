@@ -272,8 +272,32 @@ Media links (images, video, audio, fonts, archives) are counted and never fetche
 marked `rel="nofollow"` is recorded and not followed. Query strings used for tracking (`utm_*`, `gclid`,
 `fbclid`) and fragments are dropped before a URL is compared.
 
-**Politeness.** At most one request a second and one connection per host. A longer
-`Crawl-delay` wins. A 429 or 503 backs off and retries.
+**Politeness.** One request at a time per host, at most `--rate` a second: 10 by default,
+1 to 50 (the ceiling: one agent asking one host for one page at a time is already more than
+a site's own search crawlers are usually let take). robots.txt `Crawl-delay` wins whenever it
+is slower, per host, and never speeds a crawl up. A 429 or 503 backs off and retries.
+Before 2026-11-08 the pace was fixed at one a second.
+
+**Progress.** With `--progress` the crawl writes one JSON object per line to standard
+error while it runs, for a caller that shows a bar (`iohr init --crawl` does). After every
+page, when a sitemap gives the total, and when the listings start and end:
+
+```json
+{"event":"progress","v":1,"scope":"acme.example","phase":"pages","read":12,"failed":1,"queued":40,"total":120,"cap":2000}
+```
+
+`read` counts pages answered without an error (redirects included), `failed` those that
+errored or returned 400 and over, `queued` the URLs waiting. `total` is what the crawl
+expects to request, at most `cap` (the `--max-pages` budget): the start page and every
+sitemap entry, never less than read, failed and queued together. It is absent until a
+sitemap has been read, absent for a site without one (only the count is known), and once
+given it stays, though it can grow as pages link to pages no sitemap lists. `phase` is
+`pages`, then `listings` once the last page is read. A line holds the scope (the
+registrable domain) and counts, never a page URL, title or text. Fields are only added;
+a reader ignores those it does not know; `v` changes if one is removed or changes meaning.
+The text summary still follows on standard error at the end. An agent without `--rate` and
+`--progress` (before this change) refuses them as unknown flags; a caller probes
+`atlas crawl --help` for them.
 
 **Render fallback.** A page whose static HTML has no readable text (under 40
 non-space characters) and no links is loaded once in a local Chrome or Chromium
@@ -293,6 +317,7 @@ a page whose scripts come from a CDN stays empty.
 | `--max-minutes` | 30 | 240 |
 | `--max-mb` | 200 MB | |
 | `--max-page-mb` | 5 MB | |
+| `--rate` | 10 a second per host | 1 to 50 |
 
 A budget stop marks the result `complete: false` and names the budget in `stopped_by`
 (exit 1). `used` reports what was spent. With `--state`, the crawl writes its frontier
@@ -319,4 +344,6 @@ before third-party ones a blog post links to.
 Tests: `tests/crawl.rs`, with two hosts of one domain played by wiremock: links, a
 subdomain, redirects in and out of scope, a robots.txt disallow, a sitemap, an OpenAPI
 document, a JavaScript-only page rendered by a stand-in browser, a budget stop and a
-resumed run.
+resumed run. `tests/crawl_rate.rs` stamps every request as it arrives: the pace at the
+rate asked, a slower `Crawl-delay` winning, the progress lines with and without a sitemap
+(and the total capped by the budget), and the real binary against a small local server.
