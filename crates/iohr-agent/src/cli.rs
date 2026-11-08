@@ -2437,7 +2437,7 @@ mod tests {
         let p = Policy::from_toml(&text).unwrap();
         assert_eq!(p.environment, "staging");
         assert_eq!(p.domains.bound, ["example.com"]);
-        assert!(p.secret_allowed("vault:kv/staging/x#y"));
+        assert!(p.secret_allowed("vault:kv/staging/x#y", "any.example"));
         assert!(text.contains("# The local policy"));
     }
 

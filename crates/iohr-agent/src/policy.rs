@@ -2,6 +2,7 @@
 //! company that runs the agent and wins over anything the platform asks for. See
 //! `docs/policy.md` for the reference.
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -287,10 +288,22 @@ impl Default for Networks {
     }
 }
 
+/// The IPv4 address inside a NAT64 well-known-prefix address (`64:ff9b::/96`, RFC 6052).
+fn nat64_embedded(ip: IpAddr) -> Option<std::net::Ipv4Addr> {
+    let IpAddr::V6(v6) = ip else { return None };
+    let s = v6.segments();
+    (s[..6] == [0x64, 0xff9b, 0, 0, 0, 0]).then(|| {
+        let o = v6.octets();
+        std::net::Ipv4Addr::new(o[12], o[13], o[14], o[15])
+    })
+}
+
 fn default_deny() -> Vec<String> {
     [
         "0.0.0.0/8",
         "169.254.0.0/16",
+        "100.100.100.200/32",
+        "168.63.129.16/32",
         "fe80::/10",
         "fd00:ec2::254/128",
         "::/128",
@@ -539,6 +552,92 @@ pub struct SecretsPolicy {
     /// no job may use a secret.
     #[serde(default)]
     pub allow: Vec<String>,
+    /// Binds a secret to the hosts it may be sent to: each key is a reference pattern like
+    /// those in `allow`, each value the host names (`*.suffix` for a domain's hosts) or
+    /// addresses that secret may go to. A reference that matches a key may be used only
+    /// against those hosts (the longest matching key wins); a reference that matches no key
+    /// may go to any host the policy allows, as before this table existed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub hosts: BTreeMap<String, Vec<String>>,
+}
+
+impl SecretsPolicy {
+    /// Whether a job may name this secret reference at all.
+    #[must_use]
+    pub fn allows(&self, reference: &str) -> bool {
+        self.allow.iter().any(|p| ref_matches(p, reference))
+    }
+
+    /// Whether a job may send this secret reference to `host`: listed in `allow`, and, when
+    /// `hosts` binds it, `host` is one of its hosts.
+    #[must_use]
+    pub fn allows_for(&self, reference: &str, host: &str) -> bool {
+        if !self.allows(reference) {
+            return false;
+        }
+        let Some((_, bound)) = self
+            .hosts
+            .iter()
+            .filter(|(p, _)| ref_matches(p, reference))
+            .max_by_key(|(p, _)| (p.len(), !p.ends_with('*')))
+        else {
+            return true;
+        };
+        let host = host_key(host);
+        bound.iter().any(|b| match b.strip_prefix("*.") {
+            Some(suffix) => HostPattern::Suffix(suffix.to_owned()).matches(&host),
+            None => *b == host,
+        })
+    }
+
+    fn validate(&mut self) -> std::result::Result<(), String> {
+        for s in self.allow.iter().chain(self.hosts.keys()) {
+            let base = s.strip_suffix('*').unwrap_or(s);
+            if base.contains('*')
+                || !["env:", "file:", "k8s:", "vault:"]
+                    .iter()
+                    .any(|p| base.starts_with(p))
+            {
+                return Err(format!(
+                    "secrets: {s} must start with env:, file:, k8s: or vault: and may end in one *"
+                ));
+            }
+        }
+        for (reference, hosts) in &mut self.hosts {
+            if hosts.is_empty() {
+                return Err(format!("secrets.hosts: {reference} names no host"));
+            }
+            for h in hosts.iter_mut() {
+                let bad = |e: String| format!("secrets.hosts: {reference}: {e}");
+                *h = match h.strip_prefix("*.") {
+                    Some(suffix) => format!("*.{}", normalize_host(suffix).map_err(bad)?),
+                    None => match h.trim_matches(['[', ']']).parse::<IpAddr>() {
+                        Ok(ip) => ip.to_canonical().to_string(),
+                        Err(_) => normalize_host(h).map_err(bad)?,
+                    },
+                };
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A secret reference pattern: exact, or a prefix ending in `*`.
+fn ref_matches(pattern: &str, reference: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => reference.starts_with(prefix),
+        None => reference == pattern,
+    }
+}
+
+/// A target host as `[secrets] hosts` compares it: lower case without a trailing dot, an
+/// address in its canonical form without brackets.
+fn host_key(host: &str) -> String {
+    let bare = host.trim_matches(['[', ']']);
+    match bare.parse::<IpAddr>() {
+        Ok(ip) => ip.to_canonical().to_string(),
+        Err(_) => bare.trim_end_matches('.').to_ascii_lowercase(),
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -685,18 +784,7 @@ impl Policy {
                 limits::MAX_JOBS_PER_MINUTE
             ));
         }
-        for s in &self.secrets.allow {
-            let base = s.strip_suffix('*').unwrap_or(s);
-            if base.contains('*')
-                || !["env:", "file:", "k8s:", "vault:"]
-                    .iter()
-                    .any(|p| base.starts_with(p))
-            {
-                return Err(format!(
-                    "secrets.allow: {s} must start with env:, file:, k8s: or vault: and may end in one *"
-                ));
-            }
-        }
+        self.secrets.validate()?;
         if let Some(cap) = &mut self.capture {
             if !cap.socket.is_absolute() {
                 return Err(format!(
@@ -738,11 +826,7 @@ impl Policy {
                 let Some(o) = &con.oidc else {
                     return Err("console.users names oidc: [console.oidc] is needed".into());
                 };
-                let local = o
-                    .issuer
-                    .host_str()
-                    .is_some_and(|h| h == "127.0.0.1" || h == "localhost" || h == "[::1]");
-                if o.issuer.scheme() != "https" && !local {
+                if crate::config::check_platform_url(&o.issuer).is_err() {
                     return Err("console.oidc.issuer must be https".into());
                 }
                 if !o.client_secret.contains(':') {
@@ -784,16 +868,11 @@ impl Policy {
         out
     }
 
-    /// Whether a job may name this secret reference.
+    /// Whether a job may send this secret reference to `host` (`[secrets] allow`, and
+    /// `[secrets] hosts` when it binds the reference).
     #[must_use]
-    pub fn secret_allowed(&self, reference: &str) -> bool {
-        self.secrets
-            .allow
-            .iter()
-            .any(|p| match p.strip_suffix('*') {
-                Some(prefix) => reference.starts_with(prefix),
-                None => reference == p,
-            })
+    pub fn secret_allowed(&self, reference: &str, host: &str) -> bool {
+        self.secrets.allows_for(reference, host)
     }
 
     /// The capture settings in force: `Some` only when `[work] capture = true` (the
@@ -875,13 +954,21 @@ impl Policy {
     /// The refusal reason.
     pub fn check_ip(&self, ip: IpAddr) -> std::result::Result<(), String> {
         let ip = ip.to_canonical();
-        if self.compiled.deny_nets.iter().any(|n| n.contains(&ip)) {
+        if self.denied(ip) {
             return Err(format!("{ip} is in networks.deny"));
         }
         if self.compiled.allow_nets.iter().any(|n| n.contains(&ip)) {
             return Ok(());
         }
         Err(format!("{ip} is not in networks.allow"))
+    }
+
+    /// Whether an address is in `networks.deny`, also when it is an IPv4 address written in
+    /// the NAT64 well-known prefix `64:ff9b::/96`, which a NAT64 gateway forwards to that IPv4.
+    fn denied(&self, ip: IpAddr) -> bool {
+        let ip = ip.to_canonical();
+        let hit = |ip: IpAddr| self.compiled.deny_nets.iter().any(|n| n.contains(&ip));
+        hit(ip) || nat64_embedded(ip).is_some_and(|v4| hit(IpAddr::V4(v4)))
     }
 
     /// Whether a host name may be resolved at all: named in `networks.allow`, or inside a
@@ -926,7 +1013,7 @@ impl Policy {
             .ok_or_else(|| format!("{host} has no address"))?;
         for ip in addrs {
             let ip = ip.to_canonical();
-            if self.compiled.deny_nets.iter().any(|n| n.contains(&ip)) {
+            if self.denied(ip) {
                 return Err(format!(
                     "{host} resolves to {ip}, which is in networks.deny"
                 ));
@@ -1117,6 +1204,42 @@ allow = ["vault:kv/staging/*", "env:CHECK_TOKEN"]
     }
 
     #[test]
+    fn default_deny_covers_cloud_metadata_and_nat64_forms() {
+        let p = Policy::from_toml(
+            "environment = \"s\"\n[networks]\nallow = [\"0.0.0.0/0\", \"::/0\"]\n",
+        )
+        .unwrap();
+        for denied in [
+            "100.100.100.200",
+            "168.63.129.16",
+            "169.254.169.254",
+            "64:ff9b::a9fe:a9fe",
+            "64:ff9b::6464:64c8",
+            "64:ff9b::a83f:8110",
+            "64:ff9b::1",
+        ] {
+            assert!(p.check_ip(ip(denied)).is_err(), "{denied}");
+            assert!(
+                p.check_resolved(
+                    "h.example",
+                    NameRule::NamedInAllow,
+                    &[ip("1.1.1.1"), ip(denied)]
+                )
+                .is_err(),
+                "{denied} in a resolved answer"
+            );
+        }
+        for open in [
+            "1.1.1.1",
+            "64:ff9b::101:101",
+            "2606:4700::1111",
+            "100.100.100.201",
+        ] {
+            assert!(p.check_ip(ip(open)).is_ok(), "{open}");
+        }
+    }
+
+    #[test]
     fn names() {
         let p = Policy::from_toml(POLICY).unwrap();
         assert_eq!(p.check_name("db.internal"), Ok(NameRule::NamedInAllow));
@@ -1187,11 +1310,50 @@ allow = ["vault:kv/staging/*", "env:CHECK_TOKEN"]
     #[test]
     fn secrets() {
         let p = Policy::from_toml(POLICY).unwrap();
-        assert!(p.secret_allowed("vault:kv/staging/app#token"));
-        assert!(!p.secret_allowed("vault:kv/production/app#token"));
-        assert!(p.secret_allowed("env:CHECK_TOKEN"));
-        assert!(!p.secret_allowed("env:CHECK_TOKEN_2"));
-        assert!(!p.secret_allowed("env:VAULT_TOKEN"));
+        let h = "db.internal";
+        assert!(p.secret_allowed("vault:kv/staging/app#token", h));
+        assert!(!p.secret_allowed("vault:kv/production/app#token", h));
+        assert!(p.secret_allowed("env:CHECK_TOKEN", h));
+        assert!(!p.secret_allowed("env:CHECK_TOKEN_2", h));
+        assert!(!p.secret_allowed("env:VAULT_TOKEN", h));
+    }
+
+    #[test]
+    fn secrets_bound_to_hosts_go_only_to_those_hosts() {
+        let base = Policy::from_toml(POLICY).unwrap();
+        let p = Policy::from_toml(&format!(
+            "{POLICY}[secrets.hosts]\n\"vault:kv/staging/*\" = [\"Grafana.Internal.\", \"*.svc.cluster.local\", \"[::1]\"]\n\"vault:kv/staging/db#*\" = [\"db.internal\"]\n"
+        ))
+        .unwrap();
+        assert_ne!(p.hash(), base.hash());
+        let r = "vault:kv/staging/app#token";
+        assert!(p.secret_allowed(r, "grafana.internal"));
+        assert!(p.secret_allowed(r, "GRAFANA.internal."));
+        assert!(p.secret_allowed(r, "api.shop.svc.cluster.local"));
+        assert!(p.secret_allowed(r, "[::1]"));
+        assert!(!p.secret_allowed(r, "db.internal"), "bound elsewhere");
+        assert!(!p.secret_allowed(r, "svc.cluster.local"));
+        assert!(!p.secret_allowed(r, "10.1.2.3"));
+        let db = "vault:kv/staging/db#password";
+        assert!(p.secret_allowed(db, "db.internal"), "the longest key wins");
+        assert!(!p.secret_allowed(db, "grafana.internal"));
+        assert!(
+            p.secret_allowed("env:CHECK_TOKEN", "10.1.2.3"),
+            "an unbound reference keeps going to any allowed host"
+        );
+        assert!(!p.secret_allowed("vault:kv/production/x#y", "grafana.internal"));
+        for bad in [
+            "\"vault:kv/x\" = []",
+            "\"aws:x\" = [\"h\"]",
+            "\"vault:kv/x\" = [\"bad host\"]",
+        ] {
+            assert!(
+                Policy::from_toml(&format!("{POLICY}[secrets.hosts]\n{bad}\n")).is_err(),
+                "{bad}"
+            );
+        }
+        let json = serde_json::to_string(&base).unwrap();
+        assert!(!json.contains("hosts"), "old policies keep their hash");
     }
 
     #[test]

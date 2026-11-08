@@ -551,10 +551,10 @@ impl Executor {
                 if !spec.surface.takes_auth() {
                     return Admission::Refuse("auth is not used by tcp and tls checks".into());
                 }
-                if !self.policy.secret_allowed(&auth.secret) {
+                if !self.policy.secret_allowed(&auth.secret, &endpoint.host) {
                     return Admission::Refuse(format!(
-                        "the secret reference {} is not in the local policy's [secrets] allow",
-                        auth.secret
+                        "the secret reference {} is not in the local policy's [secrets] allow for {}",
+                        auth.secret, endpoint.host
                     ));
                 }
                 match auth.secret.parse::<SecretRef>() {

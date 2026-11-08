@@ -170,6 +170,10 @@ pub struct Conn {
     /// helm: the registries an `oci://` chart may come from; empty refuses OCI charts.
     #[serde(default)]
     pub oci_registries: Vec<String>,
+    /// helm: `get values` may run. Off by default: a release's values often hold
+    /// credentials, and they would come back in the output.
+    #[serde(default)]
+    pub helm_values: bool,
     /// ssh: the systemd units this connection may read; none set means any.
     #[serde(default)]
     pub units: Option<Vec<String>>,
@@ -195,6 +199,7 @@ impl Conn {
             root: None,
             resources: None,
             oci_registries: Vec::new(),
+            helm_values: false,
             units: None,
             plan_ttl_secs: default_ttl(),
         }
@@ -401,6 +406,9 @@ impl Runner {
 
     /// The connection's allow-lists: resource types, OCI registries, units.
     fn check_policy(&self, c: &Command) -> Result<(), String> {
+        if c.kind == Kind::Helm && c.verb == "get values" && !self.conn.helm_values {
+            return Err("get values needs helm_values = true on this connection".into());
+        }
         if let Some(allow) = &self.conn.resources {
             let allow: Vec<String> = allow.iter().map(|a| verbs::normal_type(a)).collect();
             if let Some(r) = c

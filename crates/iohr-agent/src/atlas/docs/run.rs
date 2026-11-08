@@ -192,9 +192,18 @@ async fn credential(
         .token
         .as_deref()
         .ok_or_else(|| Error::Config(format!("docs source {}: no token reference", s.id)))?;
-    if !policy.secret_allowed(reference) {
+    // The host the token goes to: the source's base_url, or the provider's own API.
+    let host = match &s.base_url {
+        Some(u) => u.host_str().unwrap_or_default().to_owned(),
+        None if s.provider == Provider::Notion => url::Url::parse(notion::API)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_owned))
+            .unwrap_or_default(),
+        None => String::new(),
+    };
+    if !policy.secret_allowed(reference, &host) {
         return Err(Error::Policy(format!(
-            "docs source {}: the policy's [secrets] allow does not list {reference}",
+            "docs source {}: the policy's [secrets] allow does not list {reference} for {host}",
             s.id
         )));
     }
