@@ -10,6 +10,7 @@ pub mod admin;
 pub mod agent;
 pub mod atlas;
 pub mod atomic;
+pub mod browser;
 pub mod audit;
 pub mod capture;
 pub mod checks;

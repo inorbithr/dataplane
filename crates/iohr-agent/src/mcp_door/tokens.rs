@@ -384,7 +384,7 @@ impl Tokens {
         let me = Arc::clone(self);
         tokio::spawn(async move { me.callback_server(verifier, state).await });
         if self.cfg.open_browser {
-            open_in_browser(&url);
+            let _ = crate::browser::open(&url);
         }
         tracing::info!("login: started");
         url
@@ -516,17 +516,4 @@ pub fn error_class(e: &reqwest::Error) -> String {
         "error"
     };
     kind.into()
-}
-
-fn open_in_browser(url: &str) {
-    let opener = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    let _ = std::process::Command::new(opener)
-        .arg(url)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
 }
