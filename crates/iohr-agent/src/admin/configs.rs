@@ -449,7 +449,10 @@ mod tests {
     #[test]
     fn a_large_diff_keeps_the_shared_lines_and_stays_cheap() {
         let lines = |tag: &str, n: usize| -> String {
-            (0..n).map(|i| format!("{tag}{i}\n")).collect::<String>()
+            (0..n).fold(String::new(), |mut s, i| {
+                let _ = writeln!(s, "{tag}{i}");
+                s
+            })
         };
         // 3000 changed lines on each side: past the LCS budget, so the middle is shown
         // as removed then added, between the untouched first and last lines.

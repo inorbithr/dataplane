@@ -66,12 +66,13 @@ fn temp_beside(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
-    fn leftovers(dir: &Path) -> Vec<String> {
+    /// How many temporary files `temp_beside` names are left in `dir`.
+    fn leftovers(dir: &Path) -> usize {
         std::fs::read_dir(dir)
             .unwrap()
             .filter_map(|e| e.ok()?.file_name().into_string().ok())
-            .filter(|n| n.ends_with(".tmp"))
-            .collect()
+            .filter(|n| Path::new(n).extension().is_some_and(|x| x == "tmp"))
+            .count()
     }
 
     #[test]
@@ -89,7 +90,7 @@ mod tests {
                 0o600
             );
         }
-        assert!(leftovers(p.parent().unwrap()).is_empty());
+        assert_eq!(leftovers(p.parent().unwrap()), 0);
     }
 
     #[test]
@@ -104,6 +105,6 @@ mod tests {
             std::fs::read_to_string(d.path().join(".checks.toml.iohr-new")).unwrap(),
             "planted"
         );
-        assert!(leftovers(d.path()).is_empty());
+        assert_eq!(leftovers(d.path()), 0);
     }
 }
