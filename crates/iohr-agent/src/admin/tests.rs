@@ -615,6 +615,11 @@ async fn the_token_opens_the_page_once_required() {
         assert!(!r.contains("Set-Cookie"));
     }
     let once = code(&token);
+    // A HEAD (a link preview) neither signs in nor spends the code.
+    let head = get(&format!("/auth?code={once}"), &host, "").replacen("GET", "HEAD", 1);
+    let r = send(addr, &head).await;
+    assert_eq!(status(&r), 401, "{r}");
+    assert!(!r.contains("Set-Cookie"));
     let r = send(addr, &get(&format!("/auth?code={once}"), &host, "")).await;
     assert_eq!(status(&r), 303, "{r}");
     let r = send(addr, &get(&format!("/auth?code={once}"), &host, "")).await;

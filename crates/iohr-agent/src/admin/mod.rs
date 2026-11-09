@@ -995,7 +995,8 @@ impl Server {
 /// `GET /auth?code=…` (a one-time link from `iohr agent page --open`, [`signin_code`]) or
 /// `POST /auth` with the token in a form: either becomes a session for the machine's
 /// owner (`HttpOnly`, SameSite=Strict, Secure over TLS), then back to the page. The token
-/// itself is taken only from a form body, never from the address.
+/// itself is taken only from a form body, never from the address. A `HEAD` (a link
+/// preview, a prefetch) never spends the code: it is answered as not signed in.
 async fn auth<S: AsyncWrite + Unpin>(
     sock: &mut S,
     srv: &Server,
@@ -1018,9 +1019,16 @@ async fn auth<S: AsyncWrite + Unpin>(
             Some(_) => fields
                 .get("token")
                 .is_some_and(|g| constant_time_eq(t.as_bytes(), g.trim().as_bytes())),
-            None => req.query_param("code").is_some_and(|c| {
-                srv.spend_signin_code(t, &c, time::OffsetDateTime::now_utc().unix_timestamp())
-            }),
+            None => {
+                !head
+                    && req.query_param("code").is_some_and(|c| {
+                        srv.spend_signin_code(
+                            t,
+                            &c,
+                            time::OffsetDateTime::now_utc().unix_timestamp(),
+                        )
+                    })
+            }
         });
     if !ok {
         if form.is_some() {
