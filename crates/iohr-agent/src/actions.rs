@@ -1408,7 +1408,7 @@ hosts = ["grafana.observability.svc.cluster.local", "127.0.0.1"]
         assert!(matches!(before.admit(&job), Admission::RunAction(_)));
         drop(before);
         match generation().admit(&job) {
-            Admission::Refuse(r) => assert!(r.contains("already ran"), "{r}"),
+            Admission::Refuse(r) => assert!(r.contains("already ran")),
             Admission::Run(_) | Admission::RunAction(_) => panic!("admitted again after a reload"),
         }
     }
