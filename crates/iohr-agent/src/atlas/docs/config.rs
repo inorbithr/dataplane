@@ -198,15 +198,9 @@ pub fn check_base_url(u: &Url) -> Result<(), String> {
     if u.query().is_some() || u.fragment().is_some() {
         return Err("must not carry a query or fragment".into());
     }
-    match u.scheme() {
-        "https" => Ok(()),
-        "http" => match u.host() {
-            Some(url::Host::Ipv4(ip)) if ip.is_loopback() => Ok(()),
-            Some(url::Host::Ipv6(ip)) if ip.is_loopback() => Ok(()),
-            Some(url::Host::Domain(d)) if d == "localhost" || d.ends_with(".localhost") => Ok(()),
-            _ => Err("http is allowed only to a loopback address".into()),
-        },
-        other => Err(format!("scheme {other} is not https")),
+    match u.host() {
+        Some(url::Host::Domain(d)) if u.scheme() == "http" && d.ends_with(".localhost") => Ok(()),
+        _ => crate::config::check_platform_url(u),
     }
 }
 

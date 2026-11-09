@@ -153,10 +153,10 @@ pub fn parse_wtmp(bytes: &[u8]) -> Vec<WtmpEvent> {
 /// Runs a program with fixed arguments, an empty environment, a timeout and an output
 /// bound. `None` if it is missing, fails, or runs too long.
 fn run_bounded(program: &str, args: &[&str]) -> Result<String, String> {
-    let mut child = Command::new(program)
+    let mut cmd = Command::new(program);
+    crate::child_env::isolate(&mut cmd, &[], [("LC_ALL", "C")]);
+    let mut child = cmd
         .args(args)
-        .env_clear()
-        .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

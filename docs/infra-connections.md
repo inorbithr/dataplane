@@ -148,6 +148,9 @@ Each connection can narrow what its verbs may name:
   too.
 - `oci_registries` (helm): the registries an OCI chart may come from. Empty refuses OCI
   charts.
+- `helm_values` (helm): `get values` (with or without `--all`) may run. Default `false`: a
+  release's values often hold credentials, and the read would print them. Set it only on a
+  connection whose releases keep secrets out of their values.
 - `units` (ssh): the systemd units `systemctl status` and `journalctl -u` may name, with or
   without `.service`. Unset means any.
 
@@ -179,7 +182,7 @@ has each file learned for redaction.
 | Kind | read | plan | apply |
 | --- | --- | --- | --- |
 | kubectl | `get`, `describe`, `logs` (default `--tail 200`, 1 MiB), `top`, `api-resources`, `version`, `auth can-i` | `diff -f FILE` (server side) | `apply --server-side -f FILE` |
-| helm | `list`, `status`, `history`, `get values` | `template REL CHART --version V`, `diff upgrade REL CHART --version V --suppress-secrets` | `upgrade --install REL CHART --version V` |
+| helm | `list`, `status`, `history`, `get values` (only with `helm_values = true`) | `template REL CHART --version V`, `diff upgrade REL CHART --version V --suppress-secrets` | `upgrade --install REL CHART --version V` |
 | ansible | `inventory --list` | `--check --diff PLAYBOOK`; `PLAYBOOK --list-hosts`, `PLAYBOOK --list-tasks` (no apply) | `PLAYBOOK` |
 | tofu | `show`, `state list`, `validate`, `version` | `plan [-target ADDR]` (saves the plan file) | `apply` of the saved plan |
 | ssh | `uptime`, `df`, `systemctl status UNIT`, `journalctl -u UNIT [-n N]` | none | none |

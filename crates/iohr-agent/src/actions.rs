@@ -242,10 +242,10 @@ impl ActionsPolicy {
             s.auth
                 .parse::<SecretRef>()
                 .map_err(|e| format!("actions.sensors.{}: {e}", s.name))?;
-            if !secret_allowed(secrets, &s.auth) {
+            if !secrets.allows_for(&s.auth, &base.1) {
                 return Err(format!(
-                    "actions.sensors.{}: {} is not in [secrets] allow",
-                    s.name, s.auth
+                    "actions.sensors.{}: {} is not in [secrets] allow for {}",
+                    s.name, s.auth, base.1
                 ));
             }
         }
@@ -259,13 +259,6 @@ impl ActionsPolicy {
             .filter_map(|k| parse_key(k).ok())
             .collect()
     }
-}
-
-fn secret_allowed(secrets: &SecretsPolicy, reference: &str) -> bool {
-    secrets.allow.iter().any(|p| match p.strip_suffix('*') {
-        Some(prefix) => reference.starts_with(prefix),
-        None => reference == p,
-    })
 }
 
 /// A key's id: the first 16 hex digits of SHA-256 over its 32 bytes. The platform names
@@ -305,12 +298,11 @@ pub fn is_uid(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// `http(s)://host[:port]` and nothing else: the URL, its host and its port.
+/// `https://host[:port]` (plain http only to loopback) and nothing else: the URL, its host and its port.
 fn parse_base(s: &str) -> Result<(url::Url, String, u16), String> {
     let u = url::Url::parse(s).map_err(|e| format!("base_url {s:?}: {e}"))?;
-    if !matches!(u.scheme(), "http" | "https") {
-        return Err(format!("base_url {s:?} must be http or https"));
-    }
+    // The connector's token goes with every request: never in clear past this machine.
+    crate::config::check_platform_url(&u).map_err(|e| format!("base_url {e}"))?;
     if !u.username().is_empty() || u.password().is_some() {
         return Err(format!("base_url {s:?} must not carry credentials"));
     }
@@ -655,9 +647,9 @@ pub fn admit(
             "the datasource {ds} is not in the local policy's [actions] datasources"
         ));
     }
-    if !policy.secret_allowed(&a.auth) {
+    if !policy.secret_allowed(&a.auth, &host) {
         return Err(format!(
-            "the secret reference {} is not in the local policy's [secrets] allow",
+            "the secret reference {} is not in the local policy's [secrets] allow for {host}",
             a.auth
         ));
     }
@@ -1232,7 +1224,7 @@ hosts = ["grafana.observability.svc.cluster.local", "127.0.0.1"]
     fn action(path: &str, query: &[(&str, &str)]) -> Value {
         json!({
             "connector": GRAFANA, "action": "x",
-            "base_url": "http://grafana.observability.svc.cluster.local:3000",
+            "base_url": "https://grafana.observability.svc.cluster.local:3000",
             "method": "GET", "path": path,
             "query": query.iter().map(|(k, v)| json!([k, v])).collect::<Vec<_>>(),
             "auth": "k8s:observability/grafana-inorbit-sa#token",
@@ -1271,7 +1263,7 @@ hosts = ["grafana.observability.svc.cluster.local", "127.0.0.1"]
         assert_eq!(plan.route, Route::Search);
         assert_eq!(
             plan.url.as_str(),
-            "http://grafana.observability.svc.cluster.local:3000/api/search?type=dash-db"
+            "https://grafana.observability.svc.cluster.local:3000/api/search?type=dash-db"
         );
     }
 
@@ -1345,6 +1337,25 @@ hosts = ["grafana.observability.svc.cluster.local", "127.0.0.1"]
     }
 
     #[test]
+    fn a_token_never_travels_in_clear_past_loopback() {
+        for ok in [
+            "https://grafana.example:3000",
+            "http://127.0.0.1:3000",
+            "http://[::1]:3000",
+            "http://localhost:3000",
+        ] {
+            assert!(parse_base(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://grafana.example:3000",
+            "http://10.0.0.5",
+            "ftp://grafana.example",
+        ] {
+            assert!(parse_base(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn a_job_runs_once() {
         let p = policy("");
         let replay = Replay::since(NOW);
@@ -1374,7 +1385,7 @@ hosts = ["grafana.observability.svc.cluster.local", "127.0.0.1"]
     fn host_route_and_method_are_allowlisted() {
         let p = policy("");
         let mut a = action("/api/search", &[]);
-        a["base_url"] = json!("http://grafana.evil.example:3000");
+        a["base_url"] = json!("https://grafana.evil.example:3000");
         let e = try_admit(&p, "j", &signed_with(&signer(), &envelope("j", a))).unwrap_err();
         assert!(
             e.contains("not in the local policy's [actions] hosts"),
@@ -1399,7 +1410,7 @@ hosts = ["grafana.observability.svc.cluster.local", "127.0.0.1"]
         let e = try_admit(&p, "j", &signed_with(&signer(), &envelope("j", a))).unwrap_err();
         assert!(e.contains("read only"), "{e}");
         let mut a = action("/api/search", &[]);
-        a["base_url"] = json!("http://user:pw@grafana.observability.svc.cluster.local:3000");
+        a["base_url"] = json!("https://user:pw@grafana.observability.svc.cluster.local:3000");
         assert!(try_admit(&p, "j", &signed_with(&signer(), &envelope("j", a))).is_err());
         let mut a = action("/api/search", &[]);
         a["auth"] = json!("vault:kv/other#token");
@@ -1544,7 +1555,7 @@ datasources = ["vm"]
 [[actions.sensors]]
 name = "api-errors"
 template = "error-rate"
-base_url = "http://grafana.observability.svc.cluster.local:3000"
+base_url = "https://grafana.observability.svc.cluster.local:3000"
 auth = "k8s:observability/grafana-inorbit-sa#token"
 datasource_uid = "vm"
 expr = "sum(rate(errors[5m]))"
@@ -1595,7 +1606,7 @@ datasources = ["vm"]
 [[actions.sensors]]
 name = "api-errors"
 template = "error-rate"
-base_url = "http://grafana.observability.svc.cluster.local:3000"
+base_url = "https://grafana.observability.svc.cluster.local:3000"
 auth = "k8s:observability/grafana-inorbit-sa#token"
 datasource_uid = "vm"
 expr = "sum(rate(errors[5m]))"
@@ -1621,7 +1632,7 @@ crit = 5.0
         );
         // Another port on the same host: counts only.
         let mut port = a.clone();
-        port["base_url"] = json!("http://grafana.observability.svc.cluster.local:3001");
+        port["base_url"] = json!("https://grafana.observability.svc.cluster.local:3001");
         assert!(
             !try_admit(&p, "j", &signed_with(&signer(), &envelope("j", port)))
                 .unwrap()
@@ -1666,7 +1677,7 @@ crit = 5.0
     fn a_trailing_dot_host_is_refused() {
         let p = policy("");
         let mut a = action("/api/search", &[]);
-        a["base_url"] = json!("http://grafana.observability.svc.cluster.local.:3000");
+        a["base_url"] = json!("https://grafana.observability.svc.cluster.local.:3000");
         let e = try_admit(&p, "j", &signed_with(&signer(), &envelope("j", a))).unwrap_err();
         assert!(e.contains("dot"), "{e}");
     }
