@@ -443,21 +443,22 @@ impl Tokens {
             }
         }
         let head = String::from_utf8_lossy(&buf[..n]).into_owned();
-        let target = head
-            .lines()
-            .next()
-            .and_then(|l| l.split_whitespace().nth(1))
-            .unwrap_or("/");
+        let mut line = head.lines().next().unwrap_or_default().split_whitespace();
+        let method = line.next().unwrap_or_default();
+        let target = line.next().unwrap_or("/");
         let q: std::collections::HashMap<String, String> =
             url::Url::parse(&format!("http://localhost{target}"))
                 .map(|u| u.query_pairs().into_owned().collect())
                 .unwrap_or_default();
         let (mut ok, mut msg) = (false, "Sign-in failed.");
         // Only the redirect for this sign-in, carrying its state, may end it: any other
-        // local request on the port is answered and the wait goes on.
-        let state_ok = q
-            .get("state")
-            .is_some_and(|s| crate::admin::constant_time_eq(s.as_bytes(), state.as_bytes()));
+        // local request on the port is answered and the wait goes on. The browser follows
+        // the redirect with a GET; any other method (a HEAD probe, say) leaves the code
+        // unused.
+        let get = method == "GET";
+        let state_ok = get
+            && q.get("state")
+                .is_some_and(|s| crate::admin::constant_time_eq(s.as_bytes(), state.as_bytes()));
         let errored = state_ok && q.contains_key("error");
         if state_ok && let Some(code) = q.get("code") {
             let redirect = self.cfg.redirect();
@@ -490,7 +491,13 @@ impl Tokens {
             format!("<!doctype html><meta charset=utf-8><title>InOrbit MCP</title><p>{msg}</p>");
         let resp = format!(
             "HTTP/1.1 {} X\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{body}",
-            if ok { 200 } else { 400 },
+            if ok {
+                200
+            } else if get {
+                400
+            } else {
+                405
+            },
             body.len()
         );
         let _ = sock.write_all(resp.as_bytes()).await;

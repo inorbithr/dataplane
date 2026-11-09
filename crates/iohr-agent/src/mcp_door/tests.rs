@@ -222,9 +222,15 @@ async fn the_local_door_needs_the_secret_and_no_browser() {
     assert_eq!(r.raw(&c, set("Host", "evil.test")).await.0, 403);
     assert_eq!(r.fake.methods().len(), 0);
     assert_eq!(r.post(&c).await.0, 200);
+    let v6 = format!("[::1]:{}", r.door.port());
+    let as_v6 = |h: &mut Vec<(&str, String)>| {
+        h.retain(|(n, _)| *n != "Host");
+        h.push(("Host", v6.clone()));
+    };
+    assert_eq!(r.raw(&c, as_v6).await.0, 200);
     assert_eq!(
         *r.fake.seen.lock().unwrap(),
-        vec![("tools/list".to_owned(), "bearer at".to_owned())]
+        vec![("tools/list".to_owned(), "bearer at".to_owned()); 2]
     );
 }
 
@@ -332,6 +338,8 @@ async fn status_answers_only_the_doors_own_host_and_no_page() {
     let port = r.door.port();
     let own = get(format!("localhost:{port}"), None).await.unwrap();
     assert_eq!(own.status().as_u16(), 200);
+    let v6 = get(format!("[::1]:{port}"), None).await.unwrap();
+    assert_eq!(v6.status().as_u16(), 200);
     let rebound = get(format!("door.example.com:{port}"), None).await.unwrap();
     assert_eq!(rebound.status().as_u16(), 403);
     let page = get(format!("127.0.0.1:{port}"), Some("http://example.com"))
@@ -467,11 +475,15 @@ async fn login_scope(meta: SocketAddr) -> Vec<String> {
     scope.split(' ').map(String::from).collect()
 }
 
-/// Sends one request line to the sign-in callback and returns (over, status line).
+/// Sends one GET to the sign-in callback and returns (over, status line).
 async fn callback(tokens: &Tokens, target: &str, state: &str) -> (bool, String) {
+    callback_with(tokens, "GET", target, state).await
+}
+
+async fn callback_with(tokens: &Tokens, method: &str, target: &str, state: &str) -> (bool, String) {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
-    let req = format!("GET {target} HTTP/1.1\r\nHost: {addr}\r\n\r\n");
+    let req = format!("{method} {target} HTTP/1.1\r\nHost: {addr}\r\n\r\n");
     let client = tokio::spawn(async move {
         let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
         c.write_all(req.as_bytes()).await.unwrap();
@@ -511,6 +523,22 @@ async fn only_the_matching_state_may_end_a_sign_in() {
     )
     .await;
     assert!(over);
+}
+
+#[tokio::test]
+async fn only_a_get_may_use_the_sign_in_code() {
+    let meta = fake_metadata(&["mcp:read"], &["mcp:read"]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let tokens = login_tokens(meta, &dir).await;
+    let state = "the-state-of-this-sign-in";
+    let target = format!("/callback?code=c&state={state}");
+    for method in ["HEAD", "POST", "OPTIONS"] {
+        let (over, status) = callback_with(&tokens, method, &target, state).await;
+        assert!(!over, "{method} ended the sign-in");
+        assert!(status.contains(" 405 "), "{method}: {status}");
+    }
+    // Nothing was exchanged: the door is still not signed in.
+    assert!(!tokens.auth().ok);
 }
 
 #[tokio::test]
