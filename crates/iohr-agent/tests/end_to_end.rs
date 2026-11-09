@@ -367,7 +367,7 @@ async fn revoked_agent_stops_for_good() {
 async fn a_foreign_key_cannot_get_a_token() {
     let h = harness(KeyAlg::Es256).await;
     let enrollment = enroll_agent(&h).await;
-    let stranger = AgentKey::generate(KeyAlg::Es256).unwrap();
+    let stranger = AgentKey::generate(KeyAlg::Es256);
     let src = TokenSource::new(
         reqwest::Client::new(),
         Arc::new(enrollment),
@@ -468,6 +468,7 @@ async fn start_on_fixture(
             DeclaredChecks::load(&h.cfg.checks).unwrap(),
             enrollment,
             key,
+            Arc::default(),
         )
         .unwrap(),
     );

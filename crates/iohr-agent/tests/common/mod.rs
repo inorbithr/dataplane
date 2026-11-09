@@ -341,6 +341,7 @@ pub async fn start(
             DeclaredChecks::load(&h.cfg.checks).unwrap(),
             enrollment,
             key,
+            Arc::default(),
         )
         .unwrap(),
     );
