@@ -49,8 +49,9 @@ pub struct Executor {
     /// When each sensor is next due. Kept here, not in a session, so a reconnect does
     /// not run every sensor again at once.
     sensor_due: Mutex<std::collections::HashMap<String, Instant>>,
-    /// Action job ids seen, against replay.
-    replay: crate::actions::Replay,
+    /// Action job ids seen, against replay. Shared with the executors of later
+    /// generations, so a reload does not forget them.
+    replay: Arc<crate::actions::Replay>,
     jobs: Counter<u64>,
     duration: Histogram<f64>,
 }
@@ -114,7 +115,7 @@ impl Executor {
             agent_id: String::new(),
             account_id: String::new(),
             sensor_due: Mutex::new(std::collections::HashMap::new()),
-            replay: crate::actions::Replay::default(),
+            replay: Arc::new(crate::actions::Replay::default()),
             jobs: meter
                 .u64_counter("iohr_agent.jobs")
                 .with_description("Jobs finished, by kind, surface and verdict")
@@ -213,6 +214,14 @@ impl Executor {
     #[must_use]
     pub fn with_account_id(mut self, id: impl Into<String>) -> Self {
         self.account_id = id.into();
+        self
+    }
+
+    /// The action job ids this process has seen, kept across generations: a reload
+    /// builds a new executor on the same set.
+    #[must_use]
+    pub fn with_replay(mut self, replay: Arc<crate::actions::Replay>) -> Self {
+        self.replay = replay;
         self
     }
 

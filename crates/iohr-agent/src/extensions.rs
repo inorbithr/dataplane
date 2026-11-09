@@ -316,15 +316,8 @@ impl Lock {
     /// The file cannot be written.
     pub fn save(&self, state_dir: &Path) -> Result<()> {
         let p = Self::path(state_dir);
-        let tmp = state_dir.join(".extensions.lock.iohr-new");
         let text = serde_json::to_string_pretty(self).map_err(|e| Error::Config(e.to_string()))?;
-        std::fs::write(&tmp, text).map_err(|e| Error::io(&tmp, e))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-        }
-        std::fs::rename(&tmp, &p).map_err(|e| Error::io(&p, e))
+        crate::atomic::write(&p, text.as_bytes()).map_err(|e| Error::io(&p, e))
     }
 
     #[must_use]

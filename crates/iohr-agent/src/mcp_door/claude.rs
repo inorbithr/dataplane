@@ -7,7 +7,8 @@ use std::process::ExitCode;
 
 use serde_json::{Value, json};
 
-use super::{LaunchdArgs, RegisterArgs, out, write_state};
+use super::{LaunchdArgs, RegisterArgs, out};
+use crate::atomic::write as write_state;
 use crate::error::{Error, Result};
 
 /// The launchd label; the same as the Python bridge's, so one job replaces the other.

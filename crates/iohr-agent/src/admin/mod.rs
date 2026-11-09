@@ -13,8 +13,9 @@
 //!   `POST /policy/reload` loads the files again: only from this machine (the listener and
 //!   the client both on loopback), only signed in (the page's token as a session cookie, or
 //!   as a bearer for `iohr agent share`), a browser's from this page's own origin with the
-//!   form's token. The platform has no way to call either. `/auth` turns the token into a
-//!   cookie for this browser.
+//!   form's token. The platform has no way to call either. `/auth` turns the token (from
+//!   a form) or a one-time code made from it (`page --open`) into a cookie for this
+//!   browser; the token never travels in an address.
 //! - **DNS rebinding and CSRF**: the `Host` header must be one of `127.0.0.1:<port>`,
 //!   `localhost:<port>`, `[::1]:<port>` (plus `admin.hosts`), else 421; an `Origin` that is
 //!   not this page and a `Sec-Fetch-Site` other than `same-origin`/`none` are refused with
@@ -102,12 +103,7 @@ const RELOAD_WAIT: Duration = Duration::from_secs(20);
 fn csrf_for(session: &str) -> String {
     use sha2::Digest as _;
     let d = sha2::Sha256::digest(format!("iohr-agent-page-form:{session}").as_bytes());
-    d.iter()
-        .take(16)
-        .fold(String::with_capacity(32), |mut s, b| {
-            let _ = write!(s, "{b:02x}");
-            s
-        })
+    crate::random::to_hex(&d[..16])
 }
 
 /// What the page reads. Never the private key, never the enrollment.
@@ -169,6 +165,8 @@ struct Server {
     tls: bool,
     sessions: Mutex<Vec<auth::Session>>,
     pending: Mutex<Vec<auth::Pending>>,
+    /// Sign-in codes already used, until they expire.
+    spent: Mutex<HashMap<String, i64>>,
     buckets: Mutex<HashMap<IpAddr, (f64, Instant)>>,
     conn_buckets: Mutex<HashMap<IpAddr, (f64, Instant)>>,
     slots: Arc<Semaphore>,
@@ -208,14 +206,10 @@ pub fn server_tls(admin: &AdminConfig) -> Result<Option<tokio_rustls::TlsAccepto
 /// `iohr agent page --open` reads it. A new one every start.
 ///
 /// # Errors
-/// When the random source or the file fails.
+/// When the folder or the file cannot be written. (Randomness cannot fail here: without
+/// it the process stops, see [`crate::random`].)
 pub fn write_token(state_dir: &Path) -> Result<String> {
-    let mut raw = [0u8; 32];
-    getrandom::fill(&mut raw).map_err(|e| Error::Config(format!("random: {e}")))?;
-    let token = raw.iter().fold(String::with_capacity(64), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
-    });
+    let token = crate::random::hex(32);
     std::fs::create_dir_all(state_dir).map_err(|e| Error::io(state_dir, e))?;
     let path = state_dir.join(TOKEN_FILE);
     let _ = std::fs::remove_file(&path);
@@ -268,6 +262,7 @@ pub async fn serve_watch(
         tls: tls.is_some(),
         sessions: Mutex::new(Vec::new()),
         pending: Mutex::new(Vec::new()),
+        spent: Mutex::new(HashMap::new()),
         buckets: Mutex::new(HashMap::new()),
         conn_buckets: Mutex::new(HashMap::new()),
         slots: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
@@ -523,12 +518,7 @@ impl Server {
     }
 
     fn new_session(&self, person: auth::Person) -> String {
-        let mut raw = [0u8; 32];
-        let _ = getrandom::fill(&mut raw);
-        let id = raw.iter().fold(String::with_capacity(64), |mut s, b| {
-            let _ = write!(s, "{b:02x}");
-            s
-        });
+        let id = crate::random::hex(32);
         let mut s = match self.sessions.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
@@ -949,9 +939,64 @@ fn session_cookie(srv: &Server, id: &str, max_age: u64) -> String {
     )
 }
 
-/// `/auth?token=…` (a link from `iohr agent page --open`) or `POST /auth` with the token in
-/// a form: the token from `<state_dir>/admin.token` becomes a session for the machine's
-/// owner (`HttpOnly`, SameSite=Strict, Secure over TLS), then back to the page.
+/// How long a sign-in code from `page --open` is good for, and how many may be spent at
+/// once.
+const SIGNIN_CODE_SECS: i64 = 60;
+const SIGNIN_CODES: usize = 256;
+
+fn signin_mac(token: &str, secs: i64, nonce: &str) -> String {
+    let msg = format!("iohr-agent-page-signin:{secs}.{nonce}");
+    crate::random::to_hex(&crate::share::hmac_sha256(
+        token.trim().as_bytes(),
+        msg.as_bytes(),
+    ))
+}
+
+/// A one-time sign-in code for `GET /auth?code=…`, made from the page's token by
+/// `iohr agent page --open`: good once, for [`SIGNIN_CODE_SECS`], and it never shows the
+/// token itself in the browser's address bar or history.
+#[must_use]
+pub fn signin_code(token: &str, now: i64) -> String {
+    let nonce = crate::random::hex(16);
+    let mac = signin_mac(token, now, &nonce);
+    format!("{now}.{nonce}.{mac}")
+}
+
+impl Server {
+    /// True once for a fresh code made from `token`; a code is spent when used.
+    fn spend_signin_code(&self, token: &str, code: &str, now: i64) -> bool {
+        let mut parts = code.splitn(3, '.');
+        let (Some(secs), Some(nonce), Some(mac)) = (parts.next(), parts.next(), parts.next())
+        else {
+            return false;
+        };
+        let Ok(secs) = secs.parse::<i64>() else {
+            return false;
+        };
+        if secs < now - SIGNIN_CODE_SECS || secs > now + 5 || nonce.len() != 32 {
+            return false;
+        }
+        if !constant_time_eq(signin_mac(token, secs, nonce).as_bytes(), mac.as_bytes()) {
+            return false;
+        }
+        let mut spent = match self.spent.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        spent.retain(|_, exp| *exp >= now);
+        if spent.contains_key(nonce) || spent.len() >= SIGNIN_CODES {
+            return false;
+        }
+        spent.insert(nonce.to_owned(), secs + SIGNIN_CODE_SECS);
+        true
+    }
+}
+
+/// `GET /auth?code=…` (a one-time link from `iohr agent page --open`, [`signin_code`]) or
+/// `POST /auth` with the token in a form: either becomes a session for the machine's
+/// owner (`HttpOnly`, SameSite=Strict, Secure over TLS), then back to the page. The token
+/// itself is taken only from a form body, never from the address. A `HEAD` (a link
+/// preview, a prefetch) never spends the code: it is answered as not signed in.
 async fn auth<S: AsyncWrite + Unpin>(
     sock: &mut S,
     srv: &Server,
@@ -963,7 +1008,6 @@ async fn auth<S: AsyncWrite + Unpin>(
         .map(|b| url::form_urlencoded::parse(b).into_owned().collect())
         .unwrap_or_default();
     let field = |k: &str| fields.get(k).cloned().or_else(|| req.query_param(k));
-    let given = field("token").unwrap_or_default();
     let ctx = srv.ctx();
     let machine_ok = ctx
         .policy
@@ -971,10 +1015,21 @@ async fn auth<S: AsyncWrite + Unpin>(
         .users
         .contains(&crate::policy::SignInMode::Machine);
     let ok = machine_ok
-        && ctx
-            .token
-            .as_ref()
-            .is_some_and(|t| constant_time_eq(t.as_bytes(), given.trim().as_bytes()));
+        && ctx.token.as_ref().is_some_and(|t| match form {
+            Some(_) => fields
+                .get("token")
+                .is_some_and(|g| constant_time_eq(t.as_bytes(), g.trim().as_bytes())),
+            None => {
+                !head
+                    && req.query_param("code").is_some_and(|c| {
+                        srv.spend_signin_code(
+                            t,
+                            &c,
+                            time::OffsetDateTime::now_utc().unix_timestamp(),
+                        )
+                    })
+            }
+        });
     if !ok {
         if form.is_some() {
             return respond(
@@ -1083,9 +1138,9 @@ async fn oidc_start<S: AsyncWrite + Unpin>(
         }
     };
     let pending = auth::Pending {
-        state: auth::random(),
-        verifier: auth::random(),
-        nonce: auth::random(),
+        state: crate::random::urlsafe(32),
+        verifier: crate::random::urlsafe(32),
+        nonce: crate::random::urlsafe(32),
         next: next_of(req.query_param("next")),
         created: Instant::now(),
     };

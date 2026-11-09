@@ -68,6 +68,7 @@ pub async fn serve_on(listener: TcpListener, door: Door) -> Result<()> {
     let hosts = Arc::new(vec![
         format!("127.0.0.1:{}", local.port()),
         format!("localhost:{}", local.port()),
+        format!("[::1]:{}", local.port()),
     ]);
     let door = Arc::new(door);
     let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
@@ -195,7 +196,11 @@ fn plain(status: u16, v: &serde_json::Value) -> Reply {
 }
 
 async fn connection(mut sock: TcpStream, door: &Door, hosts: &[String]) {
-    let gate = |req: &Request| req.method != "POST" || authorised(req, door, hosts);
+    // Every request, `/status` too, must come from this machine's own clients: no
+    // Origin and the door's Host (a page on a rebinding name fails here). A POST also
+    // needs the local secret.
+    let gate =
+        |req: &Request| local(req, hosts) && (req.method != "POST" || authorised(req, door, hosts));
     let reply = match read_request(&mut sock, &gate).await {
         Err(code) => plain(code, &serde_json::json!({"error": "bad request"})),
         Ok(req) => route(&req, door, hosts).await,
@@ -203,15 +208,20 @@ async fn connection(mut sock: TcpStream, door: &Door, hosts: &[String]) {
     respond(&mut sock, &reply).await;
 }
 
-/// The local gate: no Origin, a known Host, the local secret.
-fn authorised(req: &Request, door: &Door, hosts: &[String]) -> bool {
+/// No Origin and a known Host: a local client, not a browser page.
+fn local(req: &Request, hosts: &[String]) -> bool {
     let host_ok = req
         .header("host")
         .is_some_and(|h| hosts.iter().any(|a| a == h));
+    req.header("origin").is_none() && host_ok
+}
+
+/// The local gate: a local client holding the local secret.
+fn authorised(req: &Request, door: &Door, hosts: &[String]) -> bool {
     let secret_ok = req
         .header("x-iohr-bridge")
         .is_some_and(|s| constant_time_eq(s.as_bytes(), door.secret.as_bytes()));
-    req.header("origin").is_none() && host_ok && secret_ok
+    local(req, hosts) && secret_ok
 }
 
 async fn route(req: &Request, door: &Door, hosts: &[String]) -> Reply {

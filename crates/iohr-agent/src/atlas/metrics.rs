@@ -509,12 +509,12 @@ mod tests {
     use iohr_evidence::method::MethodCategory;
     use iohr_evidence::observer::ObserverClass;
 
-    // The real answer for the agents cluster's p95 at 2026-10-09T09:45:51Z (VictoriaMetrics
-    // on nevio-server), with one extra label that must not survive.
+    // A synthetic answer in the shape VictoriaMetrics returns for a per-cluster p95, with
+    // one extra label that must not survive.
     const ANSWER: &[u8] = br#"{"status":"success","data":{"resultType":"vector","result":[
-      {"metric":{"envoy_cluster_name":"agents","pod":"envoy-7f9c-xyz"},"value":[1791539151,"363.4146341463413"]},
-      {"metric":{"envoy_cluster_name":"protocol","pod":"envoy-7f9c-xyz"},"value":[1791539151,"17.93749999999997"]},
-      {"metric":{"envoy_cluster_name":"broken"},"value":[1791539151,"NaN"]}]}}"#;
+      {"metric":{"envoy_cluster_name":"agents","pod":"envoy-pod-a"},"value":[1700000000,"250.4"]},
+      {"metric":{"envoy_cluster_name":"protocol","pod":"envoy-pod-a"},"value":[1700000000,"12.6"]},
+      {"metric":{"envoy_cluster_name":"broken"},"value":[1700000000,"NaN"]}]}}"#;
 
     fn q() -> MetricQuery {
         MetricQuery {
@@ -588,7 +588,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(ms.iter().map(|x| x.1).collect::<Vec<_>>(), vec![363, 18]);
+        assert_eq!(ms.iter().map(|x| x.1).collect::<Vec<_>>(), vec![250, 13]);
         assert!(
             sink.records()
                 .iter()
@@ -601,11 +601,11 @@ mod tests {
     // A `count by (le)` answer for envoy's upstream request time, out of order, with a
     // label that must not matter.
     const BUCKETS: &[u8] = br#"{"status":"success","data":{"resultType":"vector","result":[
-      {"metric":{"le":"+Inf"},"value":[1791539151,"12"]},
-      {"metric":{"le":"0.5"},"value":[1791539151,"12"]},
-      {"metric":{"le":"1000"},"value":[1791539151,"12"]},
-      {"metric":{"le":"25"},"value":[1791539151,"12"]},
-      {"metric":{"le":"250","pod":"x"},"value":[1791539151,"12"]}]}}"#;
+      {"metric":{"le":"+Inf"},"value":[1700000000,"12"]},
+      {"metric":{"le":"0.5"},"value":[1700000000,"12"]},
+      {"metric":{"le":"1000"},"value":[1700000000,"12"]},
+      {"metric":{"le":"25"},"value":[1700000000,"12"]},
+      {"metric":{"le":"250","pod":"x"},"value":[1700000000,"12"]}]}}"#;
 
     #[test]
     fn a_query_names_its_histogram_or_the_file_does() {
@@ -683,11 +683,11 @@ mod tests {
     }
 
     #[test]
-    fn envoy_s_real_buckets_parse_in_order() {
-        // `count by (le) (envoy_cluster_upstream_rq_time_bucket)` at 2026-10-09T09:00:00Z,
-        // from VictoriaMetrics on nevio-server.
-        let real = include_bytes!("../../tests/fixtures/metrics-envoy-buckets.json");
-        let b = parse_bounds(real).unwrap();
+    fn envoy_s_default_buckets_parse_in_order() {
+        // The shape of `count by (le) (envoy_cluster_upstream_rq_time_bucket)` over Envoy's
+        // default buckets, with synthetic counts.
+        let fixture = include_bytes!("../../tests/fixtures/metrics-envoy-buckets.json");
+        let b = parse_bounds(fixture).unwrap();
         assert_eq!(b.first().map(String::as_str), Some("0.5"));
         assert_eq!(b.last().map(String::as_str), Some("+Inf"));
         let finite: Vec<f64> = b[..b.len() - 1]

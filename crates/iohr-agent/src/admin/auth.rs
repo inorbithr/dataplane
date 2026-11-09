@@ -88,13 +88,6 @@ impl Pending {
     }
 }
 
-/// 32 random bytes, base64url.
-pub(super) fn random() -> String {
-    let mut raw = [0u8; 32];
-    let _ = getrandom::fill(&mut raw);
-    B64.encode(raw)
-}
-
 /// The issuer's discovery document, the parts used.
 #[derive(Debug, Deserialize)]
 pub(super) struct Discovery {
@@ -301,7 +294,7 @@ mod tests {
 
     #[test]
     fn groups_map_to_the_highest_role() {
-        let n = random();
+        let n = crate::random::urlsafe(32);
         let p = person_from_id_token(
             &token(&good(&n)),
             "https://login.example.com",
@@ -318,14 +311,16 @@ mod tests {
     fn a_token_that_does_not_hold_is_refused() {
         let o = policy();
         let iss = "https://login.example.com";
-        let n = random();
+        let n = crate::random::urlsafe(32);
         let mut c = good(&n);
         c["aud"] = "someone-else".into();
         assert!(person_from_id_token(&token(&c), iss, &o, &n).is_err());
         let mut c = good(&n);
         c["exp"] = 1.into();
         assert!(person_from_id_token(&token(&c), iss, &o, &n).is_err());
-        assert!(person_from_id_token(&token(&good(&n)), iss, &o, &random()).is_err());
+        assert!(
+            person_from_id_token(&token(&good(&n)), iss, &o, &crate::random::urlsafe(32)).is_err()
+        );
         let mut c = good(&n);
         c["iss"] = "https://evil.example".into();
         assert!(person_from_id_token(&token(&c), iss, &o, &n).is_err());

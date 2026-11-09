@@ -58,14 +58,10 @@ impl TokenSource {
 
     /// The client assertion: `iss` = `sub` = client id, `aud` = token endpoint, short-lived,
     /// with a random `jti`.
-    ///
-    /// # Errors
-    /// When the random source fails.
-    pub fn assertion(&self) -> Result<String> {
+    #[must_use]
+    pub fn assertion(&self) -> String {
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let mut jti = [0u8; 16];
-        getrandom::fill(&mut jti).map_err(|e| Error::Token(format!("random: {e}")))?;
-        let jti = hex(&jti);
+        let jti = crate::random::hex(16);
         let claims = json!({
             "iss": self.enrollment.client_id,
             "sub": self.enrollment.client_id,
@@ -74,7 +70,7 @@ impl TokenSource {
             "iat": now,
             "exp": now + ASSERTION_TTL_SECS,
         });
-        Ok(self.key.sign_jwt(&claims))
+        self.key.sign_jwt(&claims)
     }
 
     /// A token valid for at least another minute.
@@ -88,7 +84,7 @@ impl TokenSource {
         {
             return Ok(token.clone());
         }
-        let assertion = Zeroizing::new(self.assertion()?);
+        let assertion = Zeroizing::new(self.assertion());
         let form = [
             ("grant_type", "client_credentials"),
             (
@@ -149,14 +145,4 @@ impl TokenSource {
     pub async fn invalidate(&self) {
         *self.cached.lock().await = None;
     }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-            let _ = write!(s, "{b:02x}");
-            s
-        })
 }

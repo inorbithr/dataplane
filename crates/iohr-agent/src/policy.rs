@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 use crate::checks::Surface;
 use crate::error::{Error, Result};
@@ -857,15 +856,7 @@ impl Policy {
     /// `sha256:<hex>` over the policy's canonical form; what the platform is told.
     #[must_use]
     pub fn hash(&self) -> String {
-        let canonical = serde_json::to_vec(self).unwrap_or_default();
-        let digest = Sha256::digest(&canonical);
-        let mut out = String::with_capacity(7 + 64);
-        out.push_str("sha256:");
-        for b in digest {
-            use std::fmt::Write as _;
-            let _ = write!(out, "{b:02x}");
-        }
-        out
+        crate::ledger::sha256_hex(&serde_json::to_vec(self).unwrap_or_default())
     }
 
     /// Whether a job may send this secret reference to `host` (`[secrets] allow`, and

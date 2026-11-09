@@ -311,19 +311,19 @@ mod tests {
     fn links_name_their_listings() {
         assert_eq!(
             target_of(&u(
-                "https://play.google.com/store/apps/details?id=com.velebit.babbly&hl=en"
+                "https://play.google.com/store/apps/details?id=com.example.app&hl=en"
             )),
             Some(Target::Store(u(
-                "https://play.google.com/store/apps/details?id=com.velebit.babbly"
+                "https://play.google.com/store/apps/details?id=com.example.app"
             )))
         );
         assert_eq!(
-            target_of(&u("https://github.com/velebit-ai/")),
-            Some(Target::GitHubOrg("velebit-ai".into()))
+            target_of(&u("https://github.com/example-org/")),
+            Some(Target::GitHubOrg("example-org".into()))
         );
         assert_eq!(
-            target_of(&u("https://github.com/velebit-ai/repo/issues")),
-            Some(Target::GitHubOrg("velebit-ai".into()))
+            target_of(&u("https://github.com/example-org/repo/issues")),
+            Some(Target::GitHubOrg("example-org".into()))
         );
         assert_eq!(target_of(&u("https://github.com/features")), None);
         assert_eq!(
@@ -336,10 +336,10 @@ mod tests {
         );
         assert_eq!(
             target_of(&u(
-                "https://docs.velebit.ai/assets/openapi-specs/visual-search.yaml"
+                "https://docs.example.com/assets/openapi-specs/search.yaml"
             )),
             Some(Target::Spec(u(
-                "https://docs.velebit.ai/assets/openapi-specs/visual-search.yaml"
+                "https://docs.example.com/assets/openapi-specs/search.yaml"
             )))
         );
         assert_eq!(target_of(&u("https://www.linkedin.com/company/x")), None);
