@@ -6,8 +6,8 @@ use url::Url;
 
 use super::super::html::looks_like_spec;
 
-/// The registrable domain of `host` by the Public Suffix List (`velebit.ai` for
-/// `docs.velebit.ai`, `example.co.uk` for `www.example.co.uk`), else the host itself (an
+/// The registrable domain of `host` by the Public Suffix List (`example.com` for
+/// `docs.example.com`, `example.co.uk` for `www.example.co.uk`), else the host itself (an
 /// address, `localhost`).
 #[must_use]
 pub fn registrable(host: &str) -> String {
@@ -321,16 +321,16 @@ mod tests {
 
     #[test]
     fn the_scope_is_the_registrable_domain() {
-        assert_eq!(registrable("docs.velebit.ai"), "velebit.ai");
+        assert_eq!(registrable("docs.example.com"), "example.com");
         assert_eq!(registrable("www.example.co.uk"), "example.co.uk");
         assert_eq!(registrable("user.github.io"), "user.github.io");
         assert_eq!(registrable("localhost"), "localhost");
         assert_eq!(registrable("docs.localhost"), "docs.localhost");
         assert_eq!(registrable("127.0.0.1"), "127.0.0.1");
-        assert!(in_scope("docs.velebit.ai", "velebit.ai"));
-        assert!(in_scope("VELEBIT.AI.", "velebit.ai"));
-        assert!(!in_scope("notvelebit.ai", "velebit.ai"));
-        assert!(!in_scope("velebit.ai.evil.test", "velebit.ai"));
+        assert!(in_scope("docs.example.com", "example.com"));
+        assert!(in_scope("EXAMPLE.COM.", "example.com"));
+        assert!(!in_scope("notexample.com", "example.com"));
+        assert!(!in_scope("example.com.evil.test", "example.com"));
     }
 
     #[test]
@@ -355,11 +355,11 @@ mod tests {
     fn links_are_sorted_into_classes() {
         let cases = [
             (
-                "https://play.google.com/store/apps/details?id=com.velebit.babbly",
+                "https://play.google.com/store/apps/details?id=com.example.app",
                 LinkClass::AppStore,
             ),
             ("https://apps.apple.com/us/app/x/id123", LinkClass::AppStore),
-            ("https://github.com/velebit-ai/", LinkClass::CodeHost),
+            ("https://github.com/example-org/", LinkClass::CodeHost),
             ("https://gitlab.com/acme/tool", LinkClass::CodeHost),
             ("https://pypi.org/project/acme/", LinkClass::Registry),
             ("https://www.npmjs.com/package/acme", LinkClass::Registry),
@@ -368,16 +368,16 @@ mod tests {
                 "https://search.maven.org/artifact/hr.acme/acme",
                 LinkClass::Registry,
             ),
-            ("https://docs.velebit.ai/api/", LinkClass::ApiDocs),
+            ("https://docs.example.com/api/", LinkClass::ApiDocs),
             ("https://acme.test/assets/openapi.yaml", LinkClass::ApiDocs),
             (
                 "https://raw.githubusercontent.com/a/b/main/swagger.json",
                 LinkClass::ApiDocs,
             ),
-            ("https://dash.velebit.ai/register", LinkClass::SignUp),
+            ("https://dash.example.com/register", LinkClass::SignUp),
             ("https://acme.test/signup", LinkClass::SignUp),
             (
-                "https://www.linkedin.com/company/velebitai/",
+                "https://www.linkedin.com/company/example-org/",
                 LinkClass::Other,
             ),
         ];

@@ -11,8 +11,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use super::DoorConfig;
 use super::tokens::{Tokens, error_class, now_s};
-use super::{DoorConfig, write_state};
+use crate::atomic::write as write_state;
 
 /// Edge says the origin is down: always worth another try, even for a call.
 const EDGE_DOWN: [u16; 4] = [521, 522, 523, 530];

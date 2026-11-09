@@ -21,7 +21,6 @@ use std::sync::Mutex;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 use crate::error::{Error, Result};
 
@@ -129,17 +128,11 @@ impl Entry {
     }
 }
 
-/// `sha256:<hex>` of `bytes`.
+/// `sha256:<hex>` of `bytes`, the digest form the evidence crate names content by. The
+/// agent's one helper for it: policy, checks, ledger, audit and plan hashes all use it.
 #[must_use]
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let d = Sha256::digest(bytes);
-    let mut s = String::with_capacity(71);
-    s.push_str("sha256:");
-    for b in d {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
+    iohr_evidence::digest::ContentDigest::of_bytes(bytes).to_hex()
 }
 
 /// What is being recorded.
@@ -514,18 +507,8 @@ fn read_anchor(dir: &Path) -> Option<Anchor> {
 
 fn write_anchor(dir: &Path, a: &Anchor) -> Result<()> {
     let path = dir.join("anchor.json");
-    let tmp = dir.join("anchor.json.tmp");
-    let mut o = OpenOptions::new();
-    o.create(true).write(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        o.mode(0o600);
-    }
-    let mut f = o.open(&tmp).map_err(|e| Error::io(&tmp, e))?;
-    f.write_all(&serde_json::to_vec(a).unwrap_or_default())
-        .map_err(|e| Error::io(&tmp, e))?;
-    std::fs::rename(&tmp, &path).map_err(|e| Error::io(&path, e))
+    crate::atomic::write(&path, &serde_json::to_vec(a).unwrap_or_default())
+        .map_err(|e| Error::io(&path, e))
 }
 
 /// What `ledger verify` found.

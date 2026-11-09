@@ -127,11 +127,17 @@ securityContext:
   capabilities:
     drop: ["ALL"]
 
-# Optional egress NetworkPolicy: DNS plus the CIDRs listed here (the platform API and the
-# targets your policy allows). Off by default because API addresses vary.
+# Optional egress NetworkPolicy: the cluster DNS pods plus the CIDRs listed here (the platform
+# API and the targets your policy allows). Off by default because API addresses vary.
 networkPolicy:
   enabled: false
   egressCIDRs: []
+  # DNS (port 53) goes only to these pods, not to any address. The defaults match kube-dns
+  # and CoreDNS in kube-system; change them if your cluster's DNS runs elsewhere.
+  dns:
+    namespace: kube-system
+    podLabels:
+      k8s-app: kube-dns
 
 nodeSelector: {}
 tolerations: []

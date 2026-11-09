@@ -59,10 +59,9 @@ pub async fn run(
     cap: usize,
 ) -> std::io::Result<Output> {
     let mut cmd = Command::new(bin);
+    crate::child_env::isolate_tokio(&mut cmd, &[], env);
     cmd.args(args)
         .current_dir(cwd)
-        .env_clear()
-        .envs(env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

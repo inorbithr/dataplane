@@ -110,6 +110,8 @@ description = "Lint and render the Helm chart"
 run = """
 helm lint charts/iohr-agent --strict --set environment=staging
 helm template t charts/iohr-agent --set environment=staging,enrollment.existingSecret=t,secrets.kubernetes.secretNames={a},secrets.vault.addr=https://vault.example:8200,secrets.vault.tokenSecret.name=v,networkPolicy.enabled=true,networkPolicy.egressCIDRs={10.0.0.0/8} > /dev/null
+netpol=$(helm template t charts/iohr-agent --show-only templates/networkpolicy.yaml --set environment=staging,networkPolicy.enabled=true)
+grep -qF 'k8s-app: kube-dns' <<<"$netpol" && grep -qF 'kubernetes.io/metadata.name: kube-system' <<<"$netpol" || { echo "DNS egress must go to the cluster DNS pods only" >&2; exit 1; }
 helm template t charts/iohr-agent --set environment=staging,checks.existingConfigMap=c > /dev/null
 rendered=$(helm template t charts/iohr-agent --set environment=staging,metadata.placement.country=DE,metadata.environment.tier=production,metadata.compliance.regimes={gdpr})
 grep -qF '    [metadata.placement]' <<<"$rendered" && grep -qF '    country = \"DE\"' <<<"$rendered" || { echo "metadata values do not render into agent.toml" >&2; exit 1; }

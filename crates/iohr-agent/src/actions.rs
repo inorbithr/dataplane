@@ -242,10 +242,10 @@ impl ActionsPolicy {
             s.auth
                 .parse::<SecretRef>()
                 .map_err(|e| format!("actions.sensors.{}: {e}", s.name))?;
-            if !secret_allowed(secrets, &s.auth) {
+            if !secrets.allows_for(&s.auth, &base.1) {
                 return Err(format!(
-                    "actions.sensors.{}: {} is not in [secrets] allow",
-                    s.name, s.auth
+                    "actions.sensors.{}: {} is not in [secrets] allow for {}",
+                    s.name, s.auth, base.1
                 ));
             }
         }
@@ -261,25 +261,11 @@ impl ActionsPolicy {
     }
 }
 
-fn secret_allowed(secrets: &SecretsPolicy, reference: &str) -> bool {
-    secrets.allow.iter().any(|p| match p.strip_suffix('*') {
-        Some(prefix) => reference.starts_with(prefix),
-        None => reference == p,
-    })
-}
-
 /// A key's id: the first 16 hex digits of SHA-256 over its 32 bytes. The platform names
 /// the key it signed with by this id.
 #[must_use]
 pub fn key_id(public: &[u8; 32]) -> String {
-    let d = Sha256::digest(public);
-    d.iter()
-        .take(8)
-        .fold(String::with_capacity(16), |mut s, b| {
-            use std::fmt::Write as _;
-            let _ = write!(s, "{b:02x}");
-            s
-        })
+    crate::random::to_hex(&Sha256::digest(public)[..8])
 }
 
 fn parse_key(k: &str) -> Result<(String, ed25519_dalek::VerifyingKey), String> {
@@ -305,12 +291,11 @@ pub fn is_uid(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// `http(s)://host[:port]` and nothing else: the URL, its host and its port.
+/// `https://host[:port]` (plain http only to loopback) and nothing else: the URL, its host and its port.
 fn parse_base(s: &str) -> Result<(url::Url, String, u16), String> {
     let u = url::Url::parse(s).map_err(|e| format!("base_url {s:?}: {e}"))?;
-    if !matches!(u.scheme(), "http" | "https") {
-        return Err(format!("base_url {s:?} must be http or https"));
-    }
+    // The connector's token goes with every request: never in clear past this machine.
+    crate::config::check_platform_url(&u).map_err(|e| format!("base_url {e}"))?;
     if !u.username().is_empty() || u.password().is_some() {
         return Err(format!("base_url {s:?} must not carry credentials"));
     }
@@ -494,17 +479,59 @@ pub struct Plan {
 }
 
 /// Remembers job ids until their envelope expires, so none runs twice.
-#[derive(Debug, Default)]
+///
+/// One set serves the whole process: a reload (a console apply, `iohr agent share`)
+/// builds a new executor on the same set, so it keeps every id it has seen.
+///
+/// The set lives in memory, so it starts empty after a restart. An envelope issued
+/// before this process started, less the allowed clock skew (`bounds::SKEW_SECS`,
+/// 60 s), is therefore refused: it may have run before the restart and its id is no
+/// longer remembered. The skew allowance means an envelope issued in the 60 s before a
+/// start is still admitted once after it, even if it also ran before the restart; that
+/// window keeps a clock up to 60 s ahead of the platform's from refusing fresh jobs
+/// just after a start. The platform signs a fresh envelope for a job it still wants, so
+/// the cost is one retry per job in flight across a restart; keeping the set on disk
+/// instead would add a state file that has to survive crashes and stay private.
+#[derive(Debug)]
 pub struct Replay {
     seen: Mutex<HashMap<String, i64>>,
+    started_at: i64,
+}
+
+impl Default for Replay {
+    /// Starts now.
+    fn default() -> Self {
+        Self::since(time::OffsetDateTime::now_utc().unix_timestamp())
+    }
 }
 
 impl Replay {
-    /// Records `job_id` until `expires_at`, or says it was seen.
+    /// A set that refuses envelopes issued before `started_at` (unix seconds).
+    #[must_use]
+    pub fn since(started_at: i64) -> Self {
+        Self {
+            seen: Mutex::new(HashMap::new()),
+            started_at,
+        }
+    }
+
+    /// Records `job_id` until `expires_at`, or says it was seen or is older than this
+    /// set.
     ///
     /// # Errors
-    /// Seen already, or too many live entries.
-    pub fn once(&self, job_id: &str, expires_at: i64, now: i64) -> Result<(), String> {
+    /// Seen already, issued before this set started, or too many live entries.
+    pub fn once(
+        &self,
+        job_id: &str,
+        issued_at: i64,
+        expires_at: i64,
+        now: i64,
+    ) -> Result<(), String> {
+        if issued_at < self.started_at.saturating_sub(bounds::SKEW_SECS) {
+            return Err(format!(
+                "the job {job_id} was issued before the agent started (replay refused)"
+            ));
+        }
         let mut seen = match self.seen.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
@@ -619,9 +646,9 @@ pub fn admit(
             "the datasource {ds} is not in the local policy's [actions] datasources"
         ));
     }
-    if !policy.secret_allowed(&a.auth) {
+    if !policy.secret_allowed(&a.auth, &host) {
         return Err(format!(
-            "the secret reference {} is not in the local policy's [secrets] allow",
+            "the secret reference {} is not in the local policy's [secrets] allow for {host}",
             a.auth
         ));
     }
@@ -671,7 +698,7 @@ pub fn admit(
     } else {
         a.max_bytes.min(actions.max_bytes)
     };
-    replay.once(&env.job_id, env.expires_at, now)?;
+    replay.once(&env.job_id, env.issued_at, env.expires_at, now)?;
     Ok(Plan {
         connector: a.connector,
         url,
@@ -1196,7 +1223,7 @@ hosts = ["grafana.observability.svc.cluster.local", "127.0.0.1"]
     fn action(path: &str, query: &[(&str, &str)]) -> Value {
         json!({
             "connector": GRAFANA, "action": "x",
-            "base_url": "http://grafana.observability.svc.cluster.local:3000",
+            "base_url": "https://grafana.observability.svc.cluster.local:3000",
             "method": "GET", "path": path,
             "query": query.iter().map(|(k, v)| json!([k, v])).collect::<Vec<_>>(),
             "auth": "k8s:observability/grafana-inorbit-sa#token",
@@ -1221,7 +1248,7 @@ hosts = ["grafana.observability.svc.cluster.local", "127.0.0.1"]
     }
 
     fn try_admit(p: &Policy, job: &str, spec: &Value) -> Result<Plan, String> {
-        admit(p, "acct-1", AGENT, job, spec, &Replay::default(), NOW)
+        admit(p, "acct-1", AGENT, job, spec, &Replay::since(NOW), NOW)
     }
 
     #[test]
@@ -1235,7 +1262,7 @@ hosts = ["grafana.observability.svc.cluster.local", "127.0.0.1"]
         assert_eq!(plan.route, Route::Search);
         assert_eq!(
             plan.url.as_str(),
-            "http://grafana.observability.svc.cluster.local:3000/api/search?type=dash-db"
+            "https://grafana.observability.svc.cluster.local:3000/api/search?type=dash-db"
         );
     }
 
@@ -1309,9 +1336,28 @@ hosts = ["grafana.observability.svc.cluster.local", "127.0.0.1"]
     }
 
     #[test]
+    fn a_token_never_travels_in_clear_past_loopback() {
+        for ok in [
+            "https://grafana.example:3000",
+            "http://127.0.0.1:3000",
+            "http://[::1]:3000",
+            "http://localhost:3000",
+        ] {
+            assert!(parse_base(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://grafana.example:3000",
+            "http://10.0.0.5",
+            "ftp://grafana.example",
+        ] {
+            assert!(parse_base(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn a_job_runs_once() {
         let p = policy("");
-        let replay = Replay::default();
+        let replay = Replay::since(NOW);
         let spec = signed_with(&signer(), &envelope("job_1", action("/api/search", &[])));
         admit(&p, "acct-1", AGENT, "job_1", &spec, &replay, NOW).unwrap();
         let e = admit(&p, "acct-1", AGENT, "job_1", &spec, &replay, NOW).unwrap_err();
@@ -1319,10 +1365,59 @@ hosts = ["grafana.observability.svc.cluster.local", "127.0.0.1"]
     }
 
     #[test]
+    fn a_job_issued_before_a_restart_is_refused() {
+        let p = policy("");
+        // The envelope was issued 5 s before NOW; this process started 2 minutes after
+        // that, so its replay set never saw the job and cannot vouch for it.
+        let restarted = Replay::since(NOW + 120);
+        let mut env = envelope("job_r", action("/api/search", &[]));
+        env["expires_at"] = json!(NOW + 500);
+        let spec = signed_with(&signer(), &env);
+        let e = admit(&p, "acct-1", AGENT, "job_r", &spec, &restarted, NOW + 125).unwrap_err();
+        assert!(e.contains("before the agent started"), "{e}");
+        // Within the allowed clock skew of the start it still runs.
+        let fresh = Replay::since(NOW + 30);
+        admit(&p, "acct-1", AGENT, "job_r", &spec, &fresh, NOW + 35).unwrap();
+    }
+
+    #[test]
+    fn a_job_admitted_before_a_reload_is_refused_after_it() {
+        use crate::executor::{Admission, Executor};
+        use std::sync::Arc;
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let replay = Arc::new(Replay::default());
+        // One executor per generation, as `agent::supervise` builds them.
+        let generation = || {
+            let tls = TlsContext::new(None).unwrap();
+            let secrets = SecretResolver::new(crate::config::SecretsConfig::default(), tls.clone());
+            Executor::new(Arc::new(policy("")), tls, secrets)
+                .with_agent_id(AGENT)
+                .with_account_id("acct-1")
+                .with_replay(Arc::clone(&replay))
+        };
+        let mut env = envelope("job_g", action("/api/search", &[]));
+        env["issued_at"] = json!(now - 5);
+        env["expires_at"] = json!(now + 55);
+        let job = crate::protocol::Job {
+            job_id: "job_g".into(),
+            kind: KIND.into(),
+            spec: signed_with(&signer(), &env),
+            deadline_ms: None,
+        };
+        let before = generation();
+        assert!(matches!(before.admit(&job), Admission::RunAction(_)));
+        drop(before);
+        match generation().admit(&job) {
+            Admission::Refuse(r) => assert!(r.contains("already ran")),
+            Admission::Run(_) | Admission::RunAction(_) => panic!("admitted again after a reload"),
+        }
+    }
+
+    #[test]
     fn host_route_and_method_are_allowlisted() {
         let p = policy("");
         let mut a = action("/api/search", &[]);
-        a["base_url"] = json!("http://grafana.evil.example:3000");
+        a["base_url"] = json!("https://grafana.evil.example:3000");
         let e = try_admit(&p, "j", &signed_with(&signer(), &envelope("j", a))).unwrap_err();
         assert!(
             e.contains("not in the local policy's [actions] hosts"),
@@ -1347,7 +1442,7 @@ hosts = ["grafana.observability.svc.cluster.local", "127.0.0.1"]
         let e = try_admit(&p, "j", &signed_with(&signer(), &envelope("j", a))).unwrap_err();
         assert!(e.contains("read only"), "{e}");
         let mut a = action("/api/search", &[]);
-        a["base_url"] = json!("http://user:pw@grafana.observability.svc.cluster.local:3000");
+        a["base_url"] = json!("https://user:pw@grafana.observability.svc.cluster.local:3000");
         assert!(try_admit(&p, "j", &signed_with(&signer(), &envelope("j", a))).is_err());
         let mut a = action("/api/search", &[]);
         a["auth"] = json!("vault:kv/other#token");
@@ -1492,7 +1587,7 @@ datasources = ["vm"]
 [[actions.sensors]]
 name = "api-errors"
 template = "error-rate"
-base_url = "http://grafana.observability.svc.cluster.local:3000"
+base_url = "https://grafana.observability.svc.cluster.local:3000"
 auth = "k8s:observability/grafana-inorbit-sa#token"
 datasource_uid = "vm"
 expr = "sum(rate(errors[5m]))"
@@ -1543,7 +1638,7 @@ datasources = ["vm"]
 [[actions.sensors]]
 name = "api-errors"
 template = "error-rate"
-base_url = "http://grafana.observability.svc.cluster.local:3000"
+base_url = "https://grafana.observability.svc.cluster.local:3000"
 auth = "k8s:observability/grafana-inorbit-sa#token"
 datasource_uid = "vm"
 expr = "sum(rate(errors[5m]))"
@@ -1569,7 +1664,7 @@ crit = 5.0
         );
         // Another port on the same host: counts only.
         let mut port = a.clone();
-        port["base_url"] = json!("http://grafana.observability.svc.cluster.local:3001");
+        port["base_url"] = json!("https://grafana.observability.svc.cluster.local:3001");
         assert!(
             !try_admit(&p, "j", &signed_with(&signer(), &envelope("j", port)))
                 .unwrap()
@@ -1614,7 +1709,7 @@ crit = 5.0
     fn a_trailing_dot_host_is_refused() {
         let p = policy("");
         let mut a = action("/api/search", &[]);
-        a["base_url"] = json!("http://grafana.observability.svc.cluster.local.:3000");
+        a["base_url"] = json!("https://grafana.observability.svc.cluster.local.:3000");
         let e = try_admit(&p, "j", &signed_with(&signer(), &envelope("j", a))).unwrap_err();
         assert!(e.contains("dot"), "{e}");
     }
@@ -1657,7 +1752,7 @@ crit = 5.0
             AGENT,
             "j",
             &signed_with(&signer(), &env),
-            &Replay::default(),
+            &Replay::since(NOW),
             NOW,
         )
         .unwrap_err();

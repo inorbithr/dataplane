@@ -27,11 +27,22 @@ production platform and `127.0.0.1:47821`.
 
 ## The local door
 
-- `POST /mcp` and `POST /login` only. A request is refused with 403 unless it has no
-  `Origin` header (a browser always sends one), a `Host` that is the door's own address,
-  and `X-Iohr-Bridge` equal to the local secret (compared in constant time).
+- `--listen` takes a loopback address only (`127.0.0.1`, `[::1]`); any other address is
+  refused at start.
+- Every request, `GET /status` included, is refused with 403 unless it has no `Origin`
+  header (a browser always sends one) and a `Host` that is the door's own address:
+  `127.0.0.1:<port>`, `localhost:<port>` or `[::1]:<port>`. A page on another name that
+  resolves to this machine fails here.
+- `POST /mcp` and `POST /login` also need `X-Iohr-Bridge` equal to the local secret
+  (compared in constant time).
 - `GET /status` needs no secret and carries no token: `auth`, `auth_why`, `token_left_s`,
   `upstream`, `cached_tools`. Other methods get 405.
+- `auth` is `ok` while the door holds a refresh token from a sign-in. It turns
+  `unauthenticated`, with the reason in `auth_why`, when there is none yet or the platform
+  refuses the refresh; only `iohr-agent mcp login` turns it back. A refresh that fails
+  for any other reason (the platform unreachable, say) leaves it as it was.
+- The sign-in redirect port takes the code from a `GET` carrying this sign-in's `state`
+  only; any other request there is answered and the wait goes on.
 - The local secret and the token chain are two keychain items (`iohr-mcp-bridge-local`,
   `iohr-mcp-bridge`). The token item is written through `security -i` on stdin, never argv.
 

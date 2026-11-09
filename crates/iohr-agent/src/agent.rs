@@ -135,6 +135,8 @@ pub struct Agent {
 
 impl Agent {
     /// Checks that configuration, policy and enrollment agree, and builds the agent.
+    /// `replay` is the set of signed action jobs this process has seen; every generation
+    /// of one process shares it.
     ///
     /// # Errors
     /// When they disagree, or TLS cannot be set up.
@@ -145,6 +147,7 @@ impl Agent {
         checks: Option<DeclaredChecks>,
         enrollment: Enrollment,
         key: AgentKey,
+        replay: Arc<crate::actions::Replay>,
     ) -> Result<Self> {
         if config.environment != policy.environment {
             return Err(Error::Policy(format!(
@@ -239,7 +242,8 @@ impl Agent {
                 .with_share(share.targets, share_key.clone())
                 .with_monitors(monitors_on)
                 .with_agent_id(enrollment.agent_id.clone())
-                .with_account_id(enrollment.account_id.clone()),
+                .with_account_id(enrollment.account_id.clone())
+                .with_replay(replay),
         );
         let state = Arc::new(AgentState::new(
             AgentInfo {
@@ -497,9 +501,17 @@ fn build(
     policy: Policy,
     checks: Option<DeclaredChecks>,
     enrollment: &Enrollment,
+    replay: &Arc<crate::actions::Replay>,
 ) -> Result<Arc<Agent>> {
     let key = AgentKey::load(&config.key)?;
-    let agent = Agent::new(config.clone(), policy, checks, enrollment.clone(), key)?;
+    let agent = Agent::new(
+        config.clone(),
+        policy,
+        checks,
+        enrollment.clone(),
+        key,
+        Arc::clone(replay),
+    )?;
     tracing::info!(
         agent_id = %agent.enrollment.agent_id,
         environment = %agent.config.environment,
@@ -523,7 +535,8 @@ fn build(
 /// in generations. A reload (the page's "What InOrbit sees", `iohr agent share`) reads
 /// the policy and checks again; only when they are valid does the running generation
 /// stop and a new one start with them, opening a new session whose hello says what the
-/// new policy shares. A reload that fails leaves the agent as it was.
+/// new policy shares. A reload that fails leaves the agent as it was. The signed action
+/// jobs already seen are kept across reloads; only a new process starts that set again.
 ///
 /// # Errors
 /// When the first start fails, or the agent is revoked.
@@ -534,7 +547,14 @@ pub async fn supervise(
 ) -> Result<()> {
     let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel::<Reload>(4);
     let (mut policy, mut checks) = load_files(&config, &enrollment)?;
-    let mut agent = build(&config, policy.clone(), checks.clone(), &enrollment)?;
+    let replay = Arc::new(crate::actions::Replay::default());
+    let mut agent = build(
+        &config,
+        policy.clone(),
+        checks.clone(),
+        &enrollment,
+        &replay,
+    )?;
     let admin = AdminListener::bind(&config).await?;
     let token = admin.as_ref().map(|a| a.token.clone());
     let (ctx_tx, ctx_rx) = watch::channel(Arc::new(
@@ -581,7 +601,13 @@ pub async fn supervise(
             return Err(e);
         }
         let before = agent.policy_hash.clone();
-        match build(&config, new_policy.clone(), new_checks.clone(), &enrollment) {
+        match build(
+            &config,
+            new_policy.clone(),
+            new_checks.clone(),
+            &enrollment,
+            &replay,
+        ) {
             Ok(a) => {
                 let msg = if a.policy_hash == before {
                     "reloaded; the policy is unchanged".to_owned()
@@ -595,7 +621,13 @@ pub async fn supervise(
             }
             Err(e) => {
                 tracing::warn!(error = %e, "reload failed; starting again with the previous policy");
-                agent = build(&config, policy.clone(), checks.clone(), &enrollment)?;
+                agent = build(
+                    &config,
+                    policy.clone(),
+                    checks.clone(),
+                    &enrollment,
+                    &replay,
+                )?;
                 let _ = req.reply.send(Err(e.to_string()));
             }
         }

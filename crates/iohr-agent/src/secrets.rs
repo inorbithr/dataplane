@@ -227,11 +227,7 @@ impl SecretResolver {
         } else {
             reqwest::Client::builder()
         };
-        let client = builder
-            .no_proxy()
-            .timeout(TIMEOUT)
-            .build()
-            .map_err(|e| e.to_string())?;
+        let client = store_client(builder)?;
         let url = api
             .join(&format!("api/v1/namespaces/{namespace}/secrets/{name}"))
             .map_err(|e| e.to_string())?;
@@ -270,11 +266,7 @@ impl SecretResolver {
         } else {
             reqwest::Client::builder()
         };
-        let client = builder
-            .no_proxy()
-            .timeout(TIMEOUT)
-            .build()
-            .map_err(|e| e.to_string())?;
+        let client = store_client(builder)?;
         let url: Url = v
             .addr
             .join(&format!("v1/{mount}/data/{path}"))
@@ -290,6 +282,17 @@ impl SecretResolver {
             .map(|s| Zeroizing::new(s.to_owned()))
             .ok_or_else(|| format!("the secret has no string key {key}"))
     }
+}
+
+/// The client for a secret store: no proxy, a timeout, and no redirects, so the store's token
+/// header is only ever sent to the address that was configured.
+fn store_client(builder: reqwest::ClientBuilder) -> std::result::Result<reqwest::Client, String> {
+    builder
+        .no_proxy()
+        .timeout(TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| e.to_string())
 }
 
 fn in_cluster_api() -> std::result::Result<Url, String> {
@@ -443,6 +446,54 @@ mod tests {
             .await
             .unwrap_err();
         assert!(e.to_string().contains("404"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn vault_redirects_are_not_followed() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = hits.clone();
+        let other = serve(Router::new().fallback(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+            async { axum::Json(serde_json::json!({"data": {"data": {"token": "x"}}})) }
+        }))
+        .await;
+        let target = format!("{other}v1/kv/data/staging/app");
+        let url = serve(Router::new().route(
+            "/v1/kv/data/staging/app",
+            get(move || {
+                let target = target.clone();
+                async move {
+                    (
+                        axum::http::StatusCode::TEMPORARY_REDIRECT,
+                        [(axum::http::header::LOCATION, target)],
+                    )
+                }
+            }),
+        ))
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let tf = dir.path().join("vt");
+        std::fs::write(&tf, "vt\n").unwrap();
+        let cfg = SecretsConfig {
+            vault: Some(VaultConfig {
+                addr: url,
+                token: format!("file:{}", tf.display()),
+                namespace: None,
+            }),
+            ..SecretsConfig::default()
+        };
+        let e = resolver(cfg)
+            .resolve(&"vault:kv/staging/app#token".parse().unwrap())
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("307"), "{e}");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "the redirect target is never asked"
+        );
     }
 
     #[tokio::test]

@@ -210,7 +210,7 @@ fn evidence_is_the_report_signed_with_the_agent_key() {
     let web = web_target();
     let s = setup(&checks(web));
     let cfg = AgentConfig::load(&s.config).unwrap();
-    let key = iohr_agent::keys::AgentKey::generate(iohr_agent::keys::KeyAlg::Es256).unwrap();
+    let key = iohr_agent::keys::AgentKey::generate(iohr_agent::keys::KeyAlg::Es256);
     key.save(&cfg.key, false).unwrap();
     let evidence = s.config.parent().unwrap().join("run.jws");
     let (code, _) = run(

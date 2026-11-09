@@ -145,12 +145,12 @@ pub async fn enroll(p: EnrollParams<'_>) -> Result<Enrollment> {
             p.key_path.display()
         )));
     }
-    let key = AgentKey::generate(p.key_alg)?;
-    // Write the key first under a temporary name: if the platform accepts the public key,
-    // the private one must already be safe on disk.
-    let tmp = p.key_path.with_extension("key.new");
-    let _ = std::fs::remove_file(&tmp);
-    key.save(&tmp, false)?;
+    let key = AgentKey::generate(p.key_alg);
+    // Write the key first beside its place: if the platform accepts the public key, the
+    // private one must already be safe on disk. It replaces the old key only once
+    // enrollment succeeded; any earlier return removes it.
+    let staged = crate::atomic::stage(p.key_path, key.to_pem()?.as_bytes())
+        .map_err(|e| Error::io(p.key_path, e))?;
     let body = EnrollRequest {
         token: p.token,
         public_jwk: key.public_jwk(),
@@ -176,21 +176,14 @@ pub async fn enroll(p: EnrollParams<'_>) -> Result<Enrollment> {
             .map_err(|e| Error::Enroll(format!("unexpected answer: {}", without_url(&e))))
     }
     .await;
-    let r = match result {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
-    };
+    let r = result?;
     if r.environment != p.environment {
-        let _ = std::fs::remove_file(&tmp);
         return Err(Error::Enroll(format!(
             "the token is for environment {:?} but this agent's configuration and policy say {:?}",
             r.environment, p.environment
         )));
     }
-    std::fs::rename(&tmp, p.key_path).map_err(|e| Error::io(p.key_path, e))?;
+    staged.commit().map_err(|e| Error::io(p.key_path, e))?;
     let record = Enrollment {
         agent_id: r.agent_id,
         account_id: r.account_id,

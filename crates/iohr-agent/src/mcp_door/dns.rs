@@ -107,7 +107,7 @@ impl FallbackResolver {
         }
         c.insert(host.to_owned(), new);
         if let Ok(bytes) = serde_json::to_vec(&c) {
-            let _ = super::write_state(&self.cache, &bytes);
+            let _ = crate::atomic::write(&self.cache, &bytes);
         }
     }
 

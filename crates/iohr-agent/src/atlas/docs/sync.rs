@@ -8,7 +8,6 @@
 //! store.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use chrono::TimeDelta;
@@ -131,35 +130,9 @@ fn file_for(id: &str) -> String {
     hex.trim_start_matches("sha256:")[..32].to_owned()
 }
 
-fn make_private_dir(dir: &Path) -> Result<()> {
-    let mut b = std::fs::DirBuilder::new();
-    b.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        b.mode(0o700);
-    }
-    b.create(dir).map_err(|e| Error::io(dir, e))
-}
-
 /// Writes through a temporary file and a rename, readable by this user only.
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        make_private_dir(dir)?;
-    }
-    let tmp = path.with_extension("tmp");
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(&tmp).map_err(|e| Error::io(&tmp, e))?;
-    f.write_all(bytes).map_err(|e| Error::io(&tmp, e))?;
-    f.sync_all().map_err(|e| Error::io(&tmp, e))?;
-    drop(f);
-    std::fs::rename(&tmp, path).map_err(|e| Error::io(path, e))
+    crate::keys::write_private(path, bytes, true)
 }
 
 fn remove_if_present(path: &Path) -> Result<()> {
@@ -278,7 +251,7 @@ pub async fn sync_source<S: DocsSource>(
         }
     };
     summary.workspace.clone_from(&identity.workspace);
-    make_private_dir(&opts.store.join("items"))?;
+    crate::keys::create_private_dir(&opts.store.join("items"))?;
     let mut state = State::load(&opts.store, provider)?;
     let readers = Readers::new(sink, provider, &identity.principal, &identity.scopes, clock)?;
 

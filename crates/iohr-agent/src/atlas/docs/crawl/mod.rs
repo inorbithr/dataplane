@@ -1179,9 +1179,7 @@ impl Crawler<'_> {
             sitemap_urls: self.sitemap_urls,
         };
         let bytes = serde_json::to_vec(&s).map_err(|e| CrawlError::State(e.to_string()))?;
-        let tmp = p.with_extension("tmp");
-        std::fs::write(&tmp, bytes)
-            .and_then(|()| std::fs::rename(&tmp, p))
+        crate::atomic::write(p, &bytes)
             .map_err(|e| CrawlError::State(format!("{}: {e}", p.display())))
     }
 }

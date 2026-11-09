@@ -115,7 +115,7 @@ impl Backoff {
             .min(self.max);
         self.attempt = self.attempt.saturating_add(1);
         let mut r = [0u8; 8];
-        let _ = getrandom::fill(&mut r);
+        crate::random::fill(&mut r);
         let frac = u64::from_le_bytes(r);
         let ms = u64::try_from(ceiling.as_millis()).unwrap_or(u64::MAX);
         let jittered = if ms == 0 { 0 } else { frac % (ms + 1) };
@@ -397,6 +397,11 @@ async fn once(agent: &Arc<Agent>, shutdown: &mut watch::Receiver<bool>) -> Resul
                 let Some(msg) = msg else { return Ok(SessionEnd::Closed) };
                 match msg.map_err(|e| Error::Session(e.to_string()))? {
                     Message::Text(t) => match serde_json::from_str::<ServerFrame>(t.as_str()) {
+                        Ok(ServerFrame::Job(job)) if running.contains_key(&job.job_id) => {
+                            // The running one keeps its handle, so a cancel still reaches it;
+                            // its result answers for both, so the repeat is not counted.
+                            tracing::warn!(job_id = %job.job_id, "a job with this id is already running; the repeat is ignored");
+                        }
                         Ok(ServerFrame::Job(job)) => {
                             agent.state.job_received();
                             match agent.executor.admit(&job) {
