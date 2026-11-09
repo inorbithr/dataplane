@@ -286,6 +286,12 @@ pub struct AtlasCrawlArgs {
     /// URL), for a caller that shows a bar: `{"event":"progress","v":1,...}`, RFC 0163.
     #[arg(long)]
     pub progress: bool,
+    /// Keep the HTML of every page read in `pages/<name>.html` beside `--out` (the name is the
+    /// first 16 hex digits of the SHA-256 of the page's URL), so a caller can read the text
+    /// without asking the site again. A page the browser rendered is kept as rendered; any
+    /// other as the server sent it, which for a page built by script can be an empty shell.
+    #[arg(long, requires = "out")]
+    pub keep_pages: bool,
 }
 
 /// `atlas docs …`.
@@ -1118,6 +1124,18 @@ async fn atlas_crawl(args: &AtlasCrawlArgs, config_path: &Path) -> Result<ExitCo
         },
         state: args.state.clone(),
         per_minute: crawl::per_minute_for_rate(args.rate),
+        keep_pages: args.keep_pages.then(|| {
+            args.out.as_deref().and_then(Path::parent).map_or_else(
+                || PathBuf::from("."),
+                |d| {
+                    if d.as_os_str().is_empty() {
+                        PathBuf::from(".")
+                    } else {
+                        d.to_path_buf()
+                    }
+                },
+            )
+        }),
     };
     let show = args.progress;
     let r = crawl::crawl_reporting(&crawl_cfg, &policy, &tls, &mut |p| {
