@@ -116,11 +116,20 @@ fn post(path: &str, host: &str, extra: &str, body: &str) -> String {
     )
 }
 
+/// A fresh one-time sign-in code made from `token`, as `page --open` makes it.
+fn code(token: &str) -> String {
+    super::signin_code(token, time::OffsetDateTime::now_utc().unix_timestamp())
+}
+
 /// Signs in with the token; the session cookie.
 async fn sign_in(addr: SocketAddr, token: &str) -> String {
     let r = send(
         addr,
-        &get(&format!("/auth?token={token}"), &addr.to_string(), ""),
+        &get(
+            &format!("/auth?code={}", code(token)),
+            &addr.to_string(),
+            "",
+        ),
     )
     .await;
     r.lines()
@@ -283,6 +292,7 @@ fn a_change_is_refused_beyond_loopback() {
         tls: true,
         sessions: Mutex::new(Vec::new()),
         pending: Mutex::new(Vec::new()),
+        spent: Mutex::new(HashMap::new()),
         buckets: Mutex::new(HashMap::new()),
         conn_buckets: Mutex::new(HashMap::new()),
         slots: Arc::new(Semaphore::new(1)),
@@ -474,7 +484,7 @@ async fn a_cross_origin_post_is_refused_and_nothing_writes() {
         403
     );
     assert_eq!(
-        status(&send(addr, &get("/auth?token=x", &host, nav)).await),
+        status(&send(addr, &get("/auth?code=x", &host, nav)).await),
         403
     );
     // Framing it: the CSP and X-Frame-Options forbid it.
@@ -584,10 +594,36 @@ async fn the_token_opens_the_page_once_required() {
     assert_eq!(status(&r), 401);
     // A wrong token, a prefix of the right one, a forged cookie: still locked.
     for t in ["nope", &token[..63], &format!("{token}0")] {
-        let r = send(addr, &get(&format!("/auth?token={t}"), &host, "")).await;
+        let r = send(addr, &get(&format!("/auth?code={}", code(t)), &host, "")).await;
         assert_eq!(status(&r), 401, "{t}");
         assert!(!r.contains("Set-Cookie"));
     }
+    // The token itself in the address no longer signs in (it would stay in the
+    // browser's history); nor does a code that is stale, malformed or already spent.
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let stale = super::signin_code(&token, now - 120);
+    let early = super::signin_code(&token, now + 120);
+    for q in [
+        format!("token={token}"),
+        format!("code={stale}"),
+        format!("code={early}"),
+        "code=1.2.3".to_owned(),
+        format!("code={token}"),
+    ] {
+        let r = send(addr, &get(&format!("/auth?{q}"), &host, "")).await;
+        assert_eq!(status(&r), 401, "{q}");
+        assert!(!r.contains("Set-Cookie"));
+    }
+    let once = code(&token);
+    // A HEAD (a link preview) neither signs in nor spends the code.
+    let head = get(&format!("/auth?code={once}"), &host, "").replacen("GET", "HEAD", 1);
+    let r = send(addr, &head).await;
+    assert_eq!(status(&r), 401, "{r}");
+    assert!(!r.contains("Set-Cookie"));
+    let r = send(addr, &get(&format!("/auth?code={once}"), &host, "")).await;
+    assert_eq!(status(&r), 303, "{r}");
+    let r = send(addr, &get(&format!("/auth?code={once}"), &host, "")).await;
+    assert_eq!(status(&r), 401, "a code signs in once");
     let r = send(
         addr,
         &get("/", &host, &format!("Cookie: {COOKIE}={token}\r\n")),
@@ -598,7 +634,7 @@ async fn the_token_opens_the_page_once_required() {
     let r = send(
         addr,
         &get(
-            &format!("/auth?token={token}"),
+            &format!("/auth?code={}", code(&token)),
             &host,
             "Sec-Fetch-Site: none\r\n",
         ),
@@ -670,6 +706,7 @@ async fn bounded_requests_and_rate() {
         tls: false,
         sessions: Mutex::new(Vec::new()),
         pending: Mutex::new(Vec::new()),
+        spent: Mutex::new(HashMap::new()),
         buckets: Mutex::new(HashMap::new()),
         conn_buckets: Mutex::new(HashMap::new()),
         slots: Arc::new(Semaphore::new(1)),
@@ -1246,7 +1283,7 @@ async fn the_console_bundle_is_served_with_its_own_csp() {
     let r = send(
         addr,
         &get(
-            &format!("/auth?token={token}&next=/console/monitors/"),
+            &format!("/auth?code={}&next=/console/monitors/", code(&token)),
             &host,
             "",
         ),
@@ -1256,7 +1293,7 @@ async fn the_console_bundle_is_served_with_its_own_csp() {
     let r = send(
         addr,
         &get(
-            &format!("/auth?token={token}&next=https://evil.example/"),
+            &format!("/auth?code={}&next=https://evil.example/", code(&token)),
             &host,
             "",
         ),

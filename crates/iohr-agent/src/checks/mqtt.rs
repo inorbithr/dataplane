@@ -64,13 +64,8 @@ async fn converse(socket: &mut Socket, p: &Prepared<'_>) -> Result<(), ErrorClas
         return Err(ErrorClass::Connect);
     };
     let mut nonce = [0u8; 8];
-    getrandom::fill(&mut nonce).map_err(|_| ErrorClass::Connect)?;
-    let hex = nonce.iter().fold(String::new(), |mut s, b| {
-        use std::fmt::Write as _;
-        let _ = write!(s, "{b:02x}");
-        s
-    });
-    let client_id = format!("iohr-agent-{hex}");
+    crate::random::fill(&mut nonce);
+    let client_id = format!("iohr-agent-{}", crate::random::to_hex(&nonce));
     let reply = format!("reply/{client_id}/check");
     let payload = match &p.spec.params.body {
         Some(v) => serde_json::to_vec(v).map_err(|_| ErrorClass::Connect)?,

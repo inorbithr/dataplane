@@ -8,7 +8,6 @@
 //! (`<state_dir>/share.key`, 0600), so the platform cannot test guesses ("is it
 //! `db.internal:5432`?") against it.
 
-use std::fmt::Write as _;
 use std::path::Path;
 
 use serde_json::{Value, json};
@@ -39,7 +38,7 @@ pub fn key(state_dir: &Path) -> Result<Vec<u8>> {
         )));
     }
     let mut raw = [0u8; 32];
-    getrandom::fill(&mut raw).map_err(|e| Error::Config(format!("random: {e}")))?;
+    crate::random::fill(&mut raw);
     std::fs::create_dir_all(state_dir).map_err(|e| Error::io(state_dir, e))?;
     let mut o = std::fs::OpenOptions::new();
     o.write(true).create_new(true);
@@ -53,13 +52,7 @@ pub fn key(state_dir: &Path) -> Result<Vec<u8>> {
     Ok(raw.to_vec())
 }
 
-fn hex(b: &[u8]) -> String {
-    b.iter()
-        .fold(String::with_capacity(b.len() * 2), |mut s, x| {
-            let _ = write!(s, "{x:02x}");
-            s
-        })
-}
+use crate::random::to_hex as hex;
 
 fn unhex(s: &str) -> Vec<u8> {
     if !s.len().is_multiple_of(2) {
@@ -337,28 +330,7 @@ pub fn write_policy(path: &Path, share: &SharePolicy) -> Result<bool> {
     if out == text {
         return Ok(false);
     }
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp = dir.join(format!(
-        ".{}.share-{}",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("policy.toml"),
-        std::process::id()
-    ));
-    let perms = std::fs::metadata(path)
-        .map_err(|e| Error::io(path, e))?
-        .permissions();
-    let write = || -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&tmp)?;
-        std::io::Write::write_all(&mut f, out.as_bytes())?;
-        f.sync_all()?;
-        std::fs::set_permissions(&tmp, perms.clone())?;
-        std::fs::rename(&tmp, path)
-    };
-    write().map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        Error::io(path, e)
-    })?;
+    crate::atomic::write_keeping_mode(path, out.as_bytes()).map_err(|e| Error::io(path, e))?;
     Ok(true)
 }
 

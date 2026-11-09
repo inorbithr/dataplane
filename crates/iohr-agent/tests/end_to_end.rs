@@ -310,6 +310,36 @@ async fn reconnects_and_stops_work_when_disconnected() {
 }
 
 #[tokio::test]
+async fn a_repeated_job_id_leaves_the_running_job_cancellable() {
+    let mut h = harness(KeyAlg::Es256).await;
+    let (_agent, stop, task) = start(&h).await;
+    next(&mut h.frames, "hello").await;
+    // A target that accepts and never answers: the job hangs until its deadline.
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = silent.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut held = VecDeque::new();
+        while let Ok((s, _)) = silent.accept().await {
+            held.push_back(s);
+        }
+    });
+    let hang = json!({"type": "job", "job_id": "twice", "kind": "check", "deadline_ms": 1500,
+        "spec": {"surface": "grpc_health", "target": {"host": "127.0.0.1", "port": port, "tls": false}}});
+    h.cmds.send(Cmd::Send(hang.clone())).ok();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    h.cmds.send(Cmd::Send(hang)).ok();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    h.cmds
+        .send(Cmd::Send(json!({"type": "cancel", "job_id": "twice"})))
+        .ok();
+    // The cancel stopped the one job that ran: nothing reports at its deadline.
+    let late = tokio::time::timeout(Duration::from_secs(3), next(&mut h.frames, "result")).await;
+    assert!(late.is_err(), "a job outlived its cancel: {late:?}");
+    stop.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn revoked_agent_stops_for_good() {
     let mut h = harness(KeyAlg::Es256).await;
     let (agent, _stop, task) = start(&h).await;
@@ -337,7 +367,7 @@ async fn revoked_agent_stops_for_good() {
 async fn a_foreign_key_cannot_get_a_token() {
     let h = harness(KeyAlg::Es256).await;
     let enrollment = enroll_agent(&h).await;
-    let stranger = AgentKey::generate(KeyAlg::Es256).unwrap();
+    let stranger = AgentKey::generate(KeyAlg::Es256);
     let src = TokenSource::new(
         reqwest::Client::new(),
         Arc::new(enrollment),
@@ -438,6 +468,7 @@ async fn start_on_fixture(
             DeclaredChecks::load(&h.cfg.checks).unwrap(),
             enrollment,
             key,
+            Arc::default(),
         )
         .unwrap(),
     );

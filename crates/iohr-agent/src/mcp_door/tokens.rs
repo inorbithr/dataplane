@@ -30,20 +30,6 @@ pub fn now_s() -> f64 {
         .map_or(0.0, |d| d.as_secs_f64())
 }
 
-/// A random URL-safe string of `n` bytes of entropy.
-#[must_use]
-pub fn random_urlsafe(n: usize) -> String {
-    let mut buf = vec![0_u8; n];
-    // No randomness means no safe verifier, state or local secret: stop rather than use zeros.
-    if getrandom::fill(&mut buf).is_err() {
-        tracing::error!("the operating system has no randomness; stopping");
-        std::process::abort();
-    }
-    let s = URL_SAFE_NO_PAD.encode(&buf);
-    buf.zeroize();
-    s
-}
-
 /// The chain as stored.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct TokenSet {
@@ -371,9 +357,9 @@ impl Tokens {
             {
                 return l.url.clone();
             }
-            let verifier = random_urlsafe(64);
+            let verifier = crate::random::urlsafe(64);
             let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-            let state = random_urlsafe(24);
+            let state = crate::random::urlsafe(24);
             let Ok(mut url) = url::Url::parse(&format!("{}/oauth2/auth", self.cfg.issuer)) else {
                 tracing::warn!("login: the issuer is not a URL");
                 return String::new();
@@ -398,7 +384,7 @@ impl Tokens {
         let me = Arc::clone(self);
         tokio::spawn(async move { me.callback_server(verifier, state).await });
         if self.cfg.open_browser {
-            open_in_browser(&url);
+            let _ = crate::browser::open(&url);
         }
         tracing::info!("login: started");
         url
@@ -437,7 +423,7 @@ impl Tokens {
     }
 
     /// Answers one request on the redirect port; true when the sign-in is over.
-    async fn one_callback(
+    pub(super) async fn one_callback(
         &self,
         sock: &mut tokio::net::TcpStream,
         verifier: &str,
@@ -457,20 +443,24 @@ impl Tokens {
             }
         }
         let head = String::from_utf8_lossy(&buf[..n]).into_owned();
-        let target = head
-            .lines()
-            .next()
-            .and_then(|l| l.split_whitespace().nth(1))
-            .unwrap_or("/");
+        let mut line = head.lines().next().unwrap_or_default().split_whitespace();
+        let method = line.next().unwrap_or_default();
+        let target = line.next().unwrap_or("/");
         let q: std::collections::HashMap<String, String> =
             url::Url::parse(&format!("http://localhost{target}"))
                 .map(|u| u.query_pairs().into_owned().collect())
                 .unwrap_or_default();
         let (mut ok, mut msg) = (false, "Sign-in failed.");
-        let errored = q.contains_key("error");
-        if q.get("state").is_some_and(|s| s == state)
-            && let Some(code) = q.get("code")
-        {
+        // Only the redirect for this sign-in, carrying its state, may end it: any other
+        // local request on the port is answered and the wait goes on. The browser follows
+        // the redirect with a GET; any other method (a HEAD probe, say) leaves the code
+        // unused.
+        let get = method == "GET";
+        let state_ok = get
+            && q.get("state")
+                .is_some_and(|s| crate::admin::constant_time_eq(s.as_bytes(), state.as_bytes()));
+        let errored = state_ok && q.contains_key("error");
+        if state_ok && let Some(code) = q.get("code") {
             let redirect = self.cfg.redirect();
             let form = [
                 ("grant_type", "authorization_code"),
@@ -501,7 +491,13 @@ impl Tokens {
             format!("<!doctype html><meta charset=utf-8><title>InOrbit MCP</title><p>{msg}</p>");
         let resp = format!(
             "HTTP/1.1 {} X\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{body}",
-            if ok { 200 } else { 400 },
+            if ok {
+                200
+            } else if get {
+                400
+            } else {
+                405
+            },
             body.len()
         );
         let _ = sock.write_all(resp.as_bytes()).await;
@@ -527,17 +523,4 @@ pub fn error_class(e: &reqwest::Error) -> String {
         "error"
     };
     kind.into()
-}
-
-fn open_in_browser(url: &str) {
-    let opener = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    let _ = std::process::Command::new(opener)
-        .arg(url)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
 }

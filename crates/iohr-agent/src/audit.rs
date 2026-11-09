@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 use crate::error::{Error, Result};
 
@@ -63,17 +62,11 @@ impl Entry {
         let mut e = self.clone();
         e.hash = String::new();
         let bytes = serde_json::to_vec(&e).unwrap_or_default();
-        format!("sha256:{}", hex(&Sha256::digest(bytes)))
+        sha256_hex(&bytes)
     }
 }
 
-fn hex(b: &[u8]) -> String {
-    b.iter().fold(String::with_capacity(64), |mut s, x| {
-        use std::fmt::Write as _;
-        let _ = write!(s, "{x:02x}");
-        s
-    })
-}
+use crate::ledger::sha256_hex;
 
 /// What a caller records.
 #[derive(Debug, Clone, Default)]
@@ -115,7 +108,7 @@ impl Audit {
         }
         let path = dir.join(FILE);
         let mut seq = 0;
-        let mut prev = format!("sha256:{}", hex(&Sha256::digest(b"")));
+        let mut prev = sha256_hex(b"");
         let mut recent = std::collections::VecDeque::with_capacity(RECENT);
         if let Ok(f) = std::fs::File::open(&path) {
             for line in std::io::BufReader::new(f)
@@ -211,7 +204,7 @@ impl Audit {
         let Ok(f) = std::fs::File::open(&self.path) else {
             return Ok(0);
         };
-        let mut prev = format!("sha256:{}", hex(&Sha256::digest(b"")));
+        let mut prev = sha256_hex(b"");
         let mut n = 0;
         for (i, line) in std::io::BufReader::new(f).lines().enumerate() {
             let line = line.map_err(|e| e.to_string())?;

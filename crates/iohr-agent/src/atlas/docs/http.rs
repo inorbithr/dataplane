@@ -306,11 +306,8 @@ impl ApiClient {
             .min(self.limits.backoff_max);
         // Full jitter over the upper half: retries from many agents do not line up.
         let mut b = [0u8; 2];
-        let frac = if getrandom::fill(&mut b).is_ok() {
-            f64::from(u16::from_le_bytes(b)) / f64::from(u16::MAX)
-        } else {
-            1.0
-        };
+        crate::random::fill(&mut b);
+        let frac = f64::from(u16::from_le_bytes(b)) / f64::from(u16::MAX);
         exp.mul_f64(0.5 + frac / 2.0)
     }
 

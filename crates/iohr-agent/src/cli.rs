@@ -865,8 +865,8 @@ fn ledger_export(args: &LedgerExportArgs, config_path: &Path) -> Result<ExitCode
     Ok(ExitCode::SUCCESS)
 }
 
-/// `page`: the address, or the browser opened on it with this run's token (which turns
-/// into a cookie for that browser and leaves the address bar at once).
+/// `page`: the address, or the browser opened on it signed in, with a one-time code made
+/// from this run's token (it turns into a cookie for that browser and is spent).
 fn page(args: &PageArgs, config_path: &Path) -> Result<ExitCode> {
     let cfg = AgentConfig::load(config_path)?;
     if !cfg.admin.enabled {
@@ -912,18 +912,14 @@ fn page(args: &PageArgs, config_path: &Path) -> Result<ExitCode> {
         ))
     })?;
     let next = if args.console { "&next=/console/" } else { "" };
-    let url = format!("{base}auth?token={}{next}", token.trim());
-    let opener = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    let status = std::process::Command::new(opener)
-        .arg(&url)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    match status {
+    // A one-time code, not the token: the address stays in the browser's history.
+    let code = crate::admin::signin_code(
+        token.trim(),
+        time::OffsetDateTime::now_utc().unix_timestamp(),
+    );
+    let url = format!("{base}auth?code={code}{next}");
+    let opener = crate::browser::opener();
+    match crate::browser::open(&url).and_then(|mut c| c.wait()) {
         Ok(s) if s.success() => {
             out(&format!("Opened {landing} in your browser, signed in."));
             Ok(ExitCode::SUCCESS)
