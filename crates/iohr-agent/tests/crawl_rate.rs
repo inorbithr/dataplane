@@ -27,13 +27,27 @@ type Routes = BTreeMap<&'static str, (u16, String, &'static str)>;
 struct Site {
     log: Log,
     routes: Routes,
+    /// A path whose first request is answered with this status and `Retry-After: 0`.
+    throttle: Option<(&'static str, u16)>,
+    throttled: std::sync::atomic::AtomicBool,
 }
 
 impl Respond for Site {
     fn respond(&self, r: &Request) -> ResponseTemplate {
         let path = r.url.path().to_owned();
         let answer = self.routes.get(path.as_str());
-        self.log.lock().unwrap().push((path, Instant::now()));
+        self.log
+            .lock()
+            .unwrap()
+            .push((path.clone(), Instant::now()));
+        if let Some((p, status)) = self.throttle
+            && p == path
+            && !self
+                .throttled
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return ResponseTemplate::new(status).insert_header("retry-after", "0");
+        }
         match answer {
             Some((status, body, ct)) => {
                 ResponseTemplate::new(*status).set_body_raw(body.clone(), ct)
@@ -68,7 +82,7 @@ struct Ran {
 /// Crawls a site `routes` describes (it is given the site's origin, whose port is known
 /// only once the server is up) and keeps every progress line.
 async fn run(routes: impl FnOnce(&str) -> Routes, per_minute: u32, pages: usize) -> Ran {
-    run_keeping(routes, per_minute, pages, None).await
+    run_site(routes, per_minute, pages, None, None).await
 }
 
 /// [`run`], keeping the pages under `keep` when it is given.
@@ -78,6 +92,16 @@ async fn run_keeping(
     pages: usize,
     keep: Option<std::path::PathBuf>,
 ) -> Ran {
+    run_site(routes, per_minute, pages, None, keep).await
+}
+
+async fn run_site(
+    routes: impl FnOnce(&str) -> Routes,
+    per_minute: u32,
+    pages: usize,
+    throttle: Option<(&'static str, u16)>,
+    keep: Option<std::path::PathBuf>,
+) -> Ran {
     let log: Log = Arc::default();
     let server = MockServer::start().await;
     let origin = format!("http://localhost:{}", server.address().port());
@@ -85,6 +109,8 @@ async fn run_keeping(
         .respond_with(Site {
             log: Arc::clone(&log),
             routes: routes(&origin),
+            throttle,
+            throttled: std::sync::atomic::AtomicBool::new(false),
         })
         .mount(&server)
         .await;
@@ -148,7 +174,7 @@ fn the_rate_is_per_second_and_bounded() {
 
 #[tokio::test]
 async fn requests_are_spaced_to_the_rate_asked() {
-    for (rate, slack) in [(10_u32, 0.8_f64), (20, 0.8)] {
+    for rate in [10_u32, 20] {
         let r = run(
             |_| linked_site(5, robots("")),
             per_minute_for_rate(rate),
@@ -160,11 +186,8 @@ async fn requests_are_spaced_to_the_rate_asked() {
         assert_eq!(r.log.lock().unwrap().len(), 8);
         let gaps = gaps(&r.log, |_| true);
         let interval = Duration::from_secs(1).div_f64(f64::from(rate));
-        let least = interval.mul_f64(slack);
-        assert!(
-            gaps.iter().all(|g| *g >= least),
-            "rate {rate}: a gap under {least:?} in {gaps:?}"
-        );
+        let at: Vec<Instant> = r.log.lock().unwrap().iter().map(|(_, t)| *t).collect();
+        assert_paced(&at, interval, 4);
         // And not slower than it was asked to be: 7 gaps of one interval, with room for a
         // loaded machine, and a long way below the 7 s a request a second would take.
         let span: Duration = gaps.iter().sum();
@@ -192,6 +215,51 @@ async fn a_slower_crawl_delay_wins_over_the_rate() {
         "{pages:?}"
     );
     assert_eq!(r.result.hosts[0].crawl_delay, Some(1));
+}
+
+#[tokio::test]
+async fn a_429_or_a_503_halves_the_pace_and_it_stays_halved() {
+    // 5 a second is 200 ms apart. The site answers the first request for /b with a 429 (then
+    // a 503), so the requests after it have to be 400 ms apart: the rate halved, and it
+    // never went back up for the pages that were still to come.
+    for status in [429_u16, 503] {
+        let r = run_site(
+            |_| linked_site(8, robots("")),
+            per_minute_for_rate(5),
+            100,
+            Some(("/b", status)),
+            None,
+        )
+        .await;
+        assert!(r.result.complete, "{status}: {:?}", r.result.stopped_by);
+        let log = r.log.lock().unwrap();
+        let at: Vec<(String, Instant)> = log.clone();
+        drop(log);
+        // The throttled request is the first /b. Its retry still takes the slot that was
+        // reserved before the answer came; every request after the retry is paced by the
+        // halved rate.
+        let hit = at.iter().position(|(p, _)| p == "/b").unwrap();
+        assert_eq!(
+            at[hit + 1].0,
+            "/b",
+            "{status}: the throttled page is retried"
+        );
+        let after: Vec<Duration> = at[hit + 1..].windows(2).map(|w| w[1].1 - w[0].1).collect();
+        assert!(
+            after.len() >= 5,
+            "{status}: {} requests after it",
+            after.len()
+        );
+        let later: Vec<Instant> = at[hit + 1..].iter().map(|(_, t)| *t).collect();
+        assert_paced(&later, Duration::from_millis(400), 4);
+        // Before it, the pace is the one asked for (200 ms), not halved early.
+        let before: Vec<Instant> = at[..=hit].iter().map(|(_, t)| *t).collect();
+        assert_paced(&before, Duration::from_millis(200), 4);
+        assert!(
+            before[before.len() - 1] - before[0] < Duration::from_millis(4 * 320),
+            "{status}: it was slowed before the throttle"
+        );
+    }
 }
 
 #[tokio::test]
@@ -473,6 +541,22 @@ fn crawl_cli(port: u16, extra: &[&str]) -> Cli {
     }
 }
 
+/// A request is stamped when the server's thread gets to it, so on a loaded machine one stamp
+/// can be late and the next early (a 120 ms gap, then 3 ms). The pace is judged over `k`
+/// intervals at a time instead: `k` intervals, less a fifth, whatever one stamp did.
+fn assert_paced(at: &[Instant], interval: Duration, k: usize) {
+    assert!(at.len() > k, "{} requests", at.len());
+    let least = (interval * u32::try_from(k).unwrap()).mul_f64(0.8);
+    for w in at.windows(k + 1) {
+        let span = w[k] - w[0];
+        assert!(
+            span >= least,
+            "{k} intervals took {span:?}, under {least:?}: {:?}",
+            at.windows(2).map(|w| w[1] - w[0]).collect::<Vec<_>>()
+        );
+    }
+}
+
 fn progress_lines(stderr: &str) -> Vec<serde_json::Value> {
     stderr
         .lines()
@@ -491,11 +575,7 @@ fn the_binary_keeps_the_rate_and_reports_progress() {
     // robots.txt, the sitemap, the start page and eight more: 11 requests, 10 gaps of 50 ms.
     let at: Vec<Instant> = log.lock().unwrap().iter().map(|(_, t)| *t).collect();
     assert_eq!(at.len(), 11);
-    let gaps: Vec<Duration> = at.windows(2).map(|w| w[1] - w[0]).collect();
-    assert!(
-        gaps.iter().all(|g| *g >= Duration::from_millis(40)),
-        "{gaps:?}"
-    );
+    assert_paced(&at, Duration::from_millis(50), 5);
     assert!(c.elapsed >= Duration::from_millis(450), "{:?}", c.elapsed);
 
     let lines = progress_lines(&c.stderr);
@@ -549,10 +629,7 @@ fn the_default_rate_is_ten_a_second() {
     let at: Vec<Instant> = log.lock().unwrap().iter().map(|(_, t)| *t).collect();
     let gaps: Vec<Duration> = at.windows(2).map(|w| w[1] - w[0]).collect();
     assert_eq!(gaps.len(), 7);
-    assert!(
-        gaps.iter().all(|g| *g >= Duration::from_millis(80)),
-        "{gaps:?}"
-    );
+    assert_paced(&at, Duration::from_millis(100), 4);
     assert!(c.elapsed < Duration::from_secs(4), "{:?}", c.elapsed);
 }
 

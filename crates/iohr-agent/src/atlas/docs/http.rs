@@ -217,6 +217,23 @@ impl ApiClient {
         self.rate.fetch_min(per_minute.max(1), Ordering::Relaxed);
     }
 
+    /// Halves the pace (a host that answered 429 or 503 asked for less); never raises it and
+    /// never goes under one request a minute. Lowers the same rate `slow_to` does, so a
+    /// `Crawl-delay` that is slower still wins.
+    fn halve(&self) {
+        let mut now = self.rate.load(Ordering::Relaxed);
+        loop {
+            let half = (now / 2).max(1);
+            match self
+                .rate
+                .compare_exchange_weak(now, half, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(seen) => now = seen,
+            }
+        }
+    }
+
     /// The base URL.
     #[must_use]
     pub const fn base(&self) -> &Url {
@@ -380,6 +397,7 @@ impl ApiClient {
                     match status {
                         StatusCode::TOO_MANY_REQUESTS => {
                             self.stats.rate_limited.fetch_add(1, Ordering::Relaxed);
+                            self.halve();
                             let asked = retry_after(resp.headers());
                             if attempt >= self.limits.max_retries
                                 || asked.is_some_and(|d| d > self.limits.backoff_max)
@@ -395,6 +413,9 @@ impl ApiClient {
                         | StatusCode::BAD_GATEWAY
                         | StatusCode::SERVICE_UNAVAILABLE
                         | StatusCode::GATEWAY_TIMEOUT => {
+                            if status == StatusCode::SERVICE_UNAVAILABLE {
+                                self.halve();
+                            }
                             if attempt >= self.limits.max_retries {
                                 return Err(DocsError::Unavailable(format!("{what}: {status}")));
                             }
