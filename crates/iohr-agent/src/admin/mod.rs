@@ -103,12 +103,7 @@ const RELOAD_WAIT: Duration = Duration::from_secs(20);
 fn csrf_for(session: &str) -> String {
     use sha2::Digest as _;
     let d = sha2::Sha256::digest(format!("iohr-agent-page-form:{session}").as_bytes());
-    d.iter()
-        .take(16)
-        .fold(String::with_capacity(32), |mut s, b| {
-            let _ = write!(s, "{b:02x}");
-            s
-        })
+    crate::random::to_hex(&d[..16])
 }
 
 /// What the page reads. Never the private key, never the enrollment.
@@ -211,7 +206,8 @@ pub fn server_tls(admin: &AdminConfig) -> Result<Option<tokio_rustls::TlsAccepto
 /// `iohr agent page --open` reads it. A new one every start.
 ///
 /// # Errors
-/// When the random source or the file fails.
+/// When the folder or the file cannot be written. (Randomness cannot fail here: without
+/// it the process stops, see [`crate::random`].)
 pub fn write_token(state_dir: &Path) -> Result<String> {
     let token = crate::random::hex(32);
     std::fs::create_dir_all(state_dir).map_err(|e| Error::io(state_dir, e))?;

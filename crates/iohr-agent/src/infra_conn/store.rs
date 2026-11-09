@@ -6,21 +6,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 use super::Kind;
 use super::verbs::Arg;
 
-/// `sha256:` and the hex digest of `bytes`.
-#[must_use]
-pub fn sha256_of(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut s = String::from("sha256:");
-    for b in Sha256::digest(bytes) {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
-}
+pub use crate::ledger::sha256_hex as sha256_of;
 
 /// A plan's record. For tofu the plan hash is the plan file's sha256; for the others it
 /// is the sha256 of this record's canonical JSON with `hash` empty.
@@ -97,14 +87,7 @@ impl Store {
     /// # Errors
     /// The directory cannot be made.
     pub fn scratch(&self) -> std::io::Result<PathBuf> {
-        let mut id = [0u8; 8];
-        getrandom::fill(&mut id).map_err(std::io::Error::other)?;
-        let name = id.iter().fold(String::new(), |mut acc, b| {
-            use std::fmt::Write as _;
-            let _ = write!(acc, "{b:02x}");
-            acc
-        });
-        let p = self.root.join(format!(".work-{name}"));
+        let p = self.root.join(format!(".work-{}", crate::random::hex(8)));
         make_private(&p.join("files"))?;
         Ok(p)
     }

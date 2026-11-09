@@ -1,8 +1,10 @@
 //! Randomness for secrets: page tokens, session ids, OAuth state, verifiers and nonces,
-//! local secrets and keys.
+//! local secrets, keys, assertion ids and temporary names; and the retry jitter, which
+//! needs no secrecy but shares the one source. Every random byte the agent uses comes
+//! through here.
 //!
-//! None of these is safe when the operating system cannot supply randomness, so every
-//! helper here stops the process rather than hand out a predictable value.
+//! None of the secrets is safe when the operating system cannot supply randomness, so
+//! every helper here stops the process rather than hand out a predictable value.
 
 use std::fmt::Write as _;
 

@@ -59,21 +59,19 @@ impl fmt::Debug for AgentKey {
 
 impl AgentKey {
     /// Makes a new key from the operating system's random source.
-    ///
-    /// # Errors
-    /// When the random source fails.
-    pub fn generate(alg: KeyAlg) -> Result<Self> {
+    #[must_use]
+    pub fn generate(alg: KeyAlg) -> Self {
         loop {
             let mut seed = Zeroizing::new([0u8; 32]);
-            getrandom::fill(seed.as_mut()).map_err(|e| Error::Key(format!("random: {e}")))?;
+            crate::random::fill(seed.as_mut());
             match alg {
                 KeyAlg::Ed25519 => {
-                    return Ok(Self::Ed25519(ed25519_dalek::SigningKey::from_bytes(&seed)));
+                    return Self::Ed25519(ed25519_dalek::SigningKey::from_bytes(&seed));
                 }
                 KeyAlg::Es256 => {
                     // A scalar of zero or above the group order is rejected; draw again.
                     if let Ok(k) = p256::ecdsa::SigningKey::from_slice(seed.as_ref()) {
-                        return Ok(Self::Es256(k));
+                        return Self::Es256(k);
                     }
                 }
             }
@@ -206,21 +204,20 @@ impl AgentKey {
 }
 
 /// Writes `bytes` to `path` with mode 0600 (Unix), creating the parent directory with
-/// mode 0700 if needed.
+/// mode 0700 if needed. With `replace`, an existing file is swapped whole through
+/// [`crate::atomic::write`], so a reader never sees half of it.
 ///
 /// # Errors
 /// When the file exists (and `replace` is not set) or cannot be written.
 pub fn write_private(path: &Path, bytes: &[u8], replace: bool) -> Result<()> {
+    if replace {
+        return crate::atomic::write(path, bytes).map_err(|e| Error::io(path, e));
+    }
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         create_private_dir(parent)?;
     }
     let mut opts = OpenOptions::new();
-    opts.write(true);
-    if replace {
-        opts.create(true).truncate(true);
-    } else {
-        opts.create_new(true);
-    }
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -312,7 +309,7 @@ mod tests {
     #[test]
     fn signs_and_verifies_both_kinds() {
         for alg in [KeyAlg::Es256, KeyAlg::Ed25519] {
-            let key = AgentKey::generate(alg).unwrap();
+            let key = AgentKey::generate(alg);
             let jwk = key.public_jwk();
             assert_eq!(jwk["use"], "sig");
             assert_eq!(jwk["kid"], key.kid());
@@ -333,7 +330,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for alg in [KeyAlg::Es256, KeyAlg::Ed25519] {
             let path = dir.path().join(format!("k-{alg:?}/agent.key"));
-            let key = AgentKey::generate(alg).unwrap();
+            let key = AgentKey::generate(alg);
             key.save(&path, false).unwrap();
             assert!(key.save(&path, false).is_err(), "must not replace silently");
             let back = AgentKey::load(&path).unwrap();
@@ -351,7 +348,7 @@ mod tests {
 
     #[test]
     fn debug_hides_material() {
-        let key = AgentKey::generate(KeyAlg::Es256).unwrap();
+        let key = AgentKey::generate(KeyAlg::Es256);
         let s = format!("{key:?}");
         assert!(s.contains("ES256"));
         assert!(!s.contains("PRIVATE"));

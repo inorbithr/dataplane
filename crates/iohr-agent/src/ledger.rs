@@ -21,7 +21,6 @@ use std::sync::Mutex;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 use crate::error::{Error, Result};
 
@@ -129,17 +128,11 @@ impl Entry {
     }
 }
 
-/// `sha256:<hex>` of `bytes`.
+/// `sha256:<hex>` of `bytes`, the digest form the evidence crate names content by. The
+/// agent's one helper for it: policy, checks, ledger, audit and plan hashes all use it.
 #[must_use]
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let d = Sha256::digest(bytes);
-    let mut s = String::with_capacity(71);
-    s.push_str("sha256:");
-    for b in d {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
+    iohr_evidence::digest::ContentDigest::of_bytes(bytes).to_hex()
 }
 
 /// What is being recorded.

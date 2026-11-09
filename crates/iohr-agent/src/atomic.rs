@@ -7,15 +7,55 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 /// Replaces `path` with `bytes`, readable and writable by this user only (0600).
-/// Creates the parent folder when missing.
+/// Creates the parent folder, owner-only (0700), when missing.
 ///
 /// # Errors
 /// The folder or file cannot be written.
 pub fn write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    stage(path, bytes)?.commit()
+}
+
+/// Writes `bytes` beside `path` as [`write`] does, without replacing `path` yet:
+/// [`Staged::commit`] renames it into place, and dropping it uncommitted removes it.
+/// For a file that must be safe on disk before something else happens, and in place
+/// only once that succeeded (the agent key during enrollment).
+///
+/// # Errors
+/// The folder or file cannot be written.
+pub fn stage(path: &Path, bytes: &[u8]) -> std::io::Result<Staged> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir)?;
+        crate::keys::create_private_dir(dir).map_err(|e| match e {
+            crate::error::Error::Io { source, .. } => source,
+            other => std::io::Error::other(other.to_string()),
+        })?;
     }
-    replace(path, bytes, None)
+    stage_with(path, bytes, None)
+}
+
+/// A new file written beside its destination, not yet renamed over it.
+#[derive(Debug)]
+#[must_use = "dropping it removes the file; call commit to put it in place"]
+pub struct Staged {
+    tmp: PathBuf,
+    path: PathBuf,
+}
+
+impl Staged {
+    /// Renames the new file over its destination.
+    ///
+    /// # Errors
+    /// The rename fails; the new file is removed.
+    pub fn commit(self) -> std::io::Result<()> {
+        std::fs::rename(&self.tmp, &self.path)?;
+        std::mem::forget(self);
+        Ok(())
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.tmp);
+    }
 }
 
 /// Replaces `path` with `bytes`, keeping the permissions the file has now (0600 when it
@@ -29,28 +69,30 @@ pub fn write_keeping_mode(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 fn replace(path: &Path, bytes: &[u8], mode: Option<Permissions>) -> std::io::Result<()> {
-    let tmp = temp_beside(path);
-    let result = (|| {
-        let mut o = OpenOptions::new();
-        o.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            o.mode(0o600);
-        }
-        let mut f = o.open(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        drop(f);
-        if let Some(m) = mode {
-            std::fs::set_permissions(&tmp, m)?;
-        }
-        std::fs::rename(&tmp, path)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    stage_with(path, bytes, mode)?.commit()
+}
+
+fn stage_with(path: &Path, bytes: &[u8], mode: Option<Permissions>) -> std::io::Result<Staged> {
+    let staged = Staged {
+        tmp: temp_beside(path),
+        path: path.to_path_buf(),
+    };
+    let mut o = OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        o.mode(0o600);
     }
-    result
+    // A failure below drops `staged`, which removes whatever was written.
+    let mut f = o.open(&staged.tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    drop(f);
+    if let Some(m) = mode {
+        std::fs::set_permissions(&staged.tmp, m)?;
+    }
+    Ok(staged)
 }
 
 /// `.<name>.<random>.tmp` in the same folder, so the rename stays on one file system.
