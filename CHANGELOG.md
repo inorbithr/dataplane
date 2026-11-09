@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.1.0-alpha.14](https://github.com/inorbithr/dataplane/compare/v0.1.0-alpha.13...v0.1.0-alpha.14) (2026-11-09)
+
+
+### Bug fixes
+
+* **agent:** harden the local page, the MCP door and the agent's file writes ([#95](https://github.com/inorbithr/dataplane/issues/95)) ([bf82fda](https://github.com/inorbithr/dataplane/commit/bf82fda46557855bf87c322f61dfa221fc8c24c6))
+* **agent:** start child processes from a clean environment and tighten egress rules ([#96](https://github.com/inorbithr/dataplane/issues/96)) ([c44be2f](https://github.com/inorbithr/dataplane/commit/c44be2fe1d0d34d90bb5fc3fcadbe8c338f84d24))
+
+
+### Dependencies
+
+* **deps:** bump distroless/static-debian13 from `18f4cc2` to `25ac8f0` ([#91](https://github.com/inorbithr/dataplane/issues/91)) ([dc50bb3](https://github.com/inorbithr/dataplane/commit/dc50bb3a7ba4cbf4fbd56bc77d70c23c915613f3))
+
 ## [0.1.0-alpha.13](https://github.com/inorbithr/dataplane/compare/v0.1.0-alpha.12...v0.1.0-alpha.13) (2026-11-04)
 
 
