@@ -273,6 +273,19 @@ pub struct AtlasCrawlArgs {
     /// The browser for the render fallback (default: the first Chrome or Chromium found).
     #[arg(long)]
     pub browser: Option<PathBuf>,
+    /// Requests a second per host, 1 to 50. A robots.txt `Crawl-delay` that is slower wins.
+    #[arg(
+        long,
+        default_value_t = crate::atlas::docs::crawl::DEFAULT_RATE,
+        value_parser = clap::value_parser!(u32).range(
+            i64::from(crate::atlas::docs::crawl::MIN_RATE)..=i64::from(crate::atlas::docs::crawl::MAX_RATE)
+        ),
+    )]
+    pub rate: u32,
+    /// Write progress to standard error as JSON lines (counts and the scope, never a page
+    /// URL), for a caller that shows a bar: `{"event":"progress","v":1,...}`, RFC 0163.
+    #[arg(long)]
+    pub progress: bool,
 }
 
 /// `atlas docs …`.
@@ -1104,11 +1117,17 @@ async fn atlas_crawl(args: &AtlasCrawlArgs, config_path: &Path) -> Result<ExitCo
             RenderMode::Auto => Render::Auto(args.browser.clone()),
         },
         state: args.state.clone(),
-        per_minute: crawl::RATE_PER_MINUTE,
+        per_minute: crawl::per_minute_for_rate(args.rate),
     };
-    let r = crawl::crawl(&crawl_cfg, &policy, &tls)
-        .await
-        .map_err(|e| Error::Atlas(e.to_string()))?;
+    let show = args.progress;
+    let r = crawl::crawl_reporting(&crawl_cfg, &policy, &tls, &mut |p| {
+        if show {
+            // A closed standard error must not stop the crawl.
+            let _ = writeln!(std::io::stderr().lock(), "{}", p.line());
+        }
+    })
+    .await
+    .map_err(|e| Error::Atlas(e.to_string()))?;
     let json = serde_json::to_vec_pretty(&r).map_err(|e| Error::Atlas(e.to_string()))?;
     if let Some(path) = &args.out {
         std::fs::write(path, &json).map_err(|e| Error::io(path, e))?;

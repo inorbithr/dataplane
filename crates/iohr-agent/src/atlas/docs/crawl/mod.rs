@@ -3,7 +3,8 @@
 //! subdomain a link or redirect reaches. It reuses the site reader's robots.txt and
 //! sitemap parsing ([`super::site`]), the HTML tokenizer ([`super::html::outline`]) and
 //! the policy-pinned client ([`super::http::ApiClient`]): one client per origin, at most
-//! one request a second per host, one at a time.
+//! [`DEFAULT_RATE`] requests a second per host unless told otherwise (`--rate`, 1 to
+//! [`MAX_RATE`]), a longer `Crawl-delay` always winning, one request at a time.
 //!
 //! What it keeps is derived only: per page its URL, status, title, type, size, depth and
 //! whether it was rendered; per host its robots.txt outcome and counts; every outgoing
@@ -13,6 +14,7 @@
 //! sent, and it runs in the agent, never hosted.
 
 pub mod listings;
+pub mod progress;
 pub mod render;
 pub mod scope;
 
@@ -30,12 +32,36 @@ use url::Url;
 use super::DocsError;
 use super::html::{self, looks_like_spec};
 use super::http::{self, ApiClient, Fetched, Limits, TEXT};
-pub use super::site::RATE_PER_MINUTE;
 use super::site::{Robots, sitemap_entries};
 use crate::policy::Policy;
 use crate::tls::TlsContext;
 use listings::Target;
+use progress::{Phase, Progress};
 use scope::{LinkClass, classify, in_scope, is_media, key, registrable};
+
+/// Requests a second per host when nothing else is asked (owner, 2026-11-08).
+pub const DEFAULT_RATE: u32 = 10;
+/// The slowest `--rate`: one request a second.
+pub const MIN_RATE: u32 = 1;
+/// The fastest `--rate`. A judgement, not a measured limit: a crawl asks one host for one
+/// page at a time, and 50 a second is the most the agent will put on a site. A hard
+/// ceiling, not a target: robots.txt `Crawl-delay` still wins whenever it is slower, and a
+/// 429 or 503 halves the pace.
+pub const MAX_RATE: u32 = 50;
+
+/// The client's pace, in requests a minute, for `per_second` requests a second per host,
+/// held between [`MIN_RATE`] and [`MAX_RATE`].
+#[must_use]
+pub const fn per_minute_for_rate(per_second: u32) -> u32 {
+    let r = if per_second < MIN_RATE {
+        MIN_RATE
+    } else if per_second > MAX_RATE {
+        MAX_RATE
+    } else {
+        per_second
+    };
+    r * 60
+}
 
 /// Most pages a crawl may be given.
 pub const MAX_PAGES: usize = 20_000;
@@ -133,8 +159,9 @@ pub struct CrawlConfig {
     pub render: Render,
     /// A state file: written as the crawl goes, and resumed from when it exists.
     pub state: Option<PathBuf>,
-    /// Requests a minute per host. RFC 0163 sets 60 ([`RATE_PER_MINUTE`]) and the command
-    /// line keeps it; only tests against a local fixture raise it.
+    /// Requests a minute per host: [`per_minute_for_rate`] of `--rate` (10 a second,
+    /// 600 a minute, by default). A longer robots.txt `Crawl-delay` lowers it for its host.
+    /// Not bounded here: only tests against a local fixture go past [`MAX_RATE`].
     pub per_minute: u32,
 }
 
@@ -166,6 +193,14 @@ pub struct PageRecord {
     /// Why the page was not read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+impl PageRecord {
+    /// Whether the request failed: an error, or an HTTP status of 400 and over.
+    #[must_use]
+    pub fn failed(&self) -> bool {
+        self.error.is_some() || self.status >= 400
+    }
 }
 
 /// One host the crawl read from.
@@ -310,6 +345,8 @@ struct Saved {
     origins_seen: Vec<String>,
     listing_targets: Vec<String>,
     seconds: u64,
+    #[serde(default)]
+    sitemap_urls: usize,
 }
 
 /// Why a crawl could not run at all. A crawl that ran records its failures instead.
@@ -372,6 +409,7 @@ fn status_of(e: &DocsError) -> u16 {
 }
 
 struct Crawler<'a> {
+    on_progress: &'a mut (dyn FnMut(&Progress) + Send),
     policy: &'a Policy,
     tls: &'a TlsContext,
     budgets: Budgets,
@@ -392,6 +430,12 @@ struct Crawler<'a> {
     prior_seconds: u64,
     requests: u64,
     since_save: usize,
+    /// Pages that failed, kept as they come so a progress line costs nothing.
+    failed: usize,
+    /// The start page and the sitemap entries first queued: what a sitemap says the site has.
+    sitemap_urls: usize,
+    /// Whether a total has been given: once it has, it stays.
+    total_known: bool,
 }
 
 /// Crawls `cfg.start`'s registrable domain under `policy`.
@@ -402,6 +446,20 @@ pub async fn crawl(
     cfg: &CrawlConfig,
     policy: &Policy,
     tls: &TlsContext,
+) -> Result<CrawlResult, CrawlError> {
+    crawl_reporting(cfg, policy, tls, &mut |_| {}).await
+}
+
+/// [`crawl`], calling `on_progress` after every page, when a sitemap gives the total, and
+/// when the listings start and end ([`Progress`]).
+///
+/// # Errors
+/// The start URL is unusable, or the state file cannot be read or written.
+pub async fn crawl_reporting(
+    cfg: &CrawlConfig,
+    policy: &Policy,
+    tls: &TlsContext,
+    on_progress: &mut (dyn FnMut(&Progress) + Send),
 ) -> Result<CrawlResult, CrawlError> {
     let start = scope::clean(&cfg.start);
     if !matches!(start.scheme(), "http" | "https") {
@@ -420,6 +478,7 @@ pub async fn crawl(
         Render::Auto(None) => render::find_browser(),
     };
     let mut c = Crawler {
+        on_progress,
         policy,
         tls,
         budgets,
@@ -440,6 +499,9 @@ pub async fn crawl(
         prior_seconds: 0,
         requests: 0,
         since_save: 0,
+        failed: 0,
+        sitemap_urls: 0,
+        total_known: false,
     };
     let resumed = match &cfg.state {
         Some(p) => c.load(p, &start)?,
@@ -520,14 +582,44 @@ impl Crawler<'_> {
         });
     }
 
-    fn enqueue(&mut self, u: &Url, depth: u32) {
-        if self.seen.insert(key(u)) {
+    /// Queues `u` unless it was seen; says whether it did.
+    fn enqueue(&mut self, u: &Url, depth: u32) -> bool {
+        let new = self.seen.insert(key(u));
+        if new {
             self.queue.push_back(Queued {
                 url: scope::clean(u).to_string(),
                 depth,
                 hops: 0,
             });
         }
+        new
+    }
+
+    /// The pages expected, once a sitemap has said: never less than what is done and
+    /// waiting, never more than the page budget.
+    fn total(&mut self) -> Option<usize> {
+        if !self.total_known && (self.sitemap_urls == 0 || !self.sitemaps.is_empty()) {
+            return None;
+        }
+        self.total_known = true;
+        let seen = self.result.pages.len() + self.queue.len();
+        Some(self.sitemap_urls.max(seen).min(self.budgets.pages))
+    }
+
+    fn report(&mut self, phase: Phase) {
+        let failed = self.failed;
+        let p = Progress {
+            event: progress::EVENT,
+            v: progress::VERSION,
+            scope: self.scope.clone(),
+            phase,
+            read: self.result.pages.len().saturating_sub(failed),
+            failed,
+            queued: self.queue.len(),
+            total: self.total(),
+            cap: self.budgets.pages,
+        };
+        (self.on_progress)(&p);
     }
 
     async fn client(&mut self, origin: &Url) -> Result<Arc<ApiClient>, DocsError> {
@@ -676,13 +768,17 @@ impl Crawler<'_> {
             return;
         };
         let (is_index, entries) = sitemap_entries(&String::from_utf8_lossy(&body));
+        if !is_index && self.sitemap_urls == 0 {
+            // The start page is one of the pages, whether or not the sitemap lists it.
+            self.sitemap_urls = 1;
+        }
         for (loc, _) in entries {
             let Ok(e) = Url::parse(&loc) else { continue };
             if is_index {
                 self.queue_sitemap(&e);
             } else if self.in_scope(&e) {
-                if !is_media(&e) {
-                    self.enqueue(&e, 1);
+                if !is_media(&e) && self.enqueue(&e, 1) {
+                    self.sitemap_urls += 1;
                 }
             } else {
                 self.note_link(&e, s, false);
@@ -691,6 +787,7 @@ impl Crawler<'_> {
     }
 
     async fn run(&mut self, state: Option<&Path>) -> Result<(), CrawlError> {
+        self.report(Phase::Pages);
         loop {
             if let Some(b) = self.spent() {
                 self.stop(b);
@@ -698,6 +795,7 @@ impl Crawler<'_> {
             }
             if let Some(s) = self.sitemaps.pop_front() {
                 self.read_sitemap(&s).await;
+                self.report(Phase::Pages);
                 continue;
             }
             let Some(next) = self.queue.pop_front() else {
@@ -709,6 +807,7 @@ impl Crawler<'_> {
                 break;
             }
             self.visit(next).await;
+            self.report(Phase::Pages);
             self.since_save += 1;
             if self.since_save >= SAVE_EVERY {
                 self.since_save = 0;
@@ -717,7 +816,9 @@ impl Crawler<'_> {
                 }
             }
         }
+        self.report(Phase::Listings);
         self.read_listings().await;
+        self.report(Phase::Listings);
         self.result.complete = self.result.stopped_by.is_empty();
         self.result.used.pages = self.result.pages.len();
         self.result.used.hosts = self.result.hosts.iter().filter(|h| h.pages > 0).count();
@@ -817,6 +918,7 @@ impl Crawler<'_> {
                 rec.error = Some(e.to_string());
             }
         }
+        self.failed += usize::from(rec.failed());
         self.result.pages.push(rec);
     }
 
@@ -1049,6 +1151,8 @@ impl Crawler<'_> {
             .filter_map(|l| Url::parse(&l.url).ok())
             .map(|u| key(&u))
             .collect();
+        self.failed = s.result.pages.iter().filter(|p| p.failed()).count();
+        self.sitemap_urls = s.sitemap_urls;
         self.result = s.result;
         self.queue = s.queue;
         self.seen = s.seen.into_iter().collect();
@@ -1072,6 +1176,7 @@ impl Crawler<'_> {
             origins_seen: self.origins_seen.iter().cloned().collect(),
             listing_targets: self.listing_targets.iter().cloned().collect(),
             seconds: self.seconds(),
+            sitemap_urls: self.sitemap_urls,
         };
         let bytes = serde_json::to_vec(&s).map_err(|e| CrawlError::State(e.to_string()))?;
         crate::atomic::write(p, &bytes)
